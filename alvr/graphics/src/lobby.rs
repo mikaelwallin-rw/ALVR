@@ -438,6 +438,7 @@ impl LobbyRenderer {
                 label: Some(&format!("lobby_view_{view_idx}")),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &self.render_targets[view_idx][view_input.swapchain_index as usize],
+                    depth_slice: None,
                     resolve_target: None,
                     ops: Operations {
                         load: LoadOp::Clear(clear_color),
