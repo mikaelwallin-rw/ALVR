@@ -86,7 +86,8 @@ impl<H> Buffer<H> {
         &self.inner[self.raw_payload_offset..]
     }
 
-    /// If the range is outside the valid range, new space will be allocated
+    /// The buffer starts with no raw payload allocated space. If the range is outside the valid
+    /// range, new space will be allocated
     /// NB: the offset parameter is applied on top of the internal offset of the buffer
     #[must_use]
     pub fn get_range_mut(&mut self, range: Range<usize>) -> &mut [u8] {
@@ -95,7 +96,7 @@ impl<H> Buffer<H> {
             self.inner.resize(required_size, 0);
         }
 
-        &mut self.inner[self.raw_payload_offset + range.start..][..range.end]
+        &mut self.inner[self.raw_payload_offset..][range]
     }
 
     /// If length > current length, allocate more space

@@ -4,7 +4,6 @@ mod stream_socket;
 use alvr_common::{ConResult, HandleTryAgain, anyhow::Result, info};
 use alvr_session::{DscpTos, SocketBufferSize};
 use socket2::Socket;
-#[cfg(not(windows))]
 use std::ffi::c_int;
 use std::{
     mem::MaybeUninit,
