@@ -170,36 +170,75 @@ fn event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                             (None, None, false, false)
                         };
 
+                        // Determine if we should prioritize controllers or hand tracking.
+                        // Controllers take priority when they have motion data, but if separate
+                        // hand trackers are NOT enabled and a hand skeleton is available, prefer
+                        // the hand skeleton instead so runtimes (and engines) use the hand device.
+                        let left_hand_skel_exists = ffi_left_hand_skeleton.is_some();
+                        let right_hand_skel_exists = ffi_right_hand_skeleton.is_some();
+
+                        // Compute preference per-hand so one hand's controller doesn't affect the other.
+                        let prefer_left_controller = if use_separate_hand_trackers {
+                            ffi_left_controller_motion.is_some()
+                        } else {
+                            ffi_left_controller_motion.is_some() && !left_hand_skel_exists
+                        };
+                        let prefer_right_controller = if use_separate_hand_trackers {
+                            ffi_right_controller_motion.is_some()
+                        } else {
+                            ffi_right_controller_motion.is_some() && !right_hand_skel_exists
+                        };
+
                         let ffi_left_hand_data = FfiHandData {
-                            controllerMotion: if let Some(motion) = &ffi_left_controller_motion {
-                                motion
+                            // Pass controller motion only when the left controller is preferred.
+                            controllerMotion: if prefer_left_controller {
+                                if let Some(motion) = &ffi_left_controller_motion {
+                                    motion
+                                } else {
+                                    ptr::null()
+                                }
                             } else {
                                 ptr::null()
                             },
+                            // Provide hand skeleton to the runtime only when we are NOT preferring the
+                            // controller for this hand, or when separate hand trackers are explicitly used.
                             handSkeleton: if let Some(skeleton) = &ffi_left_hand_skeleton {
-                                skeleton
+                                if prefer_left_controller && !use_separate_hand_trackers {
+                                    ptr::null()
+                                } else {
+                                    skeleton
+                                }
                             } else {
                                 ptr::null()
                             },
-                            isHandTracker: use_separate_hand_trackers
-                                && ffi_left_controller_motion.is_none()
-                                && ffi_left_hand_skeleton.is_some(),
+                            // Mark as hand tracker only when we are not preferring the controller.
+                            isHandTracker: !prefer_left_controller && ffi_left_hand_skeleton.is_some(),
                             predictHandSkeleton: predict_hand_skeleton,
                         };
                         let ffi_right_hand_data = FfiHandData {
-                            controllerMotion: if let Some(motion) = &ffi_right_controller_motion {
-                                motion
+                            // Pass controller motion only when the right controller is preferred.
+                            controllerMotion: if prefer_right_controller {
+                                if let Some(motion) = &ffi_right_controller_motion {
+                                    motion
+                                } else {
+                                    ptr::null()
+                                }
                             } else {
                                 ptr::null()
                             },
+                            // Provide hand skeleton to the runtime only when we are NOT preferring the
+                            // controller for this hand, or when separate hand trackers are explicitly used.
                             handSkeleton: if let Some(skeleton) = &ffi_right_hand_skeleton {
-                                skeleton
+                                if prefer_right_controller && !use_separate_hand_trackers {
+                                    ptr::null()
+                                } else {
+                                    skeleton
+                                }
                             } else {
                                 ptr::null()
                             },
-                            isHandTracker: use_separate_hand_trackers
-                                && ffi_right_controller_motion.is_none()
-                                && ffi_right_hand_skeleton.is_some(),
+                            // Mark as hand tracker only when we are not preferring the controller.
+                            isHandTracker: !prefer_right_controller && ffi_right_hand_skeleton.is_some(),
                             predictHandSkeleton: predict_hand_skeleton,
                         };
 
@@ -221,6 +260,17 @@ fn event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                         // OpenVR, two lefts and two rights. If enabled with use_separate_hand_trackers,
                         // we select at runtime which device to use (selected for left and right hand
                         // independently. Selection is done by setting deviceIsConnected.
+                        // Log selection details to help debug why both devices appear tracked in some runtimes.
+                        warn!(
+                            "SetTracking: prefer_left_ctrl={} prefer_right_ctrl={} left_ctrl={} right_ctrl={} left_skel={} right_skel={} use_separate_hand_trackers={}",
+                            prefer_left_controller,
+                            prefer_right_controller,
+                            ffi_left_controller_motion.is_some(),
+                            ffi_right_controller_motion.is_some(),
+                            ffi_left_hand_skeleton.is_some(),
+                            ffi_right_hand_skeleton.is_some(),
+                            use_separate_hand_trackers
+                        );
                         unsafe {
                             SetTracking(
                                 poll_timestamp.as_nanos() as _,

@@ -58,7 +58,12 @@ bool Controller::activate() {
         vr::VRScalarUnits_NormalizedOneSided
     );
 
-    if (this->device_id == HAND_LEFT_ID || this->device_id == HAND_TRACKER_LEFT_ID) {
+    // Only create a skeleton component for dedicated hand-tracker devices.
+    // Creating a skeleton component on controller devices makes runtimes expose
+    // the device as a Hand visual. To keep controllers reported as controllers
+    // by the runtime (unless a separate hand tracker device exists) we only
+    // register skeleton components for HAND_TRACKER_* device IDs.
+    if (this->device_id == HAND_TRACKER_LEFT_ID) {
         vr_driver_input->CreateSkeletonComponent(
             this->prop_container,
             "/input/skeleton/left",
@@ -69,7 +74,7 @@ bool Controller::activate() {
             0U,
             &m_compSkeleton
         );
-    } else {
+    } else if (this->device_id == HAND_TRACKER_RIGHT_ID) {
         vr_driver_input->CreateSkeletonComponent(
             this->prop_container,
             "/input/skeleton/right",
@@ -80,10 +85,15 @@ bool Controller::activate() {
             0U,
             &m_compSkeleton
         );
+    } else {
+        // Leave m_compSkeleton as invalid for regular controller devices so we
+        // don't advertise skeleton capability to the runtime.
+        m_compSkeleton = vr::k_ulInvalidInputComponentHandle;
     }
 
     // NB: here we set some initial values for the hand skeleton to fix the frozen hand bug
-    {
+    // Only update the skeleton if the component was actually created.
+    if (m_compSkeleton != vr::k_ulInvalidInputComponentHandle) {
         vr::VRBoneTransform_t boneTransforms[SKELETON_BONE_COUNT];
         GetBoneTransform(false, boneTransforms);
 
@@ -184,17 +194,32 @@ bool Controller::OnPoseUpdate(uint64_t targetTimestampNs, float predictionS, Ffi
         && (device_id == HAND_TRACKER_LEFT_ID || device_id == HAND_TRACKER_RIGHT_ID);
     bool enabledAsController
         = !handData.isHandTracker && (device_id == HAND_LEFT_ID || device_id == HAND_RIGHT_ID);
-    bool enabled = (controllerMotion != nullptr || handSkeleton != nullptr)
-        && (enabledAsHandTracker || enabledAsController);
+    
+    // Implement proper mutual exclusivity logic
+    bool enabled = false;
+    
+    if (device_id == HAND_LEFT_ID || device_id == HAND_RIGHT_ID) {
+        // Controller devices: enabled only if controller motion exists AND the runtime
+        // is not currently using hand tracking for this hand. When hand tracking is
+        // active (handData.isHandTracker==true and a handSkeleton is provided) we
+        // must mark the controller as disconnected so runtimes (and engine code like
+        // Unreal's UMotionControllerComponent) choose the hand-tracker device instead.
+        enabled = (controllerMotion != nullptr) && !(handData.isHandTracker && (handSkeleton != nullptr));
+    } else if (device_id == HAND_TRACKER_LEFT_ID || device_id == HAND_TRACKER_RIGHT_ID) {
+        // Hand tracker devices: only enabled if we're in hand tracker mode
+        // (which is set by Rust logic when controllers are not active)
+        enabled = handData.isHandTracker && (handSkeleton != nullptr);
+    }
 
     Debug(
-        "%s %s: enabled: %d, ctrl: %d, hand: %d",
+        "%s %s: enabled: %d, ctrl: %d, hand: %d, isHandTracker: %d",
         (device_id == HAND_TRACKER_LEFT_ID || device_id == HAND_TRACKER_RIGHT_ID) ? "hand tracker"
                                                                                   : "controller",
         (device_id == HAND_TRACKER_LEFT_ID || device_id == HAND_LEFT_ID) ? "left" : "right",
         enabled,
         handData.controllerMotion != nullptr,
-        handData.handSkeleton != nullptr
+        handData.handSkeleton != nullptr,
+        handData.isHandTracker
     );
 
     auto vr_driver_input = vr::VRDriverInput();
@@ -207,7 +232,8 @@ bool Controller::OnPoseUpdate(uint64_t targetTimestampNs, float predictionS, Ffi
     pose.qDriverFromHeadRotation = HmdQuaternion_Init(1, 0, 0, 0);
     pose.qWorldFromDriverRotation = HmdQuaternion_Init(1, 0, 0, 0);
 
-    if (controllerMotion != nullptr) {
+    // Only update pose data if the device is enabled
+    if (enabled && controllerMotion != nullptr) {
         auto m = controllerMotion;
 
         pose.qRotation = HmdQuaternion_Init(
@@ -228,7 +254,7 @@ bool Controller::OnPoseUpdate(uint64_t targetTimestampNs, float predictionS, Ffi
         pose.vecAngularVelocity[0] = m->angularVelocity[0];
         pose.vecAngularVelocity[1] = m->angularVelocity[1];
         pose.vecAngularVelocity[2] = m->angularVelocity[2];
-    } else if (handSkeleton != nullptr) {
+    } else if (enabled && handSkeleton != nullptr) {
         auto r = handSkeleton->jointRotations[0];
         pose.qRotation = HmdQuaternion_Init(r.w, r.x, r.y, r.z);
 
@@ -265,14 +291,27 @@ bool Controller::OnPoseUpdate(uint64_t targetTimestampNs, float predictionS, Ffi
 
     pose.poseTimeOffset = predictionS;
 
-    this->submit_pose(pose);
-
-    m_poseTargetTimestampNs = targetTimestampNs;
-
-    // Early return to skip updating the skeleton
-    if (!enabled) {
+    // Only submit pose if the device is actually enabled
+    // This prevents runtimes from considering the device as active when it shouldn't be
+    if (enabled) {
+        this->submit_pose(pose);
+        m_poseTargetTimestampNs = targetTimestampNs;
+    } else {
+        // For disabled devices, we still need to submit a pose to indicate disconnection
+        // but with all tracking marked as invalid
+        vr::DriverPose_t disconnected_pose = {};
+        disconnected_pose.poseIsValid = false;
+        disconnected_pose.deviceIsConnected = false;
+        disconnected_pose.result = vr::TrackingResult_Uninitialized;
+        disconnected_pose.qRotation = HmdQuaternion_Init(1, 0, 0, 0);
+        disconnected_pose.qDriverFromHeadRotation = HmdQuaternion_Init(1, 0, 0, 0);
+        disconnected_pose.qWorldFromDriverRotation = HmdQuaternion_Init(1, 0, 0, 0);
+        this->submit_pose(disconnected_pose);
         return false;
-    } else if (handSkeleton != nullptr) {
+    }
+
+    // Only update skeleton if we're enabled and have skeleton data
+    if (enabled && handSkeleton != nullptr && m_compSkeleton != vr::k_ulInvalidInputComponentHandle) {
         vr::VRBoneTransform_t boneTransform[SKELETON_BONE_COUNT] = {};
 
         boneTransform[0].orientation.w = 1.0;
@@ -296,18 +335,20 @@ bool Controller::OnPoseUpdate(uint64_t targetTimestampNs, float predictionS, Ffi
             boneTransform[j].position.v[3] = 1.0;
         }
 
-        vr_driver_input->UpdateSkeletonComponent(
-            m_compSkeleton,
-            vr::VRSkeletalMotionRange_WithController,
-            boneTransform,
-            SKELETON_BONE_COUNT
-        );
-        vr_driver_input->UpdateSkeletonComponent(
-            m_compSkeleton,
-            vr::VRSkeletalMotionRange_WithoutController,
-            boneTransform,
-            SKELETON_BONE_COUNT
-        );
+        if (m_compSkeleton != vr::k_ulInvalidInputComponentHandle) {
+            vr_driver_input->UpdateSkeletonComponent(
+                m_compSkeleton,
+                vr::VRSkeletalMotionRange_WithController,
+                boneTransform,
+                SKELETON_BONE_COUNT
+            );
+            vr_driver_input->UpdateSkeletonComponent(
+                m_compSkeleton,
+                vr::VRSkeletalMotionRange_WithoutController,
+                boneTransform,
+                SKELETON_BONE_COUNT
+            );
+        }
 
         float rotThumb = (handSkeleton->jointRotations[2].z + handSkeleton->jointRotations[2].y
                           + handSkeleton->jointRotations[3].z + handSkeleton->jointRotations[3].y
@@ -398,29 +439,34 @@ bool Controller::OnPoseUpdate(uint64_t targetTimestampNs, float predictionS, Ffi
         GetBoneTransform(true, boneTransforms);
 
         // Then update the WithController pose on the component with those transforms
-        vr::EVRInputError err = vr_driver_input->UpdateSkeletonComponent(
-            m_compSkeleton,
-            vr::VRSkeletalMotionRange_WithController,
-            boneTransforms,
-            SKELETON_BONE_COUNT
-        );
-        if (err != vr::VRInputError_None) {
-            // Handle failure case
-            Error("UpdateSkeletonComponentfailed.  Error: %i\n", err);
-        }
+        if (m_compSkeleton != vr::k_ulInvalidInputComponentHandle) {
+            vr::EVRInputError err = vr_driver_input->UpdateSkeletonComponent(
+                m_compSkeleton,
+                vr::VRSkeletalMotionRange_WithController,
+                boneTransforms,
+                SKELETON_BONE_COUNT
+            );
+            if (err != vr::VRInputError_None) {
+                // Handle failure case
+                Error("UpdateSkeletonComponentfailed.  Error: %i\n", err);
+            }
 
-        GetBoneTransform(false, boneTransforms);
+            GetBoneTransform(false, boneTransforms);
 
-        // Then update the WithoutController pose on the component
-        err = vr_driver_input->UpdateSkeletonComponent(
-            m_compSkeleton,
-            vr::VRSkeletalMotionRange_WithoutController,
-            boneTransforms,
-            SKELETON_BONE_COUNT
-        );
-        if (err != vr::VRInputError_None) {
-            // Handle failure case
-            Error("UpdateSkeletonComponentfailed.  Error: %i\n", err);
+            // Then update the WithoutController pose on the component
+            err = vr_driver_input->UpdateSkeletonComponent(
+                m_compSkeleton,
+                vr::VRSkeletalMotionRange_WithoutController,
+                boneTransforms,
+                SKELETON_BONE_COUNT
+            );
+            if (err != vr::VRInputError_None) {
+                // Handle failure case
+                Error("UpdateSkeletonComponentfailed.  Error: %i\n", err);
+            }
+        } else {
+            // If there is no skeleton component (regular controller), skip skeleton updates.
+            GetBoneTransform(false, boneTransforms);
         }
     }
 
