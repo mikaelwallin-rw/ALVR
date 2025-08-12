@@ -174,6 +174,12 @@ public:
     virtual void LeaveStandby() override { Debug("DriverProvider::LeaveStandby"); }
 } g_driver_provider;
 
+// Track last selection state so we can notify SteamVR when the preferred device
+// for each hand changes (this forces runtimes to re-evaluate which device to
+// expose to clients like Unreal).
+static bool g_last_left_using_hand = false;
+static bool g_last_right_using_hand = false;
+
 // bindigs for Rust
 
 const unsigned char* FRAME_RENDER_VS_CSO_PTR;
@@ -398,7 +404,38 @@ void SetTracking(
         g_driver_provider.hmd->OnPoseUpdated(targetTimestampNs, headMotion);
     }
 
+    // Determine whether the left hand should be presented as a hand tracker (and take the
+    // controller role) or whether the controller device should keep the role.
+    bool left_using_hand = leftHandData.isHandTracker && leftHandData.handSkeleton != nullptr;
+
+    // Update the ControllerRoleHint property so runtimes (and Unreal's UMotionControllerComponent)
+    // pick the correct device for the controller role.
+    if (g_driver_provider.left_controller) {
+        vr::VRProperties()->SetInt32Property(
+            g_driver_provider.left_controller->prop_container,
+            vr::Prop_ControllerRoleHint_Int32,
+            left_using_hand ? vr::TrackedControllerRole_Invalid : vr::TrackedControllerRole_LeftHand
+        );
+        // Prefer hand tracker when hand tracking is active by lowering controller selection priority.
+        vr::VRProperties()->SetInt32Property(
+            g_driver_provider.left_controller->prop_container,
+            vr::Prop_ControllerHandSelectionPriority_Int32,
+            left_using_hand ? -1 : 0
+        );
+    }
     if (g_driver_provider.left_hand_tracker) {
+        vr::VRProperties()->SetInt32Property(
+            g_driver_provider.left_hand_tracker->prop_container,
+            vr::Prop_ControllerRoleHint_Int32,
+            left_using_hand ? vr::TrackedControllerRole_LeftHand : vr::TrackedControllerRole_Invalid
+        );
+        // Raise hand tracker selection priority when it's active.
+        vr::VRProperties()->SetInt32Property(
+            g_driver_provider.left_hand_tracker->prop_container,
+            vr::Prop_ControllerHandSelectionPriority_Int32,
+            left_using_hand ? 0 : -1
+        );
+
         g_driver_provider.left_hand_tracker->OnPoseUpdate(
             targetTimestampNs, controllerPoseTimeOffsetS, leftHandData
         );
@@ -410,7 +447,47 @@ void SetTracking(
         );
     }
 
+    // Determine whether the right hand should be presented as a hand tracker (and take the
+    // controller role) or whether the controller device should keep the role.
+    bool right_using_hand = rightHandData.isHandTracker && rightHandData.handSkeleton != nullptr;
+
+    Debug(
+        "SetTracking: left_using_hand=%d right_using_hand=%d left_ctrl=%d right_ctrl=%d left_skel=%d right_skel=%d use_separate=%d",
+        left_using_hand ? 1 : 0,
+        right_using_hand ? 1 : 0,
+        leftHandData.controllerMotion != nullptr ? 1 : 0,
+        rightHandData.controllerMotion != nullptr ? 1 : 0,
+        leftHandData.handSkeleton != nullptr ? 1 : 0,
+        rightHandData.handSkeleton != nullptr ? 1 : 0,
+        Settings::Instance().m_useSeparateHandTrackers ? 1 : 0
+    );
+
+    if (g_driver_provider.right_controller) {
+        vr::VRProperties()->SetInt32Property(
+            g_driver_provider.right_controller->prop_container,
+            vr::Prop_ControllerRoleHint_Int32,
+            right_using_hand ? vr::TrackedControllerRole_Invalid : vr::TrackedControllerRole_RightHand
+        );
+        // Prefer hand tracker when hand tracking is active by lowering controller selection priority.
+        vr::VRProperties()->SetInt32Property(
+            g_driver_provider.right_controller->prop_container,
+            vr::Prop_ControllerHandSelectionPriority_Int32,
+            right_using_hand ? -1 : 0
+        );
+    }
     if (g_driver_provider.right_hand_tracker) {
+        vr::VRProperties()->SetInt32Property(
+            g_driver_provider.right_hand_tracker->prop_container,
+            vr::Prop_ControllerRoleHint_Int32,
+            right_using_hand ? vr::TrackedControllerRole_RightHand : vr::TrackedControllerRole_Invalid
+        );
+        // Raise hand tracker selection priority when it's active.
+        vr::VRProperties()->SetInt32Property(
+            g_driver_provider.right_hand_tracker->prop_container,
+            vr::Prop_ControllerHandSelectionPriority_Int32,
+            right_using_hand ? 0 : -1
+        );
+
         g_driver_provider.right_hand_tracker->OnPoseUpdate(
             targetTimestampNs, controllerPoseTimeOffsetS, rightHandData
         );
@@ -420,6 +497,15 @@ void SetTracking(
         g_driver_provider.right_controller->OnPoseUpdate(
             targetTimestampNs, controllerPoseTimeOffsetS, rightHandData
         );
+    }
+
+    // If the preferred device for either hand changed since last tick, ask SteamVR
+    // to re-evaluate device roles so clients (e.g., Unreal) will pick the correct device.
+    if (g_last_left_using_hand != left_using_hand || g_last_right_using_hand != right_using_hand) {
+        g_last_left_using_hand = left_using_hand;
+        g_last_right_using_hand = right_using_hand;
+        Debug("SetTracking: preferred device changed. RequestDriverResync()");
+        RequestDriverResync();
     }
 
     if (Settings::Instance().m_enableBodyTrackingFakeVive) {
