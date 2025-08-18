@@ -13,6 +13,7 @@ mod bindings {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
 use bindings::*;
+use once_cell::sync::Lazy;
 
 use alvr_common::{
     BUTTON_INFO, HAND_LEFT_ID, HAND_RIGHT_ID, HAND_TRACKER_LEFT_ID, HAND_TRACKER_RIGHT_ID, HEAD_ID,
@@ -261,16 +262,70 @@ fn event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                         // we select at runtime which device to use (selected for left and right hand
                         // independently. Selection is done by setting deviceIsConnected.
                         // Log selection details to help debug why both devices appear tracked in some runtimes.
-                        warn!(
-                            "SetTracking: prefer_left_ctrl={} prefer_right_ctrl={} left_ctrl={} right_ctrl={} left_skel={} right_skel={} use_separate_hand_trackers={}",
-                            prefer_left_controller,
-                            prefer_right_controller,
-                            ffi_left_controller_motion.is_some(),
-                            ffi_right_controller_motion.is_some(),
-                            ffi_left_hand_skeleton.is_some(),
-                            ffi_right_hand_skeleton.is_some(),
-                            use_separate_hand_trackers
-                        );
+                        {
+                            let left_ctrl = ffi_left_controller_motion.is_some();
+                            let right_ctrl = ffi_right_controller_motion.is_some();
+                            let left_skel = ffi_left_hand_skeleton.is_some();
+                            let right_skel = ffi_right_hand_skeleton.is_some();
+                            let use_separate = use_separate_hand_trackers;
+
+                            // Determine whether the left/right hand is currently presented as a hand tracker.
+                            // Mirror the logic used when constructing FfiHandData earlier.
+                            let left_using_hand = !prefer_left_controller && left_skel;
+                            let right_using_hand = !prefer_right_controller && right_skel;
+
+                            static PREV_SET_TRACKING: Lazy<
+                                Mutex<Option<(
+                                    bool, bool, bool, bool, bool, bool, bool
+                                )>>
+                            > = Lazy::new(|| Mutex::new(None));
+
+                            let mut prev = PREV_SET_TRACKING.lock();
+                            let changed = match *prev {
+                                Some((
+                                    prev_left_using_hand,
+                                    prev_right_using_hand,
+                                    prev_left_ctrl,
+                                    prev_right_ctrl,
+                                    prev_left_skel,
+                                    prev_right_skel,
+                                    prev_use_separate,
+                                )) => {
+                                    prev_left_using_hand != left_using_hand
+                                        || prev_right_using_hand != right_using_hand
+                                        || prev_left_ctrl != left_ctrl
+                                        || prev_right_ctrl != right_ctrl
+                                        || prev_left_skel != left_skel
+                                        || prev_right_skel != right_skel
+                                        || prev_use_separate != use_separate
+                                }
+                                None => true,
+                            };
+
+                            if changed {
+                                warn!(
+                                    target: alvr_common::SERVER_IMPL_DBG_LABEL,
+                                    "SetTracking: prefer_left_ctrl={} prefer_right_ctrl={} left_ctrl={} right_ctrl={} left_skel={} right_skel={} use_separate_hand_trackers={}",
+                                    prefer_left_controller,
+                                    prefer_right_controller,
+                                    left_ctrl,
+                                    right_ctrl,
+                                    left_skel,
+                                    right_skel,
+                                    use_separate
+                                );
+
+                                *prev = Some((
+                                    left_using_hand,
+                                    right_using_hand,
+                                    left_ctrl,
+                                    right_ctrl,
+                                    left_skel,
+                                    right_skel,
+                                    use_separate,
+                                ));
+                            }
+                        }
                         unsafe {
                             SetTracking(
                                 poll_timestamp.as_nanos() as _,

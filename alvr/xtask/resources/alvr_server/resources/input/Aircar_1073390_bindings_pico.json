@@ -1,0 +1,139 @@
+{
+  "bindings": {
+    "/actions/main": {
+      "haptics": [
+        {
+          "output": "/actions/main/out/vibrateleft",
+          "path": "/user/hand/left/output/haptic"
+        },
+        {
+          "output": "/actions/main/out/vibrateright",
+          "path": "/user/hand/right/output/haptic"
+        }
+      ],
+      "poses": [
+        {
+          "output": "/actions/main/in/controllerleft",
+          "path": "/user/hand/left/pose/raw",
+          "requirement": "optional"
+        },
+        {
+          "output": "/actions/main/in/controllerright",
+          "path": "/user/hand/right/pose/raw"
+        }
+      ],
+      "skeleton": [
+        {
+          "output": "/actions/main/in/skeletonleft",
+          "path": "/user/hand/left/input/skeleton/left"
+        },
+        {
+          "output": "/actions/main/in/skeletonright",
+          "path": "/user/hand/right/input/skeleton/right"
+        }
+      ],
+      "sources": [
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/pause music"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/left/input/application_menu"
+        },
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/menu interaction"
+            },
+            "position": {
+              "output": "/actions/main/in/vertical.yaw_x,vertical.yaw_y x y_axis2d"
+            }
+          },
+          "mode": "trackpad",
+          "path": "/user/hand/right/input/trackpad"
+        },
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/menu interaction"
+            },
+            "position": {
+              "output": "/actions/main/in/pitch.roll_x,pitch.roll_y x y_axis2d"
+            }
+          },
+          "mode": "trackpad",
+          "path": "/user/hand/left/input/trackpad"
+        },
+        {
+          "inputs": {
+            "pull": {
+              "output": "/actions/main/in/Reverse axis"
+            }
+          },
+          "mode": "trigger",
+          "path": "/user/hand/left/input/trigger"
+        },
+        {
+          "inputs": {
+            "pull": {
+              "output": "/actions/main/in/thrust axis"
+            }
+          },
+          "mode": "trigger",
+          "path": "/user/hand/right/input/trigger"
+        },
+        {
+          "inputs": {
+            "position": {
+              "output": "/actions/main/in/Pitch.Roll_X,Pitch.Roll_Y X Y_axis2d"
+            }
+          },
+          "mode": "joystick",
+          "path": "/user/hand/right/input/thumbstick"
+        },
+        {
+          "inputs": {
+            "position": {
+              "output": "/actions/main/in/Vertical.Yaw_X,Vertical.Yaw_Y X Y_axis2d"
+            }
+          },
+          "mode": "joystick",
+          "path": "/user/hand/left/input/thumbstick"
+        },
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/turbo"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/left/input/grip"
+        },
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/menu button"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/right/input/application_menu"
+        },
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/turbo"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/right/input/grip"
+        }
+      ]
+    }
+  },
+  "category": "steamvr_input",
+  "controller_type": "vive_controller",
+  "description": "Aircar of PICO Bingding",
+  "name": "Aircar of PICO"
+}

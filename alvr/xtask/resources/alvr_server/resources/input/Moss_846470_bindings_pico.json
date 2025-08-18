@@ -1,0 +1,198 @@
+{
+  "action_manifest_version": 0,
+  "alias_info": {},
+  "app_key": "steam.app.846470",
+  "bindings": {
+    "/actions/main": {
+      "haptics": [
+        {
+          "output": "/actions/main/out/vibrateleft",
+          "path": "/user/hand/left/output/haptic"
+        },
+        {
+          "output": "/actions/main/out/vibrateright",
+          "path": "/user/hand/right/output/haptic"
+        }
+      ],
+      "poses": [
+        {
+          "output": "/actions/main/in/controllerleft",
+          "path": "/user/hand/left/pose/raw",
+          "requirement": "optional"
+        },
+        {
+          "output": "/actions/main/in/controllerright",
+          "path": "/user/hand/right/pose/raw"
+        }
+      ],
+      "skeleton": [
+        {
+          "output": "/actions/main/in/skeletonleft",
+          "path": "/user/hand/left/input/skeleton/left"
+        },
+        {
+          "output": "/actions/main/in/skeletonright",
+          "path": "/user/hand/right/input/skeleton/right"
+        }
+      ],
+      "sources": [
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/HeroPrimary"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/right/input/b"
+        },
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/herosecondary"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/right/input/a"
+        },
+        {
+          "inputs": {
+            "position": {
+              "output": "/actions/main/in/heroaim_x,heroaim_y x y_axis2d"
+            }
+          },
+          "mode": "joystick",
+          "parameters": {
+            "deadzone_pct": "10"
+          },
+          "path": "/user/hand/right/input/joystick"
+        },
+        {
+          "inputs": {
+            "position": {
+              "output": "/actions/main/in/heromove_x,heromove_y x y_axis2d"
+            }
+          },
+          "mode": "joystick",
+          "parameters": {
+            "deadzone_pct": "10"
+          },
+          "path": "/user/hand/left/input/joystick"
+        },
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/leftgrab"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/left/input/trigger"
+        },
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/rightgrab"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/right/input/trigger"
+        },
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/ui_menu"
+            },
+            "held": {
+              "output": "/actions/main/in/camerarecenter"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/left/input/b"
+        },
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/UI_Back"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/right/input/b"
+        },
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/UI_Click"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/right/input/a"
+        },
+        {
+          "inputs": {
+            "east": {
+              "output": "/actions/main/in/ui_right"
+            },
+            "north": {
+              "output": "/actions/main/in/ui_up"
+            },
+            "south": {
+              "output": "/actions/main/in/ui_down"
+            },
+            "west": {
+              "output": "/actions/main/in/ui_left"
+            }
+          },
+          "mode": "dpad",
+          "parameters": {
+            "deadzone_pct": "80",
+            "overlap_pct": "0",
+            "sticky": "true",
+            "sub_mode": "touch"
+          },
+          "path": "/user/hand/left/input/joystick"
+        },
+        {
+          "inputs": {
+            "double": {
+              "output": "/actions/main/in/ui_menu"
+            },
+            "long": {
+              "output": "/actions/main/in/ui_menu"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/left/input/joystick"
+        },
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/heroprimary"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/left/input/y"
+        },
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/herosecondary"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/left/input/x"
+        }
+      ]
+    }
+  },
+  "category": "steamvr_input",
+  "controller_type": "pico_controller",
+  "description": "Moss of PICO Bindings",
+  "interaction_profile": "",
+  "name": "Moss of PICO",
+  "options": {
+    "compatibility_mode": true,
+    "simulate_hmd": true,
+    "simulate_rendermodel": true,
+    "simulated_controller_type": "oculus_touch"
+  },
+  "simulated_actions": []
+}

@@ -451,16 +451,48 @@ void SetTracking(
     // controller role) or whether the controller device should keep the role.
     bool right_using_hand = rightHandData.isHandTracker && rightHandData.handSkeleton != nullptr;
 
-    Debug(
-        "SetTracking: left_using_hand=%d right_using_hand=%d left_ctrl=%d right_ctrl=%d left_skel=%d right_skel=%d use_separate=%d",
-        left_using_hand ? 1 : 0,
-        right_using_hand ? 1 : 0,
-        leftHandData.controllerMotion != nullptr ? 1 : 0,
-        rightHandData.controllerMotion != nullptr ? 1 : 0,
-        leftHandData.handSkeleton != nullptr ? 1 : 0,
-        rightHandData.handSkeleton != nullptr ? 1 : 0,
-        Settings::Instance().m_useSeparateHandTrackers ? 1 : 0
-    );
+    {
+        // Only log SetTracking when relevant state changes to avoid spamming logs on every frame.
+        bool left_ctrl = leftHandData.controllerMotion != nullptr;
+        bool right_ctrl = rightHandData.controllerMotion != nullptr;
+        bool left_skel = leftHandData.handSkeleton != nullptr;
+        bool right_skel = rightHandData.handSkeleton != nullptr;
+        bool use_separate = Settings::Instance().m_useSeparateHandTrackers ? true : false;
+
+        // Persist previous values across calls
+        static bool prev_left_using_hand = left_using_hand;
+        static bool prev_right_using_hand = right_using_hand;
+        static bool prev_left_ctrl = left_ctrl;
+        static bool prev_right_ctrl = right_ctrl;
+        static bool prev_left_skel = left_skel;
+        static bool prev_right_skel = right_skel;
+        static bool prev_use_separate = use_separate;
+
+        // If any of the significant fields changed, emit a single log and update previous values.
+        // if (prev_left_using_hand != left_using_hand || prev_right_using_hand != right_using_hand
+        //     || prev_left_ctrl != left_ctrl || prev_right_ctrl != right_ctrl
+        //     || prev_left_skel != left_skel || prev_right_skel != right_skel
+        //     || prev_use_separate != use_separate) {
+        //     Debug(
+        //         "SetTracking: left_using_hand=%d right_using_hand=%d left_ctrl=%d right_ctrl=%d left_skel=%d right_skel=%d use_separate=%d",
+        //         left_using_hand ? 1 : 0,
+        //         right_using_hand ? 1 : 0,
+        //         left_ctrl ? 1 : 0,
+        //         right_ctrl ? 1 : 0,
+        //         left_skel ? 1 : 0,
+        //         right_skel ? 1 : 0,
+        //         use_separate ? 1 : 0
+        //     );
+
+        //     prev_left_using_hand = left_using_hand;
+        //     prev_right_using_hand = right_using_hand;
+        //     prev_left_ctrl = left_ctrl;
+        //     prev_right_ctrl = right_ctrl;
+        //     prev_left_skel = left_skel;
+        //     prev_right_skel = right_skel;
+        //     prev_use_separate = use_separate;
+        // }
+    }
 
     if (g_driver_provider.right_controller) {
         vr::VRProperties()->SetInt32Property(
