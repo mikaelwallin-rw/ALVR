@@ -1,0 +1,200 @@
+{
+  "action_manifest_version": 0,
+  "alias_info": {},
+  "app_key": "steam.app.916840",
+  "bindings": {
+    "/actions/main": {
+      "chords": [ {} ],
+      "poses": [
+        {
+          "output": "none",
+          "path": "/user/hand/left/pose/base"
+        },
+        {
+          "output": "none",
+          "path": "/user/hand/left/pose/raw"
+        },
+        {
+          "output": "none",
+          "path": "/user/hand/right/pose/raw"
+        },
+        {
+          "output": "none",
+          "path": "/user/hand/right/pose/base"
+        },
+        {
+          "output": "/actions/main/in/controllerleft",
+          "path": "/user/hand/left/pose/handgrip"
+        },
+        {
+          "output": "/actions/main/in/controllerright",
+          "path": "/user/hand/right/pose/handgrip"
+        }
+      ],
+      "skeleton": [
+        {
+          "output": "/actions/main/in/skeletonleft",
+          "path": "/user/hand/left/input/skeleton/left"
+        },
+        {
+          "output": "/actions/main/in/skeletonright",
+          "path": "/user/hand/right/input/skeleton/right"
+        }
+      ],
+      "sources": [
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/rightinteract axis"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/right/input/trigger"
+        },
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/selectdialogue"
+            },
+            "position": {
+              "output": "/actions/main/in/configurableturnaxis_x,configurableturnaxis_y x y_axis2d"
+            },
+            "touch": {
+              "output": "/actions/main/in/turnaxisleft"
+            }
+          },
+          "mode": "joystick",
+          "path": "/user/hand/right/input/joystick"
+        },
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/rightinteractsecondary axis"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/right/input/a"
+        },
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/crouchtoggle"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/right/input/b"
+        },
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/rightgrip axis"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/right/input/grip"
+        },
+        {
+          "inputs": {
+            "touch": {
+              "output": "/actions/main/in/pause"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/left/input/system"
+        },
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/sprinttogglemirror"
+            },
+            "position": {
+              "output": "/actions/main/in/moveforward_x,moveforward_y x y_axis2d"
+            },
+            "touch": {
+              "output": "/actions/main/in/touchmovementactive"
+            }
+          },
+          "mode": "joystick",
+          "parameters": {
+            "invert": "y"
+          },
+          "path": "/user/hand/left/input/joystick"
+        },
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/touchmovementactive"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/left/input/joystick"
+        },
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/leftgrip axis"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/left/input/grip"
+        },
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/pause"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/left/input/y"
+        },
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/leftinteract axis"
+            }
+          },
+          "mode": "trigger",
+          "path": "/user/hand/left/input/trigger"
+        },
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/resethmd"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/right/input/joystick"
+        },
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/leftinteractsecondary axis"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/left/input/x"
+        },
+        {
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/pause"
+            }
+          },
+          "mode": "button",
+          "path": "/user/hand/left/input/x"
+        }
+      ]
+    }
+  },
+  "category": "steamvr_input",
+  "controller_type": "pico_controller",
+  "description": "The Walking Dead: Saints & Sinners of PICO Bindings",
+  "interaction_profile": "",
+  "name": "The Walking Dead: Saints & Sinners of PICO",
+  "options": {
+    "compatibility_mode": true,
+    "simulate_rendermodel": true,
+    "simulated_controller_type": "oculus_touch"
+  },
+  "simulated_actions": []
+}

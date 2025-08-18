@@ -398,27 +398,29 @@ pub extern "C" fn set_device_openvr_props(instance_ptr: *mut c_void, device_id: 
                     set_oculus_common_props();
                 }
                 ControllersEmulationMode::Pico4 => {
-                    set_prop(TrackingSystemNameString, "vrlink");
+                    set_prop(TrackingSystemNameString, "alvr_server");
                     set_prop(ManufacturerNameString, "ByteDance");
+                    // Ensure SteamVR resolves {alvr_server} token to this driver's resources
+                    set_prop(ResourceRootString, "alvr_server");
                     if left_hand {
                         set_prop(ModelNumberString, "PICO 4 (Left Controller)");
                         set_prop(
                             RenderModelNameString,
-                            "{vrlink}/rendermodels/pico_4_controller_left",
+                            "{alvr_server}/rendermodels/pico_4s_leftcontroller",
                         );
-                        set_icons("{vrlink}/icons/left_pico4");
+                        set_icons("{alvr_server}/icons/left_pico4");
                     } else if right_hand {
                         set_prop(ModelNumberString, "PICO 4 (Right Controller)");
                         set_prop(
                             RenderModelNameString,
-                            "{vrlink}/rendermodels/pico_4_controller_right",
+                            "{alvr_server}/rendermodels/pico_4s_rightcontroller",
                         );
-                        set_icons("{vrlink}/icons/right_pico4");
+                        set_icons("{alvr_server}/icons/right_pico4");
                     }
                     set_prop(ControllerTypeString, "pico_controller");
                     set_prop(
                         InputProfilePathString,
-                        "{vrlink}/input/pico_controller_profile.json",
+                        "{alvr_server}/input/pico_controller_profile.json",
                     );
                 }
                 ControllersEmulationMode::ValveIndex => {
@@ -546,34 +548,34 @@ pub extern "C" fn set_device_openvr_props(instance_ptr: *mut c_void, device_id: 
             set_prop(AttachedDeviceIdString, device_serial);
 
             if full_skeletal_hand {
-                set_prop(TrackingSystemNameString, "vrlink");
-                set_prop(ManufacturerNameString, "VRLink");
+                set_prop(TrackingSystemNameString, "alvr_server");
+                set_prop(ManufacturerNameString, "alvr_server");
 
-                set_prop(RenderModelNameString, "{vrlink}/rendermodels/shuttlecock");
+                set_prop(RenderModelNameString, "{alvr_server}/rendermodels/shuttlecock");
                 set_prop(ControllerTypeString, "svl_hand_interaction_augmented");
                 set_prop(
                     InputProfilePathString,
-                    "{vrlink}/input/svl_hand_interaction_augmented_input_profile.json",
+                    "{alvr_server}/input/svl_hand_interaction_augmented_input_profile.json",
                 );
 
                 if left_hand {
-                    set_prop(ModelNumberString, "VRLink Hand Tracker (Left Hand)");
+                    set_prop(ModelNumberString, "alvr_server Hand Tracker (Left Hand)");
                     set_prop(
                         RegisteredDeviceTypeString,
-                        "vrlink/VRLINKQ_HandTracker_Left",
+                        "alvr_server/alvr_serverQ_HandTracker_Left",
                     );
-                    set_prop(SerialNumberString, "VRLINKQ_Hand_Left");
-                    set_prop(AttachedDeviceIdString, "VRLINKQ_Hand_Left");
-                    set_icons("{vrlink}/icons/left_handtracking");
+                    set_prop(SerialNumberString, "alvr_serverQ_Hand_Left");
+                    set_prop(AttachedDeviceIdString, "alvr_serverQ_Hand_Left");
+                    set_icons("{alvr_server}/icons/left_handtracking");
                 } else if right_hand {
-                    set_prop(ModelNumberString, "VRLink Hand Tracker (Right Hand)");
+                    set_prop(ModelNumberString, "alvr_server Hand Tracker (Right Hand)");
                     set_prop(
                         RegisteredDeviceTypeString,
-                        "vrlink/VRLINKQ_HandTracker_Right",
+                        "alvr_server/alvr_serverQ_HandTracker_Right",
                     );
-                    set_prop(SerialNumberString, "VRLINKQ_Hand_Right");
-                    set_prop(AttachedDeviceIdString, "VRLINKQ_Hand_Right");
-                    set_icons("{vrlink}/icons/right_handtracking");
+                    set_prop(SerialNumberString, "alvr_serverQ_Hand_Right");
+                    set_prop(AttachedDeviceIdString, "alvr_serverQ_Hand_Right");
+                    set_icons("{alvr_server}/icons/right_handtracking");
                 }
             }
 
@@ -605,3 +607,4 @@ pub extern "C" fn set_device_openvr_props(instance_ptr: *mut c_void, device_id: 
         }
     }
 }
+

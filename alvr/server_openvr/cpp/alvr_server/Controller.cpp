@@ -152,7 +152,9 @@ void Controller::RegisterButton(uint64_t id) {
 void Controller::SetButton(uint64_t id, FfiButtonValue value) {
     Debug("Controller::SetButton deviceID=%llu buttonID=%llu", this->device_id, id);
 
-    if (!this->last_pose.poseIsValid) {
+    // Don't update buttons if the device is not connected/valid
+    // This prevents button updates from affecting disabled controllers
+    if (!this->last_pose.poseIsValid || !this->last_pose.deviceIsConnected) {
         return;
     }
 
@@ -204,7 +206,7 @@ bool Controller::OnPoseUpdate(uint64_t targetTimestampNs, float predictionS, Ffi
         // active (handData.isHandTracker==true and a handSkeleton is provided) we
         // must mark the controller as disconnected so runtimes (and engine code like
         // Unreal's UMotionControllerComponent) choose the hand-tracker device instead.
-        enabled = (controllerMotion != nullptr) && !(handData.isHandTracker && (handSkeleton != nullptr));
+        enabled = (controllerMotion != nullptr) && !handData.isHandTracker;// && (handSkeleton != nullptr));
     } else if (device_id == HAND_TRACKER_LEFT_ID || device_id == HAND_TRACKER_RIGHT_ID) {
         // Hand tracker devices: only enabled if we're in hand tracker mode
         // (which is set by Rust logic when controllers are not active)
@@ -379,7 +381,7 @@ bool Controller::OnPoseUpdate(uint64_t targetTimestampNs, float predictionS, Ffi
         vr_driver_input->UpdateScalarComponent(
             m_buttonHandles[ALVR_INPUT_FINGER_PINKY], rotPinky, 0.0
         );
-    } else if (controllerMotion != nullptr) {
+    } else if (enabled && controllerMotion != nullptr) {
         if (m_lastThumbTouch != m_currentThumbTouch) {
             m_thumbTouchAnimationProgress += 1.f / ANIMATION_FRAME_COUNT;
             if (m_thumbTouchAnimationProgress > 1.f) {

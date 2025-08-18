@@ -1,0 +1,56 @@
+{
+	"jsonid" : "vrresources",
+	"statusicons_neo3" : {
+		"HMD" : {
+			"Prop_NamedIconPathDeviceOff_String" : "{alvr_server}/icons_neo3/headset_off.png",
+			"Prop_NamedIconPathDeviceSearching_String" : "{alvr_server}/icons_neo3/headset_searching.png",
+			"Prop_NamedIconPathDeviceSearchingAlert_String" : "{alvr_server}/icons_neo3/headset_searching_alert.png",
+			"Prop_NamedIconPathDeviceReady_String" : "{alvr_server}/icons_neo3/headset_ready.png",
+			"Prop_NamedIconPathDeviceReadyAlert_String" : "{alvr_server}/icons_neo3/headset_ready_alert.png",
+			"Prop_NamedIconPathDeviceNotReady_String" : "{alvr_server}/icons_neo3/headset_error.png",
+			"Prop_NamedIconPathDeviceStandby_String" : "{alvr_server}/icons_neo3/headset_standby.png",
+			"Prop_NamedIconPathDeviceAlertLow_String" : "{alvr_server}/icons_neo3/headset_ready_low.png"
+		},
+		"LeftController" : {
+			"Prop_NamedIconPathDeviceOff_String" : "{alvr_server}/icons_neo3/left_controller_off.png",
+			"Prop_NamedIconPathDeviceSearching_String" : "{alvr_server}/icons_neo3/left_controller_searching.png",
+			"Prop_NamedIconPathDeviceSearchingAlert_String" : "{alvr_server}/icons_neo3/left_controller_searching_alert.png",
+			"Prop_NamedIconPathDeviceReady_String" : "{alvr_server}/icons_neo3/left_controller_ready.png",
+			"Prop_NamedIconPathDeviceReadyAlert_String" : "{alvr_server}/icons_neo3/left_controller_ready_alert.png",
+			"Prop_NamedIconPathDeviceNotReady_String" : "{alvr_server}/icons_neo3/left_controller_error.png",
+			"Prop_NamedIconPathDeviceStandby_String" : "{alvr_server}/icons_neo3/left_controller_off.png",
+			"Prop_NamedIconPathDeviceAlertLow_String" : "{alvr_server}/icons_neo3/left_controller_ready_low.png"
+		},
+		  "RightController" : {
+			"Prop_NamedIconPathDeviceOff_String" : "{alvr_server}/icons_neo3/right_controller_off.png",
+			"Prop_NamedIconPathDeviceSearching_String" : "{alvr_server}/icons_neo3/right_controller_searching.png",
+			"Prop_NamedIconPathDeviceSearchingAlert_String" : "{alvr_server}/icons_neo3/right_controller_searching_alert.png",
+			"Prop_NamedIconPathDeviceReady_String" : "{alvr_server}/icons_neo3/right_controller_ready.png",
+			"Prop_NamedIconPathDeviceReadyAlert_String" : "{alvr_server}/icons_neo3/right_controller_ready_alert.png",
+			"Prop_NamedIconPathDeviceNotReady_String" : "{alvr_server}/icons_neo3/right_controller_error.png",
+			"Prop_NamedIconPathDeviceStandby_String" : "{alvr_server}/icons_neo3/right_controller_off.png",
+			"Prop_NamedIconPathDeviceAlertLow_String" : "{alvr_server}/icons_neo3/right_controller_ready_low.png"
+		},
+		
+		"Model-v Defaults" : {
+			"Prop_NamedIconPathDeviceOff_String" : "{alvr_server}/icons_neo3/headset_off.png",
+			"Prop_NamedIconPathDeviceSearching_String" : "Prop_NamedIconPathDeviceOff_String",
+			"Prop_NamedIconPathDeviceSearchingAlert_String" : "Prop_NamedIconPathDeviceOff_String",
+			"Prop_NamedIconPathDeviceReady_String" : "Prop_NamedIconPathDeviceOff_String",
+			"Prop_NamedIconPathDeviceReadyAlert_String" : "Prop_NamedIconPathDeviceOff_String",
+			"Prop_NamedIconPathDeviceNotReady_String" : "Prop_NamedIconPathDeviceOff_String",
+			"Prop_NamedIconPathDeviceStandby_String" : "Prop_NamedIconPathDeviceOff_String",
+			"Prop_NamedIconPathDeviceAlertLow_String" : "Prop_NamedIconPathDeviceOff_String"
+		},
+	
+		"Model-v1.0" : {
+			"Alias" : "Model-v Defaults",
+			"Prop_NamedIconPathDeviceAlertLow_String" : "{alvr_server}/icons_neo3/headset_model1_alertlow.png"
+		},
+	
+		"Model-v2.0" : {
+			"Alias" : "Model-v1.0",
+			"Prop_NamedIconPathDeviceAlertLow_String" : "{alvr_server}/icons_neo3/headset_model2_alertlow.png"
+		}
+    }	    
+}

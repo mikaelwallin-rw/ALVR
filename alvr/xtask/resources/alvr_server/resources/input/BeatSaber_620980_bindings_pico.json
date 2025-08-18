@@ -1,0 +1,396 @@
+{
+   "bindings" : {
+      "/actions/valveindexcontroller" : {
+         "chords" : [],
+         "haptics" : [
+            {
+               "output" : "/actions/valveindexcontroller/out/haptic",
+               "path" : "/user/hand/left/output/haptic"
+            },
+            {
+               "output" : "/actions/valveindexcontroller/out/haptic",
+               "path" : "/user/hand/right/output/haptic"
+            }
+         ],
+         "poses" : [
+            {
+               "output" : "/actions/valveindexcontroller/in/devicepose",
+               "path" : "/user/hand/left/pose/grip"
+            },
+            {
+               "output" : "/actions/valveindexcontroller/in/devicepose",
+               "path" : "/user/hand/right/pose/grip"
+            },
+            {
+               "output" : "/actions/valveindexcontroller/in/pointer",
+               "path" : "/user/hand/left/pose/tip"
+            },
+            {
+               "output" : "/actions/valveindexcontroller/in/pointer",
+               "path" : "/user/hand/right/pose/tip"
+            }
+         ],
+         "sources" : [
+            {
+               "inputs" : {
+                  "click" : {
+                     "output" : "/actions/valveindexcontroller/in/system"
+                  }
+               },
+               "mode" : "button",
+               "parameters" : {
+                  "force_input" : "click"
+               },
+               "path" : "/user/hand/left/input/system"
+            },
+            {
+               "inputs" : {
+                  "click" : {
+                     "output" : "/actions/valveindexcontroller/in/system"
+                  }
+               },
+               "mode" : "button",
+               "parameters" : {
+                  "force_input" : "click"
+               },
+               "path" : "/user/hand/right/input/system"
+            },
+            {
+               "inputs" : {
+                  "touch" : {
+                     "output" : "/actions/valveindexcontroller/in/systemtouched"
+                  }
+               },
+               "mode" : "button",
+               "path" : "/user/hand/left/input/system"
+            },
+            {
+               "inputs" : {
+                  "touch" : {
+                     "output" : "/actions/valveindexcontroller/in/systemtouched"
+                  }
+               },
+               "mode" : "button",
+               "path" : "/user/hand/right/input/system"
+            },
+            {
+               "inputs" : {
+                  "click" : {
+                     "output" : "/actions/valveindexcontroller/in/primarybutton"
+                  }
+               },
+               "mode" : "button",
+               "parameters" : {
+                  "force_input" : "click"
+               },
+               "path" : "/user/hand/left/input/a"
+            },
+            {
+               "inputs" : {
+                  "click" : {
+                     "output" : "/actions/valveindexcontroller/in/primarybutton"
+                  }
+               },
+               "mode" : "button",
+               "parameters" : {
+                  "force_input" : "click"
+               },
+               "path" : "/user/hand/right/input/a"
+            },
+            {
+               "inputs" : {
+                  "touch" : {
+                     "output" : "/actions/valveindexcontroller/in/primarytouched"
+                  }
+               },
+               "mode" : "button",
+               "path" : "/user/hand/left/input/a"
+            },
+            {
+               "inputs" : {
+                  "touch" : {
+                     "output" : "/actions/valveindexcontroller/in/primarytouched"
+                  }
+               },
+               "mode" : "button",
+               "path" : "/user/hand/right/input/a"
+            },
+            {
+               "inputs" : {
+                  "click" : {
+                     "output" : "/actions/valveindexcontroller/in/secondarybutton"
+                  }
+               },
+               "mode" : "button",
+               "parameters" : {
+                  "force_input" : "click"
+               },
+               "path" : "/user/hand/left/input/b"
+            },
+            {
+               "inputs" : {
+                  "click" : {
+                     "output" : "/actions/valveindexcontroller/in/secondarybutton"
+                  }
+               },
+               "mode" : "button",
+               "parameters" : {
+                  "force_input" : "click"
+               },
+               "path" : "/user/hand/right/input/b"
+            },
+            {
+               "inputs" : {
+                  "touch" : {
+                     "output" : "/actions/valveindexcontroller/in/secondarytouched"
+                  }
+               },
+               "mode" : "button",
+               "path" : "/user/hand/left/input/b"
+            },
+            {
+               "inputs" : {
+                  "touch" : {
+                     "output" : "/actions/valveindexcontroller/in/secondarytouched"
+                  }
+               },
+               "mode" : "button",
+               "path" : "/user/hand/right/input/b"
+            },
+            {
+               "inputs" : {
+                  "pull" : {
+                     "output" : "/actions/valveindexcontroller/in/grip"
+                  }
+               },
+               "mode" : "trigger",
+               "path" : "/user/hand/left/input/grip"
+            },
+            {
+               "inputs" : {
+                  "pull" : {
+                     "output" : "/actions/valveindexcontroller/in/grip"
+                  }
+               },
+               "mode" : "trigger",
+               "path" : "/user/hand/right/input/grip"
+            },
+            {
+               "inputs" : {
+                  "click" : {
+                     "output" : "/actions/valveindexcontroller/in/grippressed"
+                  }
+               },
+               "mode" : "button",
+               "path" : "/user/hand/left/input/grip"
+            },
+            {
+               "inputs" : {
+                  "click" : {
+                     "output" : "/actions/valveindexcontroller/in/grippressed"
+                  }
+               },
+               "mode" : "button",
+               "path" : "/user/hand/right/input/grip"
+            },
+            {
+               "inputs" : {
+                  "force" : {
+                     "output" : "/actions/valveindexcontroller/in/gripforce"
+                  }
+               },
+               "mode" : "force_sensor",
+               "path" : "/user/hand/left/input/grip"
+            },
+            {
+               "inputs" : {
+                  "force" : {
+                     "output" : "/actions/valveindexcontroller/in/gripforce"
+                  }
+               },
+               "mode" : "force_sensor",
+               "path" : "/user/hand/right/input/grip"
+            },
+            {
+               "inputs" : {
+                  "pull" : {
+                     "output" : "/actions/valveindexcontroller/in/trigger"
+                  }
+               },
+               "mode" : "trigger",
+               "path" : "/user/hand/left/input/trigger"
+            },
+            {
+               "inputs" : {
+                  "pull" : {
+                     "output" : "/actions/valveindexcontroller/in/trigger"
+                  }
+               },
+               "mode" : "trigger",
+               "path" : "/user/hand/right/input/trigger"
+            },
+            {
+               "inputs" : {
+                  "click" : {
+                     "output" : "/actions/valveindexcontroller/in/triggerpressed"
+                  }
+               },
+               "mode" : "button",
+               "parameters" : {
+                  "force_input" : "click"
+               },
+               "path" : "/user/hand/left/input/trigger"
+            },
+            {
+               "inputs" : {
+                  "click" : {
+                     "output" : "/actions/valveindexcontroller/in/triggerpressed"
+                  }
+               },
+               "mode" : "button",
+               "parameters" : {
+                  "force_input" : "click"
+               },
+               "path" : "/user/hand/right/input/trigger"
+            },
+            {
+               "inputs" : {
+                  "touch" : {
+                     "output" : "/actions/valveindexcontroller/in/triggertouched"
+                  }
+               },
+               "mode" : "button",
+               "path" : "/user/hand/left/input/trigger"
+            },
+            {
+               "inputs" : {
+                  "touch" : {
+                     "output" : "/actions/valveindexcontroller/in/triggertouched"
+                  }
+               },
+               "mode" : "button",
+               "path" : "/user/hand/right/input/trigger"
+            },
+            {
+               "inputs" : {
+                  "position" : {
+                     "output" : "/actions/valveindexcontroller/in/thumbstick"
+                  }
+               },
+               "mode" : "joystick",
+               "path" : "/user/hand/left/input/thumbstick"
+            },
+            {
+               "inputs" : {
+                  "position" : {
+                     "output" : "/actions/valveindexcontroller/in/thumbstick"
+                  }
+               },
+               "mode" : "joystick",
+               "path" : "/user/hand/right/input/thumbstick"
+            },
+            {
+               "inputs" : {
+                  "click" : {
+                     "output" : "/actions/valveindexcontroller/in/thumbstickclicked"
+                  }
+               },
+               "mode" : "button",
+               "parameters" : {
+                  "force_input" : "click"
+               },
+               "path" : "/user/hand/left/input/thumbstick"
+            },
+            {
+               "inputs" : {
+                  "click" : {
+                     "output" : "/actions/valveindexcontroller/in/thumbstickclicked"
+                  }
+               },
+               "mode" : "button",
+               "parameters" : {
+                  "force_input" : "click"
+               },
+               "path" : "/user/hand/right/input/thumbstick"
+            },
+            {
+               "inputs" : {
+                  "touch" : {
+                     "output" : "/actions/valveindexcontroller/in/thumbsticktouched"
+                  }
+               },
+               "mode" : "button",
+               "path" : "/user/hand/left/input/thumbstick"
+            },
+            {
+               "inputs" : {
+                  "touch" : {
+                     "output" : "/actions/valveindexcontroller/in/thumbsticktouched"
+                  }
+               },
+               "mode" : "button",
+               "path" : "/user/hand/right/input/thumbstick"
+            },
+            {
+               "inputs" : {
+                  "position" : {
+                     "output" : "/actions/valveindexcontroller/in/trackpad"
+                  }
+               },
+               "mode" : "trackpad",
+               "path" : "/user/hand/left/input/trackpad"
+            },
+            {
+               "inputs" : {
+                  "position" : {
+                     "output" : "/actions/valveindexcontroller/in/trackpad"
+                  }
+               },
+               "mode" : "trackpad",
+               "path" : "/user/hand/right/input/trackpad"
+            },
+            {
+               "inputs" : {
+                  "force" : {
+                     "output" : "/actions/valveindexcontroller/in/trackpadforce"
+                  }
+               },
+               "mode" : "force_sensor",
+               "path" : "/user/hand/left/input/trackpad"
+            },
+            {
+               "inputs" : {
+                  "force" : {
+                     "output" : "/actions/valveindexcontroller/in/trackpadforce"
+                  }
+               },
+               "mode" : "force_sensor",
+               "path" : "/user/hand/right/input/trackpad"
+            },
+            {
+               "inputs" : {
+                  "touch" : {
+                     "output" : "/actions/valveindexcontroller/in/trackpadtouched"
+                  }
+               },
+               "mode" : "button",
+               "path" : "/user/hand/left/input/trackpad"
+            },
+            {
+               "inputs" : {
+                  "touch" : {
+                     "output" : "/actions/valveindexcontroller/in/trackpadtouched"
+                  }
+               },
+               "mode" : "button",
+               "path" : "/user/hand/right/input/trackpad"
+            }
+         ]
+      }
+   },
+   "category" : "openxr",
+   "controller_type" : "knuckles",
+   "description": "BeatSaber of PICO Bindings",
+   "interaction_profile" : "/interaction_profiles/valve/index_controller",
+   "name" : "BeatSaber of PICO"
+}

@@ -1,0 +1,265 @@
+{
+   "bindings" : {
+      "/actions/controllers" : {
+         "chords" : [],
+         "haptics" : [
+            {
+               "output" : "/actions/controllers/out/left-controller-vibration",
+               "path" : "/user/hand/left/output/haptic"
+            },
+            {
+               "output" : "/actions/controllers/out/right-controller-vibration",
+               "path" : "/user/hand/right/output/haptic"
+            }
+         ],
+         "poses" : [
+            {
+               "output" : "/actions/controllers/in/left-controller-grip-pose",
+               "path" : "/user/hand/left/pose/grip"
+            },
+            {
+               "output" : "/actions/controllers/in/right-controller-grip-pose",
+               "path" : "/user/hand/right/pose/grip"
+            },
+            {
+               "output" : "/actions/controllers/in/left-controller-aim-pose",
+               "path" : "/user/hand/left/pose/tip"
+            },
+            {
+               "output" : "/actions/controllers/in/right-controller-aim-pose",
+               "path" : "/user/hand/right/pose/tip"
+            }
+         ]
+      },
+      "/actions/ue" : {
+         "chords" : [],
+         "haptics" : [],
+         "poses" : [],
+         "sources" : [
+            {
+               "inputs" : {
+                  "click" : {
+                     "output" : "/actions/ue/in/vive_left_grip_click"
+                  }
+               },
+               "mode" : "button",
+               "path" : "/user/hand/left/input/grip"
+            },
+            {
+               "inputs" : {
+                  "click" : {
+                     "output" : "/actions/ue/in/vive_left_menu_click"
+                  }
+               },
+               "mode" : "button",
+               "parameters" : {
+                  "force_input" : "click"
+               },
+               "path" : "/user/hand/left/input/application_menu"
+            },
+            {
+               "inputs" : {
+                  "click" : {
+                     "output" : "/actions/ue/in/vive_left_trigger_click"
+                  }
+               },
+               "mode" : "button",
+               "path" : "/user/hand/left/input/trigger"
+            },
+            {
+               "inputs" : {
+                  "pull" : {
+                     "output" : "/actions/ue/in/vive_left_trigger_axis"
+                  }
+               },
+               "mode" : "trigger",
+               "path" : "/user/hand/left/input/trigger"
+            },
+            {
+               "inputs" : {
+                  "position_x" : {
+                     "output" : "/actions/ue/in/vive_left_trackpad_x"
+                  }
+               },
+               "mode" : "trackpad",
+               "path" : "/user/hand/left/input/trackpad"
+            },
+            {
+               "inputs" : {
+                  "position_y" : {
+                     "output" : "/actions/ue/in/vive_left_trackpad_y"
+                  }
+               },
+               "mode" : "trackpad",
+               "path" : "/user/hand/left/input/trackpad"
+            },
+            {
+               "inputs" : {
+                  "click" : {
+                     "output" : "/actions/ue/in/vive_left_trackpad_click"
+                  }
+               },
+               "mode" : "button",
+               "parameters" : {
+                  "force_input" : "click"
+               },
+               "path" : "/user/hand/left/input/trackpad"
+            },
+            {
+               "inputs" : {
+                  "touch" : {
+                     "output" : "/actions/ue/in/vive_left_trackpad_touch"
+                  }
+               },
+               "mode" : "button",
+               "path" : "/user/hand/left/input/trackpad"
+            },
+            {
+               "inputs" : {
+                  "east" : {
+                     "output" : "/actions/ue/in/vive_left_trackpad_right"
+                  },
+                  "north" : {
+                     "output" : "/actions/ue/in/vive_left_trackpad_up"
+                  },
+                  "south" : {
+                     "output" : "/actions/ue/in/vive_left_trackpad_down"
+                  },
+                  "west" : {
+                     "output" : "/actions/ue/in/vive_left_trackpad_left"
+                  }
+               },
+               "mode" : "dpad_click",
+               "parameters" : {
+                  "click_activate_threshold" : 0.5,
+                  "click_deactivate_threshold" : 0.400000006,
+                  "deadzone_pct" : 50,
+                  "haptic_amplitude" : 0,
+                  "haptic_duration" : 0,
+                  "haptic_frequency" : 0,
+                  "off_haptic_amplitude" : 0,
+                  "off_haptic_duration" : 0,
+                  "off_haptic_frequency" : 0,
+                  "overlap_pct" : 2.782753519183795e-06,
+                  "sticky" : false
+               },
+               "path" : "/user/hand/left/input/trackpad"
+            },
+            {
+               "inputs" : {
+                  "click" : {
+                     "output" : "/actions/ue/in/vive_right_grip_click"
+                  }
+               },
+               "mode" : "button",
+               "path" : "/user/hand/right/input/grip"
+            },
+            {
+               "inputs" : {
+                  "click" : {
+                     "output" : "/actions/ue/in/vive_right_menu_click"
+                  }
+               },
+               "mode" : "button",
+               "parameters" : {
+                  "force_input" : "click"
+               },
+               "path" : "/user/hand/right/input/application_menu"
+            },
+            {
+               "inputs" : {
+                  "click" : {
+                     "output" : "/actions/ue/in/vive_right_trigger_click"
+                  }
+               },
+               "mode" : "button",
+               "path" : "/user/hand/right/input/trigger"
+            },
+            {
+               "inputs" : {
+                  "pull" : {
+                     "output" : "/actions/ue/in/vive_right_trigger_axis"
+                  }
+               },
+               "mode" : "trigger",
+               "path" : "/user/hand/right/input/trigger"
+            },
+            {
+               "inputs" : {
+                  "position_x" : {
+                     "output" : "/actions/ue/in/vive_right_trackpad_x"
+                  }
+               },
+               "mode" : "trackpad",
+               "path" : "/user/hand/right/input/trackpad"
+            },
+            {
+               "inputs" : {
+                  "position_y" : {
+                     "output" : "/actions/ue/in/vive_right_trackpad_y"
+                  }
+               },
+               "mode" : "trackpad",
+               "path" : "/user/hand/right/input/trackpad"
+            },
+            {
+               "inputs" : {
+                  "click" : {
+                     "output" : "/actions/ue/in/vive_right_trackpad_click"
+                  }
+               },
+               "mode" : "button",
+               "parameters" : {
+                  "force_input" : "click"
+               },
+               "path" : "/user/hand/right/input/trackpad"
+            },
+            {
+               "inputs" : {
+                  "touch" : {
+                     "output" : "/actions/ue/in/vive_right_trackpad_touch"
+                  }
+               },
+               "mode" : "button",
+               "path" : "/user/hand/right/input/trackpad"
+            },
+            {
+               "inputs" : {
+                  "east" : {
+                     "output" : "/actions/ue/in/vive_right_trackpad_right"
+                  },
+                  "north" : {
+                     "output" : "/actions/ue/in/vive_right_trackpad_up"
+                  },
+                  "south" : {
+                     "output" : "/actions/ue/in/vive_right_trackpad_down"
+                  },
+                  "west" : {
+                     "output" : "/actions/ue/in/vive_right_trackpad_left"
+                  }
+               },
+               "mode" : "dpad_click",
+               "parameters" : {
+                  "click_activate_threshold" : 0.5,
+                  "click_deactivate_threshold" : 0.400000006,
+                  "deadzone_pct" : 50,
+                  "haptic_amplitude" : 0,
+                  "haptic_duration" : 0,
+                  "haptic_frequency" : 0,
+                  "off_haptic_amplitude" : 0,
+                  "off_haptic_duration" : 0,
+                  "off_haptic_frequency" : 0,
+                  "overlap_pct" : 2.782753519183795e-06,
+                  "sticky" : false
+               },
+               "path" : "/user/hand/right/input/trackpad"
+            }
+         ]
+      }
+   },
+   "category" : "openxr",
+   "controller_type" : "vive_controller",
+   "interaction_profile" : "/interaction_profiles/htc/vive_controller",
+   "description": "Pavlov of PICO Bindings",
+   "name" : "Pavlov of PICO"
+}

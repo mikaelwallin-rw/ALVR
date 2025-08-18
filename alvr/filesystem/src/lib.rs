@@ -121,7 +121,7 @@ impl Layout {
             let static_resources_dir =
                 or_path(option_env!("ALVR_STATIC_RESOURCES_DIR"), "share/alvr");
             let openvr_driver_root_dir =
-                or_path(option_env!("ALVR_OPENVR_DRIVER_ROOT_DIR"), "lib64/alvr");
+                or_path(option_env!("ALVR_OPENVR_DRIVER_ROOT_DIR"), "lib64/alvr/alvr_server");
             let vrcompositor_wrapper_dir =
                 or_path(option_env!("ALVR_VRCOMPOSITOR_WRAPPER_DIR"), "libexec/alvr");
             let firewall_script_dir = or_path(option_env!("FIREWALL_SCRIPT_DIR"), "libexec/alvr");
@@ -163,7 +163,7 @@ impl Layout {
             static_resources_dir: root.to_owned(),
             config_dir: root.to_owned(),
             log_dir: root.to_owned(),
-            openvr_driver_root_dir: root.to_owned(),
+            openvr_driver_root_dir: root.join("alvr_server"),
             vrcompositor_wrapper_dir: root.to_owned(),
             firewall_script_dir: root.to_owned(),
             firewalld_config_dir: root.to_owned(),
@@ -309,11 +309,16 @@ pub fn filesystem_layout_from_dashboard_exe(path: &Path) -> Option<Layout> {
 // The dir argument is used only if ALVR is built as portable
 pub fn filesystem_layout_from_openvr_driver_root_dir(dir: &Path) -> Option<Layout> {
     layout_from_env().or_else(|| {
+        // The `dir` parameter is the openvr driver root (e.g. .../alvr_server).
+        // Layout::new expects the top-level build root so that openvr_driver_root_dir
+        // = root.join("alvr_server"). To handle a registered driver root correctly,
+        // use its parent directory as `root` on non-linux platforms.
         let root = if cfg!(target_os = "linux") {
             // FHS path is expected
             dir.parent()?.parent()?.to_owned()
         } else {
-            dir.to_owned()
+            // dir is already the openvr_driver_root_dir ( .../alvr_server ), so use its parent
+            dir.parent()?.to_owned()
         };
 
         Some(Layout::new(&root))

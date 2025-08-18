@@ -208,6 +208,17 @@ pub fn build_streamer(
                 sh.copy_file(lib_path.clone(), bin_dir).unwrap();
             }
         }
+
+        // also mirror the driver lib bin contents into bin/win64 so the
+        // installation contains the same binaries (driver sees them under vrlink)
+        // let vrlink_bin_dir = build_layout
+        //     .openvr_driver_root_dir
+        //     .join("bin")
+        //     .join("win64");
+        // sh.create_dir(&vrlink_bin_dir).unwrap();
+
+        // command::copy_recursive(&sh, &build_layout.openvr_driver_lib_dir(), &vrlink_bin_dir)
+        //     .unwrap();
     } else if cfg!(target_os = "linux") {
         // build compositor wrapper
         let _push_guard = sh.push_dir(afs::crate_dir("vrcompositor_wrapper"));
@@ -265,11 +276,21 @@ pub fn build_streamer(
     // copy static resources
     {
         // copy driver manifest
+        let manifest_path = build_layout.openvr_driver_manifest();
+        sh.create_dir(manifest_path.parent().unwrap()).unwrap();
         sh.copy_file(
-            afs::crate_dir("xtask").join("resources/driver.vrdrivermanifest"),
-            build_layout.openvr_driver_manifest(),
+            afs::crate_dir("xtask").join("resources/alvr_server/driver.vrdrivermanifest"),
+            manifest_path,
         )
         .unwrap();
+
+        // copy entire resources folder (icons, rendermodels, driver_resource, etc.)
+        // into the driver installation's resources directory so SteamVR can resolve
+        // resource tokens like "{pico}" / "{vrlink}" used by the driver props.
+        let resources_src = afs::crate_dir("xtask").join("resources").join("alvr_server").join("resources");
+        let resources_dst = build_layout.openvr_driver_root_dir.join("resources");
+        sh.create_dir(resources_dst.parent().unwrap()).unwrap();
+        command::copy_recursive(&sh, &resources_src, &resources_dst).unwrap();
     }
 }
 
