@@ -312,6 +312,13 @@ pub extern "C" fn set_device_openvr_props(instance_ptr: *mut c_void, device_id: 
         for prop in &settings.headset.extra_openvr_props {
             set_prop(prop.key, &prop.value);
         }
+
+        // If controllers are configured as Pico4, prefer phoenix icons for headset status.
+        if let Switch::Enabled(controllers) = &settings.headset.controllers {
+            if matches!(controllers.emulation_mode, ControllersEmulationMode::Pico4) {
+                set_icons("{alvr_server}/icons_phoenix/headset");
+            }
+        }
     } else if device_id == *HAND_LEFT_ID
         || device_id == *HAND_RIGHT_ID
         || device_id == *HAND_TRACKER_LEFT_ID
@@ -408,15 +415,15 @@ pub extern "C" fn set_device_openvr_props(instance_ptr: *mut c_void, device_id: 
                             RenderModelNameString,
                             "{alvr_server}/rendermodels/pico_4s_leftcontroller",
                         );
-                        set_icons("{alvr_server}/icons/left_pico4");
-                    } else if right_hand {
-                        set_prop(ModelNumberString, "PICO 4 (Right Controller)");
-                        set_prop(
-                            RenderModelNameString,
-                            "{alvr_server}/rendermodels/pico_4s_rightcontroller",
-                        );
-                        set_icons("{alvr_server}/icons/right_pico4");
-                    }
+                    set_icons("{alvr_server}/icons_phoenix/left_controller");
+                } else if right_hand {
+                    set_prop(ModelNumberString, "PICO 4 (Right Controller)");
+                    set_prop(
+                        RenderModelNameString,
+                        "{alvr_server}/rendermodels/pico_4s_rightcontroller",
+                    );
+                    set_icons("{alvr_server}/icons_phoenix/right_controller");
+                }
                     set_prop(ControllerTypeString, "pico_controller");
                     set_prop(
                         InputProfilePathString,
@@ -566,7 +573,7 @@ pub extern "C" fn set_device_openvr_props(instance_ptr: *mut c_void, device_id: 
                     );
                     set_prop(SerialNumberString, "alvr_serverQ_Hand_Left");
                     set_prop(AttachedDeviceIdString, "alvr_serverQ_Hand_Left");
-                    set_icons("{alvr_server}/icons/left_handtracking");
+                    set_icons("{alvr_server}/icons_hand/left_handtracking");
                 } else if right_hand {
                     set_prop(ModelNumberString, "alvr_server Hand Tracker (Right Hand)");
                     set_prop(
@@ -575,7 +582,7 @@ pub extern "C" fn set_device_openvr_props(instance_ptr: *mut c_void, device_id: 
                     );
                     set_prop(SerialNumberString, "alvr_serverQ_Hand_Right");
                     set_prop(AttachedDeviceIdString, "alvr_serverQ_Hand_Right");
-                    set_icons("{alvr_server}/icons/right_handtracking");
+                    set_icons("{alvr_server}/icons_hand/right_handtracking");
                 }
             }
 
@@ -607,4 +614,3 @@ pub extern "C" fn set_device_openvr_props(instance_ptr: *mut c_void, device_id: 
         }
     }
 }
-

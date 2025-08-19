@@ -440,6 +440,7 @@ dependencies = [
  "alvr_session",
  "bindgen 0.71.1",
  "cc",
+ "once_cell",
  "pkg-config",
  "serde_json",
  "sysinfo",
