@@ -1,0 +1,19 @@
+{
+  "thumbnail": "hand.png",
+  "skeleton": "/skeleton/hand/right",
+  "components": {
+    "body": {
+      "filename": "hand.obj",
+      "component_local": {
+        "origin": [0.0, 0.0, 0.0],
+        "rotate_xyz": [0.0, 0.0, 0.0]
+      }
+    },
+    "openxr_handmodel": {
+      "component_local": {
+        "origin": [0.01125, -0.00182941, 0.1019482],
+        "rotate_xyz": [-39.4, 0.0, 0.0]
+      }
+    }
+  }
+}

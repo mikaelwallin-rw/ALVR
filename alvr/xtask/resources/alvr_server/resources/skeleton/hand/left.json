@@ -1,0 +1,44 @@
+{
+  "openvr_skeleton_version": 1,
+  "bone_count": 31,
+  "handedness": "left",
+  "bones": [
+    { "index": 0,  "name": "root",                "parent": -1, "pose": { "position": [0.0, 0.0, 0.0], "orientation": [1.0, 0.0, 0.0, 0.0] } },
+    { "index": 1,  "name": "wrist",               "parent": 0,  "pose": { "position": [0.0, 0.02, 0.0], "orientation": [1.0, 0.0, 0.0, 0.0] } },
+
+    { "index": 2,  "name": "thumb_metacarpal",    "parent": 1,  "pose": { "position": [0.02, 0.02, 0.01], "orientation": [1.0, 0.0, 0.0, 0.0] } },
+    { "index": 3,  "name": "thumb_proximal",      "parent": 2,  "pose": { "position": [0.035, 0.03, 0.01], "orientation": [1.0, 0.0, 0.0, 0.0] } },
+    { "index": 4,  "name": "thumb_distal",        "parent": 3,  "pose": { "position": [0.045, 0.04, 0.01], "orientation": [1.0, 0.0, 0.0, 0.0] } },
+    { "index": 5,  "name": "thumb_tip",           "parent": 4,  "pose": { "position": [0.055, 0.05, 0.01], "orientation": [1.0, 0.0, 0.0, 0.0] } },
+
+    { "index": 6,  "name": "index_metacarpal",    "parent": 1,  "pose": { "position": [0.01, 0.03, 0.06], "orientation": [1.0, 0.0, 0.0, 0.0] } },
+    { "index": 7,  "name": "index_proximal",      "parent": 6,  "pose": { "position": [0.01, 0.05, 0.09], "orientation": [1.0, 0.0, 0.0, 0.0] } },
+    { "index": 8,  "name": "index_intermediate",  "parent": 7,  "pose": { "position": [0.01, 0.07, 0.10], "orientation": [1.0, 0.0, 0.0, 0.0] } },
+    { "index": 9,  "name": "index_distal",        "parent": 8,  "pose": { "position": [0.01, 0.09, 0.11], "orientation": [1.0, 0.0, 0.0, 0.0] } },
+    { "index": 10, "name": "index_tip",           "parent": 9,  "pose": { "position": [0.01, 0.105, 0.115], "orientation": [1.0, 0.0, 0.0, 0.0] } },
+
+    { "index": 11, "name": "middle_metacarpal",   "parent": 1,  "pose": { "position": [0.0, 0.03, 0.07], "orientation": [1.0, 0.0, 0.0, 0.0] } },
+    { "index": 12, "name": "middle_proximal",     "parent": 11, "pose": { "position": [0.0, 0.055, 0.10], "orientation": [1.0, 0.0, 0.0, 0.0] } },
+    { "index": 13, "name": "middle_intermediate", "parent": 12, "pose": { "position": [0.0, 0.08, 0.11], "orientation": [1.0, 0.0, 0.0, 0.0] } },
+    { "index": 14, "name": "middle_distal",       "parent": 13, "pose": { "position": [0.0, 0.10, 0.115], "orientation": [1.0, 0.0, 0.0, 0.0] } },
+    { "index": 15, "name": "middle_tip",          "parent": 14, "pose": { "position": [0.0, 0.115, 0.12], "orientation": [1.0, 0.0, 0.0, 0.0] } },
+
+    { "index": 16, "name": "ring_metacarpal",     "parent": 1,  "pose": { "position": [-0.01, 0.03, 0.06], "orientation": [1.0, 0.0, 0.0, 0.0] } },
+    { "index": 17, "name": "ring_proximal",       "parent": 16, "pose": { "position": [-0.01, 0.05, 0.09], "orientation": [1.0, 0.0, 0.0, 0.0] } },
+    { "index": 18, "name": "ring_intermediate",   "parent": 17, "pose": { "position": [-0.01, 0.07, 0.10], "orientation": [1.0, 0.0, 0.0, 0.0] } },
+    { "index": 19, "name": "ring_distal",         "parent": 18, "pose": { "position": [-0.01, 0.09, 0.11], "orientation": [1.0, 0.0, 0.0, 0.0] } },
+    { "index": 20, "name": "ring_tip",            "parent": 19, "pose": { "position": [-0.01, 0.105, 0.115], "orientation": [1.0, 0.0, 0.0, 0.0] } },
+
+    { "index": 21, "name": "pinky_metacarpal",    "parent": 1,  "pose": { "position": [-0.02, 0.02, 0.05], "orientation": [1.0, 0.0, 0.0, 0.0] } },
+    { "index": 22, "name": "pinky_proximal",      "parent": 21, "pose": { "position": [-0.03, 0.04, 0.08], "orientation": [1.0, 0.0, 0.0, 0.0] } },
+    { "index": 23, "name": "pinky_intermediate",  "parent": 22, "pose": { "position": [-0.03, 0.06, 0.095], "orientation": [1.0, 0.0, 0.0, 0.0] } },
+    { "index": 24, "name": "pinky_distal",        "parent": 23, "pose": { "position": [-0.03, 0.08, 0.105], "orientation": [1.0, 0.0, 0.0, 0.0] } },
+    { "index": 25, "name": "pinky_tip",           "parent": 24, "pose": { "position": [-0.03, 0.095, 0.11], "orientation": [1.0, 0.0, 0.0, 0.0] } },
+
+    { "index": 26, "name": "thumb_aux",           "parent": 4,  "pose": { "position": [0.047, 0.045, 0.01], "orientation": [1.0, 0.0, 0.0, 0.0] } },
+    { "index": 27, "name": "index_aux",           "parent": 10, "pose": { "position": [0.01, 0.11, 0.12], "orientation": [1.0, 0.0, 0.0, 0.0] } },
+    { "index": 28, "name": "middle_aux",          "parent": 15, "pose": { "position": [0.0, 0.12, 0.12], "orientation": [1.0, 0.0, 0.0, 0.0] } },
+    { "index": 29, "name": "ring_aux",            "parent": 20, "pose": { "position": [-0.01, 0.11, 0.12], "orientation": [1.0, 0.0, 0.0, 0.0] } },
+    { "index": 30, "name": "pinky_aux",           "parent": 25, "pose": { "position": [-0.03, 0.11, 0.12], "orientation": [1.0, 0.0, 0.0, 0.0] } }
+  ]
+}

@@ -557,8 +557,20 @@ pub extern "C" fn set_device_openvr_props(instance_ptr: *mut c_void, device_id: 
             if full_skeletal_hand {
                 set_prop(TrackingSystemNameString, "alvr_server");
                 set_prop(ManufacturerNameString, "alvr_server");
+                // Ensure SteamVR resolves {alvr_server} token to this driver's resources
+                set_prop(ResourceRootString, "alvr_server");
 
-                set_prop(RenderModelNameString, "{alvr_server}/rendermodels/shuttlecock");
+                if left_hand {
+                    set_prop(
+                        RenderModelNameString,
+                        "{alvr_server}/rendermodels/alvr_hand_left",
+                    );
+                } else if right_hand {
+                    set_prop(
+                        RenderModelNameString,
+                        "{alvr_server}/rendermodels/alvr_hand_right",
+                    );
+                }
                 set_prop(ControllerTypeString, "svl_hand_interaction_augmented");
                 set_prop(
                     InputProfilePathString,
