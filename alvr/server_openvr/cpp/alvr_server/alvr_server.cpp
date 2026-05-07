@@ -548,8 +548,9 @@ void SetTracking(
         }
 
         for (auto id : BODY_IDS) {
-            auto* maybeTracker = (FakeViveTracker*)g_driver_provider.tracked_devices.at(id);
-            if (maybeTracker) {
+            auto it = g_driver_provider.tracked_devices.find(id);
+            if (it != g_driver_provider.tracked_devices.end()) {
+                auto* maybeTracker = (FakeViveTracker*)it->second;
                 auto res = motionsMap.find(id);
                 auto* maybeMotion = res != motionsMap.end() ? &res->second : nullptr;
 
@@ -627,6 +628,12 @@ void SetButton(unsigned long long buttonID, FfiButtonValue value) {
         if (g_driver_provider.right_hand_tracker) {
             g_driver_provider.right_hand_tracker->SetButton(buttonID, value);
         }
+    }
+}
+
+void SetProximityState(bool headset_is_worn) {
+    if (g_driver_provider.hmd) {
+        g_driver_provider.hmd->SetProximityState(headset_is_worn);
     }
 }
 

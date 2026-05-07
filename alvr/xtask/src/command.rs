@@ -45,18 +45,6 @@ pub fn download_and_extract_tar(url: &str, destination: &Path) -> Result<(), xsh
     untar(&sh, &tar_file, destination)
 }
 
-pub fn date_utc_yyyymmdd(sh: &Shell) -> Result<String, xshell::Error> {
-    if cfg!(windows) {
-        cmd!(
-            sh,
-            "powershell (Get-Date).ToUniversalTime().ToString(\"yyyy.MM.dd\")"
-        )
-        .read()
-    } else {
-        cmd!(sh, "date -u +%Y.%m.%d").read()
-    }
-}
-
 pub fn copy_recursive(sh: &Shell, source_dir: &Path, dest_dir: &Path) -> Result<(), xshell::Error> {
     sh.create_dir(dest_dir)?;
 
@@ -70,4 +58,16 @@ pub fn copy_recursive(sh: &Shell, source_dir: &Path, dest_dir: &Path) -> Result<
     }
 
     Ok(())
+}
+
+pub fn date_utc_yyyymmdd(sh: &Shell) -> Result<String, xshell::Error> {
+    if cfg!(windows) {
+        cmd!(
+            sh,
+            "powershell (Get-Date).ToUniversalTime().ToString(\"yyyy.MM.dd\")"
+        )
+        .read()
+    } else {
+        cmd!(sh, "date -u +%Y.%m.%d").read()
+    }
 }

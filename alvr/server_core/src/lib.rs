@@ -26,7 +26,7 @@ use alvr_common::{
 use alvr_events::{EventType, HapticsEvent};
 use alvr_filesystem as afs;
 use alvr_packets::{
-    BatteryInfo, ButtonEntry, ClientListAction, DecoderInitializationConfig, Haptics,
+    BatteryInfo, ButtonEntry, ClientConnectionsAction, DecoderInitializationConfig, Haptics,
     VideoPacketHeader,
 };
 use alvr_server_io::ServerSessionManager;
@@ -89,6 +89,7 @@ pub enum ServerCoreEvent {
     GameRenderLatencyFeedback(Duration), // only used for SteamVR
     ShutdownPending,
     RestartPending,
+    ProximityState(bool),
 }
 
 pub struct ConnectionContext {
@@ -546,9 +547,9 @@ impl Drop for ServerCoreContext {
                 .collect::<Vec<_>>();
 
             for hostname in hostnames {
-                session_manager_lock.update_client_list(
+                session_manager_lock.update_client_connections(
                     hostname,
-                    ClientListAction::SetConnectionState(ConnectionState::Disconnecting),
+                    ClientConnectionsAction::SetConnectionState(ConnectionState::Disconnecting),
                 );
             }
         }

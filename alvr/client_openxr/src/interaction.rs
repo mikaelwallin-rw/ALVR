@@ -1,15 +1,15 @@
 use crate::{
     Platform,
     extra_extensions::{
-        self, BODY_JOINT_SET_FULL_BODY_META, BodyJointSetBD, BodyTrackerBD, BodyTrackerFB,
-        EyeTrackerSocial, FULL_BODY_JOINT_COUNT_META, FaceTracker2FB, FaceTrackerPico,
-        FacialTrackerHTC, MotionTrackerBD, MultimodalMeta,
+        self, BodyTrackerBD, BodyTrackerFB, EyeTrackerSocial, FaceTracker2FB, FaceTrackerBD,
+        FacialTrackerHTC, MotionTrackerBD, MultimodalMeta, QRCodesSpatialContext,
     },
 };
 use alvr_common::{
     glam::{Quat, Vec3},
     *,
 };
+use alvr_graphics::HandData;
 use alvr_packets::{ButtonEntry, ButtonValue, FaceData, FaceExpressions, StreamConfig};
 use alvr_session::{BodyTrackingBDConfig, BodyTrackingSourcesConfig, FaceTrackingSourcesConfig};
 use openxr as xr;
@@ -53,6 +53,10 @@ fn get_controller_offset(platform: Platform, is_right_hand: bool) -> Pose {
         },
         p if p.is_vive() => Pose {
             position: Vec3::new(0.0, 0.0, -0.02),
+            orientation: Quat::IDENTITY,
+        },
+        Platform::SamsungGalaxyXR => Pose {
+            position: Vec3::new(0.0, 0.0, 0.055),
             orientation: Quat::IDENTITY,
         },
         _ => Pose::IDENTITY,
@@ -104,13 +108,16 @@ pub struct HandInteraction {
     #[expect(dead_code)]
     pub aim_space: xr::Space,
 
+    pub detached_grip_action: Option<xr::Action<xr::Posef>>,
+    pub detached_grip_space: Option<xr::Space>,
+
     pub vibration_action: xr::Action<xr::Haptic>,
     pub skeleton_tracker: Option<xr::HandTracker>,
 }
 
 pub enum FaceExpressionsTracker {
     Fb(FaceTracker2FB),
-    Pico(FaceTrackerPico),
+    Bd(FaceTrackerBD),
     Htc {
         eye: Option<FacialTrackerHTC>,
         lip: Option<FacialTrackerHTC>,
@@ -137,6 +144,7 @@ pub struct InteractionSourcesConfig {
     pub face_tracking: Option<FaceTrackingSourcesConfig>,
     pub body_tracking: Option<BodyTrackingSourcesConfig>,
     pub prefers_multimodal_input: bool,
+    pub markers_to_track: Option<HashSet<String>>,
 }
 
 impl InteractionSourcesConfig {
@@ -157,9 +165,15 @@ impl InteractionSourcesConfig {
             prefers_multimodal_input: config
                 .settings
                 .headset
-                .controllers
+                .multimodal_tracking
                 .as_option()
-                .is_some_and(|c| c.multimodal_tracking),
+                .is_some_and(|c| c.enabled),
+            markers_to_track: config
+                .settings
+                .headset
+                .marker_colocation
+                .as_option()
+                .map(|c| HashSet::from_iter([c.qr_code_string.clone()])),
         }
     }
 }
@@ -176,6 +190,7 @@ pub struct InteractionContext {
     pub multimodal_hands_enabled: bool,
     pub face_sources: FaceSources,
     pub body_source: Option<BodyTracker>,
+    pub marker_spatial_context: Option<QRCodesSpatialContext>,
 }
 
 impl InteractionContext {
@@ -302,37 +317,40 @@ impl InteractionContext {
 
         let multimodal_handle = check_ext_object(
             "MultimodalMeta",
-            MultimodalMeta::new(xr_session.clone(), &extra_extensions, xr_system),
+            MultimodalMeta::new(xr_session.clone(), xr_system),
         );
 
-        let left_detached_controller_pose_action;
-        let right_detached_controller_pose_action;
+        let mut left_detached_grip_action = None;
+        let mut right_detached_grip_action = None;
         if multimodal_handle.is_some() {
-            // Note: when multimodal input is enabled, both controllers and hands will always be active.
-            // To be able to detect when controllers are actually held, we have to register detached
-            // controllers pose; the controller pose will be diverted to the detached controllers when
-            // they are not held. Currently the detached controllers pose is ignored
-            left_detached_controller_pose_action = action_set
-                .create_action::<xr::Posef>(
-                    "left_detached_controller_pose",
-                    "Left detached controller pose",
-                    &[],
-                )
-                .unwrap();
-            right_detached_controller_pose_action = action_set
-                .create_action::<xr::Posef>(
-                    "right_detached_controller_pose",
-                    "Right detached controller pose",
-                    &[],
-                )
-                .unwrap();
+            // Note: when multimodal input is enabled, both controllers and hands will always be
+            // active. Held controllers and detached controllers are sent to the server as separate
+            // devices.
+            let left_detached_grip_action = left_detached_grip_action.insert(
+                action_set
+                    .create_action::<xr::Posef>(
+                        "left_detached_grip_pose",
+                        "Left detached grip pose",
+                        &[],
+                    )
+                    .unwrap(),
+            );
+            let right_detached_grip_action = right_detached_grip_action.insert(
+                action_set
+                    .create_action::<xr::Posef>(
+                        "right_detached_grip_pose",
+                        "Right detached grip pose",
+                        &[],
+                    )
+                    .unwrap(),
+            );
 
             bindings.push(binding(
-                &left_detached_controller_pose_action,
+                left_detached_grip_action,
                 "/user/detached_controller_meta/left/input/grip/pose",
             ));
             bindings.push(binding(
-                &right_detached_controller_pose_action,
+                right_detached_grip_action,
                 "/user/detached_controller_meta/right/input/grip/pose",
             ));
         }
@@ -348,18 +366,29 @@ impl InteractionContext {
             .unwrap();
 
         let left_grip_space = left_grip_action
-            .create_space(xr_session.clone(), xr::Path::NULL, xr::Posef::IDENTITY)
+            .create_space(&xr_session, xr::Path::NULL, xr::Posef::IDENTITY)
             .unwrap();
         let right_grip_space = right_grip_action
-            .create_space(xr_session.clone(), xr::Path::NULL, xr::Posef::IDENTITY)
+            .create_space(&xr_session, xr::Path::NULL, xr::Posef::IDENTITY)
             .unwrap();
 
         let left_aim_space = left_aim_action
-            .create_space(xr_session.clone(), xr::Path::NULL, xr::Posef::IDENTITY)
+            .create_space(&xr_session, xr::Path::NULL, xr::Posef::IDENTITY)
             .unwrap();
         let right_aim_space = right_aim_action
-            .create_space(xr_session.clone(), xr::Path::NULL, xr::Posef::IDENTITY)
+            .create_space(&xr_session, xr::Path::NULL, xr::Posef::IDENTITY)
             .unwrap();
+
+        let left_detached_grip_space = left_detached_grip_action.as_ref().map(|action| {
+            action
+                .create_space(&xr_session, xr::Path::NULL, xr::Posef::IDENTITY)
+                .unwrap()
+        });
+        let right_detached_grip_space = right_detached_grip_action.as_ref().map(|action| {
+            action
+                .create_space(&xr_session, xr::Path::NULL, xr::Posef::IDENTITY)
+                .unwrap()
+        });
 
         let left_hand_tracker = check_ext_object(
             "HandTracker (left)",
@@ -398,7 +427,7 @@ impl InteractionContext {
                 }
 
                 let space = action
-                    .create_space(xr_session.clone(), xr::Path::NULL, xr::Posef::IDENTITY)
+                    .create_space(&xr_session, xr::Path::NULL, xr::Posef::IDENTITY)
                     .unwrap();
 
                 Some((action, space))
@@ -448,6 +477,8 @@ impl InteractionContext {
                     grip_space: left_grip_space,
                     aim_action: left_aim_action,
                     aim_space: left_aim_space,
+                    detached_grip_action: left_detached_grip_action,
+                    detached_grip_space: left_detached_grip_space,
                     vibration_action: left_vibration_action,
                     skeleton_tracker: left_hand_tracker,
                 },
@@ -459,6 +490,8 @@ impl InteractionContext {
                     grip_space: right_grip_space,
                     aim_action: right_aim_action,
                     aim_space: right_aim_space,
+                    detached_grip_action: right_detached_grip_action,
+                    detached_grip_space: right_detached_grip_space,
                     vibration_action: right_vibration_action,
                     skeleton_tracker: right_hand_tracker,
                 },
@@ -471,6 +504,7 @@ impl InteractionContext {
                 face_expressions_tracker,
             },
             body_source: None,
+            marker_spatial_context: None,
         }
     }
 
@@ -478,12 +512,6 @@ impl InteractionContext {
         // First of all, disable/delete all sources. This ensures there are no conflicts
         if let Some(handle) = &mut self.multimodal_handle {
             handle.pause().ok();
-        }
-
-        if let Some(FaceExpressionsTracker::Pico(tracker)) =
-            &self.face_sources.face_expressions_tracker
-        {
-            tracker.stop_face_tracking().ok();
         }
 
         self.multimodal_hands_enabled = false;
@@ -498,6 +526,7 @@ impl InteractionContext {
         }
 
         self.body_source = None;
+        self.marker_spatial_context = None;
 
         if let Some(config) = &config.face_tracking {
             if matches!(self.platform, Platform::QuestPro)
@@ -520,6 +549,24 @@ impl InteractionContext {
                 {
                     alvr_system_info::try_get_permission("android.permission.RECORD_AUDIO");
                     alvr_system_info::try_get_permission("com.picovr.permission.FACE_TRACKING")
+                }
+            }
+        }
+
+        if config.markers_to_track.is_some() {
+            if self.platform.is_quest() {
+                #[cfg(target_os = "android")]
+                {
+                    alvr_system_info::try_get_permission("com.oculus.permission.USE_ANCHOR_API");
+                    alvr_system_info::try_get_permission("com.oculus.permission.USE_SCENE")
+                }
+            } else if matches!(self.platform, Platform::SamsungGalaxyXR) {
+                #[cfg(target_os = "android")]
+                {
+                    alvr_system_info::try_get_permission("android.permission.SCENE_UNDERSTANDING");
+                    alvr_system_info::try_get_permission(
+                        "android.permission.SCENE_UNDERSTANDING_COARSE",
+                    );
                 }
             }
         }
@@ -555,13 +602,11 @@ impl InteractionContext {
                     self.face_sources.face_expressions_tracker =
                         Some(FaceExpressionsTracker::Fb(tracker))
                 } else if let Some(tracker) = check_ext_object(
-                    "FaceTrackerPico",
-                    FaceTrackerPico::new(self.xr_session.clone()),
+                    "FaceTrackerBD",
+                    FaceTrackerBD::new(self.xr_session.clone(), self.xr_system),
                 ) {
-                    tracker.start_face_tracking().ok();
-
                     self.face_sources.face_expressions_tracker =
-                        Some(FaceExpressionsTracker::Pico(tracker));
+                        Some(FaceExpressionsTracker::Bd(tracker));
                 }
                 // For vive, face trackers are always created at startup regardless of settings, and
                 // also cannot be destroyed early.
@@ -575,13 +620,13 @@ impl InteractionContext {
                     BodyTrackerFB::new(
                         &self.xr_session,
                         self.xr_system,
-                        *BODY_JOINT_SET_FULL_BODY_META,
+                        xr::BodyJointSetFB::FULL_BODY_M,
                         config.meta.prefer_high_fidelity,
                     ),
                 )
                 .map(|tracker| BodyTracker::Fb {
                     tracker,
-                    joint_count: FULL_BODY_JOINT_COUNT_META,
+                    joint_count: xr::FullBodyJointMETA::COUNT.into_raw() as usize,
                 });
             }
             if self.body_source.is_none() {
@@ -610,8 +655,7 @@ impl InteractionContext {
                                 "BodyTrackerBD (high accuracy)",
                                 BodyTrackerBD::new(
                                     self.xr_session.clone(),
-                                    BodyJointSetBD::FULL_BODY_JOINTS,
-                                    &self.extra_extensions,
+                                    xr::BodyJointSetBD::FULL_BODY_JOINTS,
                                     self.xr_system,
                                     prompt_calibration_on_start,
                                 ),
@@ -623,8 +667,7 @@ impl InteractionContext {
                                 "BodyTrackerBD (low accuracy)",
                                 BodyTrackerBD::new(
                                     self.xr_session.clone(),
-                                    BodyJointSetBD::BODY_WITHOUT_ARM,
-                                    &self.extra_extensions,
+                                    xr::BodyJointSetBD::BODY_WITHOUT_ARM,
                                     self.xr_system,
                                     prompt_calibration_on_start,
                                 ),
@@ -642,6 +685,13 @@ impl InteractionContext {
                 }
             }
         }
+
+        self.marker_spatial_context = config.markers_to_track.as_ref().and_then(|strings| {
+            check_ext_object(
+                "QRCodesSpatialContext",
+                QRCodesSpatialContext::new(&self.xr_session, strings.clone()),
+            )
+        });
     }
 }
 
@@ -774,11 +824,11 @@ pub fn get_hand_data(
     hand_source: &HandInteraction,
     last_controller_pose: &mut Pose,
     last_palm_pose: &mut Pose,
-) -> (Option<DeviceMotion>, Option<[Pose; 26]>) {
+) -> HandData {
     let xr_time = crate::to_xr_time(time);
     let xr_now = crate::xr_runtime_now(xr_session.instance()).unwrap_or(xr_time);
 
-    let controller_motion = if hand_source
+    let grip_motion = if hand_source
         .grip_action
         .is_active(xr_session, xr::Path::NULL)
         .unwrap_or(false)
@@ -836,7 +886,40 @@ pub fn get_hand_data(
         None
     };
 
-    let hand_joints = if let Some(tracker) = &hand_source.skeleton_tracker
+    let detached_grip_motion = if let Some(detached_grip_action) = &hand_source.detached_grip_action
+        && detached_grip_action
+            .is_active(xr_session, xr::Path::NULL)
+            .unwrap_or(false)
+        && let Ok((location, velocity)) = hand_source
+            .detached_grip_space
+            .as_ref()
+            .unwrap()
+            .relate(reference_space, xr_time)
+    {
+        if location
+            .location_flags
+            .contains(xr::SpaceLocationFlags::ORIENTATION_VALID)
+        {
+            last_controller_pose.orientation = crate::from_xr_quat(location.pose.orientation);
+        }
+
+        if location
+            .location_flags
+            .contains(xr::SpaceLocationFlags::POSITION_VALID)
+        {
+            last_controller_pose.position = crate::from_xr_vec3(location.pose.position);
+        }
+
+        Some(DeviceMotion {
+            pose: *last_controller_pose,
+            linear_velocity: crate::from_xr_vec3(velocity.linear_velocity),
+            angular_velocity: crate::from_xr_vec3(velocity.angular_velocity),
+        })
+    } else {
+        None
+    };
+
+    let skeleton_joints = if let Some(tracker) = &hand_source.skeleton_tracker
         && let Some(joint_locations) = reference_space
             .locate_hand_joints(tracker, xr_now)
             .ok()
@@ -870,7 +953,11 @@ pub fn get_hand_data(
         None
     };
 
-    (controller_motion, hand_joints)
+    HandData {
+        grip_motion,
+        detached_grip_motion,
+        skeleton_joints,
+    }
 }
 
 pub fn update_buttons(
@@ -950,12 +1037,12 @@ pub fn get_face_data(
                 .get_face_expression_weights(xr_time)
                 .ok()
                 .flatten()
-                .map(|weights| FaceExpressions::Fb(weights.into_iter().collect())),
-            FaceExpressionsTracker::Pico(face_tracker_pico) => face_tracker_pico
-                .get_face_tracking_data(xr_time)
+                .map(FaceExpressions::Fb),
+            FaceExpressionsTracker::Bd(face_tracker_bd) => face_tracker_bd
+                .get_facial_simulation_data(xr_time)
                 .ok()
                 .flatten()
-                .map(|weights| FaceExpressions::Pico(weights.into_iter().collect())),
+                .map(FaceExpressions::Bd),
             FaceExpressionsTracker::Htc { eye, lip } => {
                 let eye = eye
                     .as_ref()
@@ -1072,4 +1159,23 @@ pub fn get_bd_motion_trackers(source: &BodyTracker, time: Duration) -> Vec<(u64,
     }
 
     Vec::new()
+}
+
+pub fn get_marker_poses(
+    context: &mut QRCodesSpatialContext,
+    reference_space: &xr::Space,
+    time: Duration,
+) -> Option<Vec<(String, Pose)>> {
+    let xr_time = crate::to_xr_time(time);
+
+    context
+        .poll(reference_space, xr_time)
+        .ok()
+        .flatten()
+        .map(|markers| {
+            markers
+                .into_iter()
+                .map(|(id, pose)| (id, crate::from_xr_pose(pose)))
+                .collect()
+        })
 }

@@ -1,11 +1,12 @@
 use alvr_common::{
-    BodySkeleton, ConnectionState, DeviceMotion, LogEntry, LogSeverity, Pose, ViewParams,
+    BodySkeleton, ConnectionState, DeviceMotion, LogSeverity, Pose, ViewParams,
     anyhow::Result,
     glam::{Quat, UVec2, Vec2},
     semver::Version,
 };
 use alvr_session::{
-    ClientsidePostProcessingConfig, CodecType, PassthroughMode, SessionConfig, Settings,
+    ClientsidePostProcessingConfig, CodecType, PassthroughMode, PerformanceLevel, SessionConfig,
+    Settings,
 };
 use serde::{Deserialize, Serialize};
 use serde_json as json;
@@ -13,7 +14,6 @@ use std::{
     collections::HashSet,
     fmt::{self, Debug},
     net::IpAddr,
-    path::PathBuf,
     time::Duration,
 };
 
@@ -31,6 +31,7 @@ pub struct VideoStreamingCapabilitiesExt {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct VideoStreamingCapabilities {
     pub default_view_resolution: UVec2,
+    pub max_view_resolution: UVec2,
     pub refresh_rates: Vec<f32>,
     pub microphone_sample_rate: u32,
     pub foveated_encoding: bool,
@@ -61,13 +62,16 @@ impl VideoStreamingCapabilities {
 }
 
 #[derive(Serialize, Deserialize)]
+pub struct ConnectionAcceptedInfo {
+    pub client_protocol_id: u64,
+    pub platform_string: String,
+    pub server_ip: IpAddr,
+    pub streaming_capabilities: Option<VideoStreamingCapabilities>,
+}
+
+#[derive(Serialize, Deserialize)]
 pub enum ClientConnectionResult {
-    ConnectionAccepted {
-        client_protocol_id: u64,
-        display_name: String,
-        server_ip: IpAddr,
-        streaming_capabilities: Option<VideoStreamingCapabilities>,
-    },
+    ConnectionAccepted(Box<ConnectionAcceptedInfo>),
     ClientStandby,
 }
 
@@ -194,14 +198,15 @@ pub enum ClientControlPacket {
         level: LogSeverity,
         message: String,
     },
+    ProximityState(bool),
     Reserved(String),
     ReservedBuffer(Vec<u8>),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum FaceExpressions {
-    Fb(Vec<f32>),   // 70 values
-    Pico(Vec<f32>), // 52 values
+    Fb(Vec<f32>), // 70 values
+    Bd(Vec<f32>), // 52 values
     Htc {
         eye: Option<Vec<f32>>, // 14 values
         lip: Option<Vec<f32>>, // 37 values
@@ -225,6 +230,7 @@ pub struct TrackingData {
     pub hand_skeletons: [Option<[Pose; 26]>; 2],
     pub face: FaceData,
     pub body: Option<BodySkeleton>,
+    pub markers: Vec<(String, Pose)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -281,7 +287,7 @@ pub fn parse_path(path: &str) -> Vec<PathSegment> {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub enum ClientListAction {
+pub enum ClientConnectionsAction {
     AddIfMissing {
         trusted: bool,
         manual_ips: Vec<IpAddr>,
@@ -317,34 +323,14 @@ pub enum FirewallRulesAction {
     Remove,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub enum ServerRequest {
-    Log(LogEntry),
-    GetSession,
-    UpdateSession(Box<SessionConfig>),
-    SetValues(Vec<PathValuePair>),
-    UpdateClientList {
-        hostname: String,
-        action: ClientListAction,
-    },
-    CaptureFrame,
-    InsertIdr,
-    StartRecording,
-    StopRecording,
-    FirewallRules(FirewallRulesAction),
-    RegisterAlvrDriver,
-    UnregisterDriver(PathBuf),
-    GetDriverList,
-    RestartSteamvr,
-    ShutdownSteamvr,
-}
-
 // Note: server sends a packet to the client at low frequency, binary encoding, without ensuring
 // compatibility between different versions, even if within the same major version.
 #[derive(Serialize, Deserialize, PartialEq, Clone)]
 pub struct RealTimeConfig {
     pub passthrough: Option<PassthroughMode>,
     pub clientside_post_processing: Option<ClientsidePostProcessingConfig>,
+    pub cpu_performance_level: Option<PerformanceLevel>,
+    pub gpu_performance_level: Option<PerformanceLevel>,
     pub ext_str: String,
 }
 
@@ -357,6 +343,8 @@ impl RealTimeConfig {
                 .clientside_post_processing
                 .clone()
                 .into_option(),
+            cpu_performance_level: settings.headset.performance_level.clone().cpu.into_option(),
+            gpu_performance_level: settings.headset.performance_level.clone().gpu.into_option(),
             ext_str: String::new(), // No extensions for now
         }
     }

@@ -1,9 +1,8 @@
-mod backend;
 mod control_socket;
 mod stream_socket;
 
 use alvr_common::{anyhow::Result, info};
-use alvr_session::{DscpTos, SocketBufferSize};
+use alvr_session::{DscpTos, SocketBufferConfig, SocketBufferSize};
 use socket2::Socket;
 use std::{
     net::{IpAddr, Ipv4Addr},
@@ -25,11 +24,7 @@ pub const MDNS_DEVICE_ID_KEY: &str = "device_id";
 
 pub const WIRED_CLIENT_HOSTNAME: &str = "client.wired";
 
-fn set_socket_buffers(
-    socket: &socket2::Socket,
-    send_buffer_bytes: SocketBufferSize,
-    recv_buffer_bytes: SocketBufferSize,
-) -> Result<()> {
+fn set_socket_buffers(socket: &socket2::Socket, buffer_config: SocketBufferConfig) -> Result<()> {
     info!(
         "Initial socket buffer size: send: {}B, recv: {}B",
         socket.send_buffer_size()?,
@@ -37,7 +32,7 @@ fn set_socket_buffers(
     );
 
     {
-        let maybe_size = match send_buffer_bytes {
+        let maybe_size = match buffer_config.send_size_bytes {
             SocketBufferSize::Default => None,
             SocketBufferSize::Maximum => Some(u32::MAX),
             SocketBufferSize::Custom(size) => Some(size),
@@ -56,7 +51,7 @@ fn set_socket_buffers(
     }
 
     {
-        let maybe_size = match recv_buffer_bytes {
+        let maybe_size = match buffer_config.recv_size_bytes {
             SocketBufferSize::Default => None,
             SocketBufferSize::Maximum => Some(u32::MAX),
             SocketBufferSize::Custom(size) => Some(size),
@@ -90,6 +85,6 @@ fn set_dscp(socket: &Socket, dscp: Option<DscpTos>) {
             DscpTos::ExpeditedForwarding => 0b101110,
         };
 
-        socket.set_tos((tos << 2) as u32).ok();
+        socket.set_tos_v4((tos << 2) as u32).ok();
     }
 }

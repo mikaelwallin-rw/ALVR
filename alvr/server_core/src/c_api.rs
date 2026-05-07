@@ -39,8 +39,8 @@ pub enum AlvrHandType {
 
 #[repr(C)]
 pub union AlvrButtonValue {
-    pub scalar: bool,
-    pub float: f32,
+    pub binary: bool,
+    pub scalar: f32,
 }
 
 // the profile is implied
@@ -71,6 +71,7 @@ pub enum AlvrEvent {
     CaptureFrame,
     RestartPending,
     ShutdownPending,
+    ProximityState(bool),
 }
 
 #[repr(C)]
@@ -293,6 +294,9 @@ pub unsafe extern "C" fn alvr_poll_event(out_event: *mut AlvrEvent, timeout_ns: 
             },
             ServerCoreEvent::GameRenderLatencyFeedback(_)
             | ServerCoreEvent::SetOpenvrProperty { .. } => {} // implementation not needed
+            ServerCoreEvent::ProximityState(headset_is_worn) => unsafe {
+                *out_event = AlvrEvent::ProximityState(headset_is_worn);
+            },
         }
 
         true
@@ -368,8 +372,8 @@ pub unsafe extern "C" fn alvr_get_buttons(out_entries: *mut AlvrButtonEntry) -> 
             let out_entry = unsafe { &mut *out_entries.add(i) };
             out_entry.id = entry.path_id;
             match entry.value {
-                ButtonValue::Binary(value) => out_entry.value.scalar = value,
-                ButtonValue::Scalar(value) => out_entry.value.float = value,
+                ButtonValue::Binary(value) => out_entry.value.binary = value,
+                ButtonValue::Scalar(value) => out_entry.value.scalar = value,
             }
         }
 

@@ -13,23 +13,23 @@ use crate::{
     input_mapping::ButtonMappingManager,
 };
 use alvr_common::{
-    BODY_CHEST_ID, BODY_HIPS_ID, BODY_LEFT_ELBOW_ID, BODY_LEFT_FOOT_ID, BODY_LEFT_KNEE_ID,
-    BODY_RIGHT_ELBOW_ID, BODY_RIGHT_FOOT_ID, BODY_RIGHT_KNEE_ID, ConnectionError,
-    DEVICE_ID_TO_PATH, DeviceMotion, HAND_LEFT_ID, HAND_RIGHT_ID, HEAD_ID, Pose, ViewParams,
-    glam::{EulerRot, Quat, Vec3},
+    AngleSlidingWindowAverage, ConnectionError, DEVICE_ID_TO_PATH, DeviceMotion, Pose,
+    SlidingWindowAverage, ViewParams,
+    glam::{Quat, Vec2, Vec3},
+    inputs as inp,
     parking_lot::Mutex,
 };
 use alvr_events::{EventType, TrackingEvent};
 use alvr_packets::TrackingData;
 use alvr_session::{
-    BodyTrackingConfig, HeadsetConfig, PositionRecenteringMode, RotationRecenteringMode, Settings,
+    BodyTrackingConfig, HeadsetConfig, MarkerColocationConfig, RecenteringMode, Settings,
     VMCConfig, settings_schema::Switch,
 };
 use alvr_sockets::StreamReceiver;
 use std::{
     cmp::Ordering,
     collections::{HashMap, VecDeque},
-    f32::consts::PI,
+    f32::consts::{FRAC_PI_2, FRAC_PI_4, PI},
     sync::Arc,
     time::Duration,
 };
@@ -40,6 +40,12 @@ const DEG_TO_RAD: f32 = PI / 180.0;
 pub enum HandType {
     Left = 0,
     Right = 1,
+}
+
+struct RecenteringMarker {
+    string: String,
+    average_angle: AngleSlidingWindowAverage,
+    average_position: SlidingWindowAverage<Vec2>,
 }
 
 // todo: Move this struct to Settings and use it for every tracked device
@@ -55,6 +61,8 @@ pub struct TrackingManager {
     last_head_pose: Pose,             // client's reference space
     inverse_recentering_origin: Pose, // client's reference space
     device_motions_history: HashMap<u64, VecDeque<(Duration, DeviceMotion)>>,
+    recentering_marker: Option<RecenteringMarker>,
+    markers: HashMap<String, Pose>,
     hand_skeletons_history: [VecDeque<(Duration, [Pose; 26])>; 2],
     max_history_size: usize,
 }
@@ -65,32 +73,30 @@ impl TrackingManager {
             last_head_pose: Pose::IDENTITY,
             inverse_recentering_origin: Pose::IDENTITY,
             device_motions_history: HashMap::new(),
+            recentering_marker: None,
+            markers: HashMap::new(),
             hand_skeletons_history: [VecDeque::new(), VecDeque::new()],
             max_history_size,
         }
     }
 
-    pub fn recenter(
-        &mut self,
-        position_recentering_mode: PositionRecenteringMode,
-        rotation_recentering_mode: RotationRecenteringMode,
-    ) {
-        let position = match position_recentering_mode {
-            PositionRecenteringMode::Disabled => Vec3::ZERO,
-            PositionRecenteringMode::LocalFloor => {
+    pub fn recenter(&mut self, recentering_mode: &RecenteringMode) {
+        let position = match recentering_mode {
+            RecenteringMode::Stage => Vec3::ZERO,
+            RecenteringMode::LocalFloor => {
                 let mut pos = self.last_head_pose.position;
                 pos.y = 0.0;
 
                 pos
             }
-            PositionRecenteringMode::Local { view_height } => {
-                self.last_head_pose.position - Vec3::new(0.0, view_height, 0.0)
+            RecenteringMode::Local { view_height } | RecenteringMode::Tilted { view_height } => {
+                self.last_head_pose.position - Vec3::new(0.0, *view_height, 0.0)
             }
         };
 
-        let orientation = match rotation_recentering_mode {
-            RotationRecenteringMode::Disabled => Quat::IDENTITY,
-            RotationRecenteringMode::Yaw => {
+        let orientation = match recentering_mode {
+            RecenteringMode::Stage => Quat::IDENTITY,
+            RecenteringMode::LocalFloor | RecenteringMode::Local { .. } => {
                 let mut rot = self.last_head_pose.orientation;
                 // extract yaw rotation
                 rot.x = 0.0;
@@ -99,7 +105,7 @@ impl TrackingManager {
 
                 rot
             }
-            RotationRecenteringMode::Tilted => self.last_head_pose.orientation,
+            RecenteringMode::Tilted { .. } => self.last_head_pose.orientation,
         };
 
         self.inverse_recentering_origin = Pose {
@@ -107,6 +113,70 @@ impl TrackingManager {
             orientation,
         }
         .inverse();
+    }
+
+    pub fn recenter_from_marker(&mut self, config: &MarkerColocationConfig) {
+        let Some(marker_pose) = self.markers.get(&config.qr_code_string) else {
+            // In case the marker isn't found, don't recenter to keep the last
+            // `inverse_recentering_origin`
+            return;
+        };
+
+        // Detect if the marker is vertical or horizontal, and use two different
+        // robust methods to extract the recentering orientation.
+        let marker_z_axis = marker_pose.orientation * Vec3::Z;
+        let angle_from_y = Vec3::angle_between(marker_z_axis, Vec3::Y);
+
+        let marker_y_angle = if (angle_from_y - FRAC_PI_2).abs() < FRAC_PI_4 {
+            // The marker is vertical
+            Vec2::new(marker_z_axis.x, marker_z_axis.z)
+                .normalize()
+                .angle_to(Vec2::Y) // (this Y is on the XZ plane -> Z)
+        } else {
+            let marker_x_axis = marker_pose.orientation * Vec3::X;
+            Vec2::new(marker_x_axis.x, marker_x_axis.z)
+                .normalize()
+                .angle_to(Vec2::X)
+        };
+        let marker_floor_position = Vec2::new(marker_pose.position.x, marker_pose.position.z);
+
+        self.recentering_marker
+            .take_if(|rm| rm.string != config.qr_code_string);
+        let recentering_marker = if let Some(rm) = &mut self.recentering_marker {
+            rm.average_angle.submit_sample(marker_y_angle);
+            rm.average_position.submit_sample(marker_floor_position);
+            rm
+        } else {
+            self.recentering_marker.insert(RecenteringMarker {
+                string: config.qr_code_string.clone(),
+                average_angle: AngleSlidingWindowAverage::new(
+                    marker_y_angle,
+                    self.max_history_size,
+                ),
+                average_position: SlidingWindowAverage::new(
+                    marker_floor_position,
+                    self.max_history_size,
+                ),
+            })
+        };
+
+        let average_angle = recentering_marker.average_angle.get_average();
+        let position = {
+            let marker_offset_2d = Vec2::from_array(config.floor_offset);
+
+            let offset_2d = recentering_marker.average_position.get_average() - marker_offset_2d;
+            Vec3::new(offset_2d.x, 0.0, offset_2d.y)
+        };
+        alvr_common::debug!(
+            "Recentering from marker. Angle: {average_angle}, Position: {position}"
+        );
+
+        let recentering_origin = Pose {
+            position,
+            orientation: Quat::from_rotation_y(average_angle),
+        };
+
+        self.inverse_recentering_origin = recentering_origin.inverse();
     }
 
     pub fn recenter_pose(&self, pose: Pose) -> Pose {
@@ -125,51 +195,32 @@ impl TrackingManager {
         device_motions: &[(u64, DeviceMotion)],
     ) {
         let mut device_motion_configs = HashMap::new();
-        device_motion_configs.insert(*HEAD_ID, MotionConfig::default());
+        device_motion_configs.insert(*inp::HEAD_ID, MotionConfig::default());
         device_motion_configs.extend([
-            (*BODY_CHEST_ID, MotionConfig::default()),
-            (*BODY_HIPS_ID, MotionConfig::default()),
-            (*BODY_LEFT_ELBOW_ID, MotionConfig::default()),
-            (*BODY_RIGHT_ELBOW_ID, MotionConfig::default()),
-            (*BODY_LEFT_KNEE_ID, MotionConfig::default()),
-            (*BODY_LEFT_FOOT_ID, MotionConfig::default()),
-            (*BODY_RIGHT_KNEE_ID, MotionConfig::default()),
-            (*BODY_RIGHT_FOOT_ID, MotionConfig::default()),
+            (*inp::BODY_CHEST_ID, MotionConfig::default()),
+            (*inp::BODY_HIPS_ID, MotionConfig::default()),
+            (*inp::BODY_LEFT_ELBOW_ID, MotionConfig::default()),
+            (*inp::BODY_RIGHT_ELBOW_ID, MotionConfig::default()),
+            (*inp::BODY_LEFT_KNEE_ID, MotionConfig::default()),
+            (*inp::BODY_LEFT_FOOT_ID, MotionConfig::default()),
+            (*inp::BODY_RIGHT_KNEE_ID, MotionConfig::default()),
+            (*inp::BODY_RIGHT_FOOT_ID, MotionConfig::default()),
         ]);
 
         if let Switch::Enabled(controllers) = &headset_config.controllers {
-            let t = controllers.left_controller_position_offset;
-            let r = controllers.left_controller_rotation_offset;
-
             device_motion_configs.insert(
-                *HAND_LEFT_ID,
+                *inp::HAND_LEFT_ID,
                 MotionConfig {
-                    pose_offset: Pose {
-                        orientation: Quat::from_euler(
-                            EulerRot::XYZ,
-                            r[0] * DEG_TO_RAD,
-                            r[1] * DEG_TO_RAD,
-                            r[2] * DEG_TO_RAD,
-                        ),
-                        position: Vec3::new(t[0], t[1], t[2]),
-                    },
+                    pose_offset: Pose::IDENTITY,
                     linear_velocity_cutoff: controllers.linear_velocity_cutoff,
                     angular_velocity_cutoff: controllers.angular_velocity_cutoff * DEG_TO_RAD,
                 },
             );
 
             device_motion_configs.insert(
-                *HAND_RIGHT_ID,
+                *inp::HAND_RIGHT_ID,
                 MotionConfig {
-                    pose_offset: Pose {
-                        orientation: Quat::from_euler(
-                            EulerRot::XYZ,
-                            r[0] * DEG_TO_RAD,
-                            -r[1] * DEG_TO_RAD,
-                            -r[2] * DEG_TO_RAD,
-                        ),
-                        position: Vec3::new(-t[0], t[1], t[2]),
-                    },
+                    pose_offset: Pose::IDENTITY,
                     linear_velocity_cutoff: controllers.linear_velocity_cutoff,
                     angular_velocity_cutoff: controllers.angular_velocity_cutoff * DEG_TO_RAD,
                 },
@@ -177,23 +228,14 @@ impl TrackingManager {
         }
 
         for &(device_id, mut motion) in device_motions {
-            if device_id == *HEAD_ID {
+            if device_id == *inp::HEAD_ID {
                 self.last_head_pose = motion.pose;
             }
 
             if let Some(config) = device_motion_configs.get(&device_id) {
-                // Recenter
                 motion = self.recenter_motion(motion);
 
-                // Apply custom transform
-                motion.pose.orientation *= config.pose_offset.orientation;
-                motion.pose.position += motion.pose.orientation * config.pose_offset.position;
-
-                motion.linear_velocity += motion
-                    .angular_velocity
-                    .cross(motion.pose.orientation * config.pose_offset.position);
-                motion.angular_velocity =
-                    motion.pose.orientation.conjugate() * motion.angular_velocity;
+                motion.pose = motion.pose * config.pose_offset;
 
                 fn cutoff(v: Vec3, threshold: f32) -> Vec3 {
                     if v.length_squared() > threshold * threshold {
@@ -294,6 +336,10 @@ impl TrackingManager {
             params.pose = self.inverse_recentering_origin.inverse() * params.pose;
         }
     }
+
+    fn report_markers(&mut self, markers: Vec<(String, Pose)>) {
+        self.markers = markers.into_iter().collect();
+    }
 }
 
 pub fn tracking_loop(
@@ -364,11 +410,17 @@ pub fn tracking_loop(
                 .into_option()
         };
 
-        let device_motion_keys = {
+        let device_motion_keys;
+        {
             let mut tracking_manager_lock = ctx.tracking_manager.write();
             let session_manager_lock = SESSION_MANAGER.read();
             let headset_config = &session_manager_lock.settings().headset;
 
+            tracking.device_motions.extend_from_slice(
+                &body::get_default_body_trackers_from_detached_controllers(
+                    &tracking.device_motions,
+                ),
+            );
             tracking.device_motions.extend_from_slice(
                 &body::get_default_body_trackers_from_motion_trackers_bd(&tracking.device_motions),
             );
@@ -378,17 +430,31 @@ pub fn tracking_loop(
                     .extend_from_slice(&body::extract_default_trackers(skeleton));
             }
 
-            let device_motion_keys = tracking
+            device_motion_keys = tracking
                 .device_motions
                 .iter()
                 .map(|(id, _)| *id)
                 .collect::<Vec<_>>();
+
+            let velocity_multiplier = session_manager_lock.settings().extra.velocities_multiplier;
+            tracking.device_motions.iter_mut().for_each(|(_, motion)| {
+                motion.linear_velocity *= velocity_multiplier;
+                motion.angular_velocity *= velocity_multiplier;
+            });
 
             tracking_manager_lock.report_device_motions(
                 headset_config,
                 timestamp,
                 &tracking.device_motions,
             );
+
+            if !tracking.markers.is_empty() {
+                tracking_manager_lock.report_markers(tracking.markers);
+
+                if let Some(config) = headset_config.marker_colocation.as_option() {
+                    tracking_manager_lock.recenter_from_marker(config);
+                };
+            }
 
             if let Some(skeleton) = tracking.hand_skeletons[0] {
                 tracking_manager_lock.report_hand_skeleton(HandType::Left, timestamp, skeleton);
@@ -420,8 +486,6 @@ pub fn tracking_loop(
                     face: tracking.face,
                 })))
             }
-
-            device_motion_keys
         };
 
         // Handle hand gestures
@@ -433,36 +497,36 @@ pub fn tracking_loop(
         ) {
             let mut hand_gesture_manager_lock = hand_gesture_manager.lock();
 
-            if !device_motion_keys.contains(&*HAND_LEFT_ID)
+            if !device_motion_keys.contains(&*inp::HAND_LEFT_ID)
                 && let Some(hand_skeleton) = tracking.hand_skeletons[0]
             {
                 ctx.events_sender
                     .send(ServerCoreEvent::Buttons(
                         hand_gestures::trigger_hand_gesture_actions(
                             gestures_button_mapping_manager,
-                            *HAND_LEFT_ID,
+                            *inp::HAND_LEFT_ID,
                             &hand_gesture_manager_lock.get_active_gestures(
                                 &hand_skeleton,
                                 gestures_config,
-                                *HAND_LEFT_ID,
+                                *inp::HAND_LEFT_ID,
                             ),
                             gestures_config.only_touch,
                         ),
                     ))
                     .ok();
             }
-            if !device_motion_keys.contains(&*HAND_RIGHT_ID)
+            if !device_motion_keys.contains(&*inp::HAND_RIGHT_ID)
                 && let Some(hand_skeleton) = tracking.hand_skeletons[1]
             {
                 ctx.events_sender
                     .send(ServerCoreEvent::Buttons(
                         hand_gestures::trigger_hand_gesture_actions(
                             gestures_button_mapping_manager,
-                            *HAND_RIGHT_ID,
+                            *inp::HAND_RIGHT_ID,
                             &hand_gesture_manager_lock.get_active_gestures(
                                 &hand_skeleton,
                                 gestures_config,
-                                *HAND_RIGHT_ID,
+                                *inp::HAND_RIGHT_ID,
                             ),
                             gestures_config.only_touch,
                         ),

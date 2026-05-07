@@ -74,6 +74,38 @@ pub fn prepare_ffmpeg_windows(deps_path: &Path) {
     .unwrap();
 }
 
+fn prepare_libvpl_windows(deps_path: &Path) {
+    let sh = Shell::new().unwrap();
+
+    const VERSION: &str = "2.15.0";
+
+    command::download_and_extract_zip(
+        &format!("https://github.com/intel/libvpl/archive/refs/tags/v{VERSION}.zip"),
+        deps_path,
+    )
+    .unwrap();
+
+    let final_path = deps_path.join("libvpl");
+
+    fs::rename(deps_path.join(format!("libvpl-{VERSION}")), &final_path).unwrap();
+
+    let install_prefix = final_path.join("alvr_build");
+    let _push_guard = sh.push_dir(final_path);
+
+    cmd!(
+        sh,
+        "cmake -B build -DUSE_MSVC_STATIC_RUNTIME=ON -DCMAKE_INSTALL_PREFIX={install_prefix}"
+    )
+    .run()
+    .unwrap();
+    cmd!(sh, "cmake --build build --config Release")
+        .run()
+        .unwrap();
+    cmd!(sh, "cmake --install build --config Release")
+        .run()
+        .unwrap();
+}
+
 pub fn prepare_windows_deps(skip_admin_priv: bool) {
     let sh = Shell::new().unwrap();
 
@@ -84,13 +116,21 @@ pub fn prepare_windows_deps(skip_admin_priv: bool) {
     if !skip_admin_priv {
         choco_install(
             &sh,
-            &["zip", "unzip", "llvm", "vulkan-sdk", "pkgconfiglite"],
+            &[
+                "zip",
+                "unzip",
+                "llvm",
+                "vulkan-sdk",
+                "pkgconfiglite",
+                "cmake",
+            ],
         )
         .unwrap();
     }
 
     prepare_x264_windows(&deps_path);
     prepare_ffmpeg_windows(&deps_path);
+    prepare_libvpl_windows(&deps_path);
 }
 
 pub fn prepare_linux_deps(enable_nvenc: bool) {
@@ -190,15 +230,6 @@ pub fn build_ffmpeg_linux(enable_nvenc: bool, deps_path: &Path) {
     cmd!(sh, "bash -c {ffmpeg_command}").run().unwrap();
 
     if enable_nvenc {
-        /*
-           Describing Nvidia specific options --nvccflags:
-           nvcc from CUDA toolkit version 11.0 or higher does not support compiling for 'compute_30' (default in ffmpeg)
-           52 is the minimum required for the current CUDA 11 version (Quadro M6000 , GeForce 900, GTX-970, GTX-980, GTX Titan X)
-           https://arnon.dk/matching-sm-architectures-arch-and-gencode-for-various-nvidia-cards/
-           Anyway below 50 arch card don't support nvenc encoding hevc https://developer.nvidia.com/nvidia-video-codec-sdk (Supported devices)
-           Nvidia docs:
-           https://docs.nvidia.com/video-technologies/video-codec-sdk/ffmpeg-with-nvidia-gpu/#commonly-faced-issues-and-tips-to-resolve-them
-        */
         #[cfg(target_os = "linux")]
         {
             let codec_header_version = "12.1.14.0";
@@ -224,30 +255,10 @@ pub fn build_ffmpeg_linux(enable_nvenc: bool, deps_path: &Path) {
                 cmd!(sh, "bash -c {make_header_cmd}").run().unwrap();
             }
 
-            let cuda = pkg_config::Config::new().probe("cuda").unwrap();
-            let include_flags = cuda
-                .include_paths
-                .iter()
-                .map(|path| format!("-I{}", path.to_string_lossy()))
-                .reduce(|a, b| format!("{a} {b}"))
-                .expect("pkg-config cuda entry to have include-paths");
-            let link_flags = cuda
-                .link_paths
-                .iter()
-                .map(|path| format!("-L{}", path.to_string_lossy()))
-                .reduce(|a, b| format!("{a} {b}"))
-                .expect("pkg-config cuda entry to have link-paths");
-
             let nvenc_flags = &[
                 "--enable-encoder=h264_nvenc",
                 "--enable-encoder=hevc_nvenc",
                 "--enable-encoder=av1_nvenc",
-                "--enable-nonfree",
-                "--enable-cuda-nvcc",
-                "--enable-libnpp",
-                "--nvccflags=\"-gencode arch=compute_52,code=sm_52 -O2\"",
-                &format!("--extra-cflags=\"{include_flags}\""),
-                &format!("--extra-ldflags=\"{link_flags}\""),
             ];
 
             let env_vars = format!(
@@ -318,11 +329,12 @@ fn get_android_openxr_loaders(selection: OpenXRLoadersSelection) {
         fs::remove_dir_all(&temp_dir).ok();
     }
 
+    const OPENXR_VERSION: &str = "1.1.36";
     get_openxr_loader(
         "",
         &format!(
-            "https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/{}",
-            "release-1.0.34/openxr_loader_for_android-1.0.34.aar",
+            "https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/\
+            release-{OPENXR_VERSION}/openxr_loader_for_android-{OPENXR_VERSION}.aar",
         ),
         "prefab/modules/openxr_loader/libs/android.arm64-v8a",
     );
@@ -351,12 +363,6 @@ fn get_android_openxr_loaders(selection: OpenXRLoadersSelection) {
         "_yvr",
         "https://developer.yvrdream.com/yvrdoc/sdk/openxr/yvr_openxr_mobile_sdk_2.0.0.zip",
         "yvr_openxr_mobile_sdk_2.0.0/OpenXR/Libs/Android/arm64-v8a",
-    );
-
-    get_openxr_loader(
-        "_lynx",
-        "https://portal.lynx-r.com/downloads/download/16", // version 1.0.0
-        "jni/arm64-v8a",
     );
 }
 

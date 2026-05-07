@@ -14,12 +14,45 @@ pub enum ReleaseFlavor {
     PicoStore,
 }
 
+pub fn generate_licenses(licenses_output: &Path) {
+    let sh = Shell::new().unwrap();
+    cmd!(sh, "cargo install cargo-about --version 0.8.4 --locked")
+        .run()
+        .unwrap();
+    let licenses_template = afs::crate_dir("xtask").join("licenses_template.hbs");
+    cmd!(
+        sh,
+        "cargo about generate {licenses_template} -o {licenses_output}"
+    )
+    .run()
+    .unwrap();
+}
+
+pub fn check_licenses() {
+    generate_licenses(&std::env::temp_dir().join("dependencies.html"));
+}
+
+pub fn include_base_licenses(root_path: &Path) {
+    let sh = Shell::new().unwrap();
+
+    let licenses_dir = root_path.join("licenses");
+    sh.create_dir(&licenses_dir).unwrap();
+    sh.copy_file(
+        afs::workspace_dir().join("LICENSE"),
+        licenses_dir.join("ALVR.txt"),
+    )
+    .unwrap();
+
+    generate_licenses(&licenses_dir.join("dependencies.html"));
+}
+
 pub fn include_licenses(root_path: &Path, gpl: bool) {
     let sh = Shell::new().unwrap();
 
     // Add licenses
+    include_base_licenses(root_path);
+
     let licenses_dir = root_path.join("licenses");
-    sh.create_dir(&licenses_dir).unwrap();
     sh.copy_file(
         afs::workspace_dir().join("LICENSE"),
         licenses_dir.join("ALVR.txt"),
@@ -37,17 +70,13 @@ pub fn include_licenses(root_path: &Path, gpl: bool) {
         )
         .ok();
     }
-
-    // Gather licenses with cargo about
-    cmd!(sh, "cargo install cargo-about --version 0.6.4")
-        .run()
+    if cfg!(windows) {
+        sh.copy_file(
+            afs::deps_dir().join("windows/libvpl/alvr_build/share/vpl/licensing/license.txt"),
+            licenses_dir.join("libvpl.txt"),
+        )
         .unwrap();
-    let licenses_template = afs::crate_dir("xtask").join("licenses_template.hbs");
-    let licenses_content = cmd!(sh, "cargo about generate {licenses_template}")
-        .read()
-        .unwrap();
-    sh.write_file(licenses_dir.join("dependencies.html"), licenses_content)
-        .unwrap();
+    }
 }
 
 pub fn package_streamer(
@@ -79,7 +108,7 @@ pub fn package_launcher() {
 
     build::build_launcher(Profile::Distribution, true);
 
-    include_licenses(&afs::launcher_build_dir(), false);
+    include_base_licenses(&afs::launcher_build_dir());
 
     if cfg!(windows) {
         command::zip(&sh, &afs::launcher_build_dir()).unwrap();

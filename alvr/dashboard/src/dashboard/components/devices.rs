@@ -1,7 +1,7 @@
 use crate::dashboard::ServerRequest;
 use alvr_common::ConnectionState;
 use alvr_gui_common::theme::{self, log_colors};
-use alvr_packets::ClientListAction;
+use alvr_packets::ClientConnectionsAction;
 use alvr_session::{ClientConnectionConfig, SessionConfig};
 use alvr_sockets::WIRED_CLIENT_HOSTNAME;
 use eframe::{
@@ -58,16 +58,17 @@ impl DevicesTab {
 
         if !connected_to_server {
             Frame::group(ui.style())
+                .inner_margin(theme::FRAME_PADDING)
                 .fill(log_colors::WARNING_LIGHT)
                 .show(ui, |ui| {
                     Grid::new(0).num_columns(2).show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.add_space(10.0);
+                            ui.add_space(theme::FRAME_TEXT_SPACING);
                             ui.heading(
-                                RichText::new(format!(
-                                    "ALVR requires running SteamVR! {}",
-                                    "Devices will not be discovered or connected"
-                                ))
+                                RichText::new(
+                                    "ALVR requires running SteamVR! \
+                                    Devices will not be discovered or connected.",
+                                )
                                 .color(Color32::BLACK)
                                 .size(16.0),
                             );
@@ -96,7 +97,7 @@ impl DevicesTab {
                 requests.push(request);
             }
 
-            ui.add_space(10.0);
+            ui.add_space(theme::FRAME_PADDING);
 
             if let Some(clients) = &self.new_devices
                 && let Some(request) = new_clients_section(ui, clients)
@@ -104,7 +105,7 @@ impl DevicesTab {
                 requests.push(request);
             }
 
-            ui.add_space(10.0);
+            ui.add_space(theme::FRAME_PADDING);
 
             if let Some(clients) = &mut self.trusted_devices
                 && let Some(request) = trusted_clients_section(
@@ -163,7 +164,7 @@ impl DevicesTab {
                             if state.new_devices {
                                 requests.push(ServerRequest::UpdateClientList {
                                     hostname: state.hostname,
-                                    action: ClientListAction::AddIfMissing {
+                                    action: ClientConnectionsAction::AddIfMissing {
                                         trusted: true,
                                         manual_ips,
                                     },
@@ -171,7 +172,7 @@ impl DevicesTab {
                             } else {
                                 requests.push(ServerRequest::UpdateClientList {
                                     hostname: state.hostname,
-                                    action: ClientListAction::SetManualIps(manual_ips),
+                                    action: ClientConnectionsAction::SetManualIps(manual_ips),
                                 });
                             }
                         } else {
@@ -194,52 +195,61 @@ fn wired_client_section(
 
     Frame::group(ui.style())
         .fill(theme::SECTION_BG)
-        .inner_margin(egui::vec2(15.0, 12.0))
+        .inner_margin(egui::vec2(
+            theme::FRAME_PADDING + theme::FRAME_TEXT_SPACING,
+            theme::FRAME_PADDING,
+        ))
         .show(ui, |ui| {
-            Grid::new("wired-client")
-                .num_columns(2)
-                .spacing(egui::vec2(8.0, 8.0))
-                .show(ui, |ui| {
-                    ui.heading("Wired Connection");
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let mut wired = maybe_client.is_some();
-                        if alvr_gui_common::switch(ui, &mut wired).changed() {
-                            if wired {
-                                request = Some(ServerRequest::UpdateClientList {
-                                    hostname: WIRED_CLIENT_HOSTNAME.to_owned(),
-                                    action: ClientListAction::AddIfMissing {
-                                        trusted: true,
-                                        manual_ips: Vec::new(),
-                                    },
-                                });
-                            } else {
-                                request = Some(ServerRequest::UpdateClientList {
-                                    hostname: WIRED_CLIENT_HOSTNAME.to_owned(),
-                                    action: ClientListAction::RemoveEntry,
-                                });
+            ui.horizontal(|ui| {
+                Grid::new("wired-client")
+                    .num_columns(2)
+                    .spacing(egui::vec2(8.0, 8.0))
+                    .show(ui, |ui| {
+                        ui.heading("Wired Connection");
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let mut wired = maybe_client.is_some();
+
+                            if alvr_gui_common::switch(ui, &mut wired).changed() {
+                                if wired {
+                                    request = Some(ServerRequest::UpdateClientList {
+                                        hostname: WIRED_CLIENT_HOSTNAME.to_owned(),
+                                        action: ClientConnectionsAction::AddIfMissing {
+                                            trusted: true,
+                                            manual_ips: Vec::new(),
+                                        },
+                                    });
+                                } else {
+                                    request = Some(ServerRequest::UpdateClientList {
+                                        hostname: WIRED_CLIENT_HOSTNAME.to_owned(),
+                                        action: ClientConnectionsAction::RemoveEntry,
+                                    });
+                                }
                             }
+                            ui.horizontal(|ui| {
+                                ui.add_space(theme::FRAME_TEXT_SPACING);
+                            });
+                        });
+                        ui.end_row();
+
+                        if let Some(progress) = adb_download_progress.filter(|p| *p < 1.0) {
+                            ui.horizontal(|ui| {
+                                ui.label("ADB download progress");
+                            });
+                            ui.horizontal(|ui| {
+                                ui.add(ProgressBar::new(progress).animate(true).show_percentage());
+                            });
+                            ui.end_row();
+                        } else if let Some((_, data)) = maybe_client {
+                            ui.horizontal(|ui| {
+                                ui.label(&data.display_name);
+                            });
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                connection_label(ui, &data.connection_state);
+                            });
+                            ui.end_row();
                         }
                     });
-                    ui.end_row();
-
-                    if let Some(progress) = adb_download_progress.filter(|p| *p < 1.0) {
-                        ui.horizontal(|ui| {
-                            ui.label("ADB download progress");
-                        });
-                        ui.horizontal(|ui| {
-                            ui.add(ProgressBar::new(progress).animate(true).show_percentage());
-                        });
-                        ui.end_row();
-                    } else if let Some((_, data)) = maybe_client {
-                        ui.horizontal(|ui| {
-                            ui.label(&data.display_name);
-                        });
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            connection_label(ui, &data.connection_state);
-                        });
-                        ui.end_row();
-                    }
-                });
+            });
         });
 
     request
@@ -252,22 +262,17 @@ fn new_clients_section(
     let mut request = None;
 
     Frame::group(ui.style())
+        .inner_margin(theme::FRAME_PADDING)
         .fill(theme::SECTION_BG)
         .show(ui, |ui| {
             ui.vertical_centered_justified(|ui| {
-                ui.add_space(5.0);
                 ui.horizontal(|ui| {
-                    ui.add_space(10.0);
+                    ui.add_space(theme::FRAME_TEXT_SPACING);
                     ui.heading("New Wireless Devices");
 
                     // Extend to the right
                     ui.with_layout(Layout::right_to_left(Align::Center), |_| ());
                 });
-
-                if clients.is_empty() {
-                    // for some reson any positive value adds too much space
-                    ui.add_space(-10.0);
-                }
             });
             for (hostname, _) in clients {
                 Frame::group(ui.style())
@@ -285,7 +290,7 @@ fn new_clients_section(
                                     if ui.button("Trust").clicked() {
                                         request = Some(ServerRequest::UpdateClientList {
                                             hostname: hostname.clone(),
-                                            action: ClientListAction::Trust,
+                                            action: ClientConnectionsAction::Trust,
                                         });
                                     };
                                 });
@@ -307,10 +312,11 @@ fn trusted_clients_section(
 
     Frame::group(ui.style())
         .fill(theme::SECTION_BG)
+        .inner_margin(theme::FRAME_PADDING)
         .show(ui, |ui| {
             Grid::new(0).num_columns(2).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.add_space(10.0);
+                    ui.add_space(theme::FRAME_TEXT_SPACING);
                     ui.heading("Trusted Wireless Devices");
                 });
 
@@ -352,7 +358,7 @@ fn trusted_clients_section(
                                     if ui.button("Remove").clicked() {
                                         request = Some(ServerRequest::UpdateClientList {
                                             hostname: hostname.clone(),
-                                            action: ClientListAction::RemoveEntry,
+                                            action: ClientConnectionsAction::RemoveEntry,
                                         });
                                     }
                                     if ui.button("Edit").clicked() {

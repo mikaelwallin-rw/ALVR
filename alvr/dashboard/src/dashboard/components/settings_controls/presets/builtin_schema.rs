@@ -31,7 +31,7 @@ fn bool_modifier(target_path: &str, value: bool) -> PresetModifier {
 
 pub fn resolution_schema() -> PresetSchemaNode {
     PresetSchemaNode::HigherOrderChoice(HigherOrderChoiceSchema {
-        name: "resolution".into(),
+        name: "Resolution".into(),
         strings: [(
             "help".into(),
             "Choosing too high resolution (commonly 'High (width: 5184)') may result in high latency or black screen.".into(),
@@ -88,7 +88,7 @@ pub fn resolution_schema() -> PresetSchemaNode {
 
 pub fn framerate_schema() -> PresetSchemaNode {
     PresetSchemaNode::HigherOrderChoice(HigherOrderChoiceSchema {
-        name: "preferred_framerate".into(),
+        name: "Preferred framerate".into(),
         strings: HashMap::new(),
         flags: ["steamvr-restart".into()].into_iter().collect(),
         options: [60, 72, 80, 90, 120]
@@ -111,13 +111,16 @@ pub fn framerate_schema() -> PresetSchemaNode {
 
 pub fn codec_preset_schema() -> PresetSchemaNode {
     PresetSchemaNode::HigherOrderChoice(HigherOrderChoiceSchema {
-        name: "codec_preset".into(),
-        strings: [(
-            "help".into(),
+        name: "Codec preset".into(),
+        strings: [
+            (
+            "notice".into(),
             "AV1 encoding is only supported on RDNA3, Ada Lovelace, Intel ARC or newer GPUs (AMD RX 7xxx+ , NVIDIA RTX 40xx+, Intel ARC)
-and on headsets that have XR2 Gen 2 onboard (Quest 3, Pico 4 Ultra)"
+and on headsets that have XR2 Gen 2 onboard (Quest 3, Pico 4 Ultra).\n
+H264 encoding is currently NOT supported on Intel ARC GPUs on Windows."
                 .into(),
-        )]
+            ),
+        ]
         .into_iter()
         .collect(),
         flags: ["steamvr-restart".into()].into_iter().collect(),
@@ -141,7 +144,7 @@ and on headsets that have XR2 Gen 2 onboard (Quest 3, Pico 4 Ultra)"
 
 pub fn encoder_preset_schema() -> PresetSchemaNode {
     PresetSchemaNode::HigherOrderChoice(HigherOrderChoiceSchema {
-        name: "encoder_preset".into(),
+        name: "Encoder preset".into(),
         strings: [(
             "help".into(),
             "Selecting a quality too high may result in stuttering or still image!".into(),
@@ -180,7 +183,7 @@ pub fn encoder_preset_schema() -> PresetSchemaNode {
 pub fn foveation_preset_schema() -> PresetSchemaNode {
     const PREFIX: &str = "session_settings.video.foveated_encoding";
     PresetSchemaNode::HigherOrderChoice(HigherOrderChoiceSchema {
-        name: "foveation_preset".into(),
+        name: "Foveation preset".into(),
         strings: [(
             "help".into(),
             "Foveation affects pixelation on the edges of \

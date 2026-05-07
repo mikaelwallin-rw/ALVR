@@ -6,7 +6,7 @@ use std::{
 
 macro_rules! interaction_profile {
     ($ty:ident, $path:expr) => {
-        paste::paste! {
+        pastey::paste! {
             pub const [<$ty _CONTROLLER_PROFILE_PATH>]: &str =
                 concat!("/interaction_profiles/", $path, "_controller");
             pub static [<$ty _CONTROLLER_PROFILE_ID>]: LazyLock<u64> =
@@ -22,12 +22,13 @@ interaction_profile!(PICO_NEO3, "bytedance/pico_neo3");
 interaction_profile!(PICO4, "bytedance/pico4");
 interaction_profile!(PICO4S, "bytedance/pico4s");
 interaction_profile!(PICO_G3, "bytedance/pico_g3");
+interaction_profile!(PSVR2, "sony/playstation_vr2_sense");
 interaction_profile!(FOCUS3, "htc/vive_focus3");
 interaction_profile!(YVR, "yvr/touch");
 
 macro_rules! devices {
     ($(($name:ident, $path:expr),)*) => {
-        paste::paste! {
+        pastey::paste! {
             $(
                 pub const [<$name _PATH>]: &str = $path;
                 pub static [<$name _ID>]: LazyLock<u64> = LazyLock::new(|| hash_string([<$name _PATH>]));
@@ -78,7 +79,7 @@ pub struct ButtonInfo {
 
 macro_rules! controller_inputs {
     ($(($inputs:ident, $paths:literal, $ty:ident),)*) => {
-        paste::paste! {
+        pastey::paste! {
             $(
                 pub const [<LEFT_ $inputs _PATH>]: &str =
                     concat!("/user/hand/left/input/", $paths);
@@ -120,6 +121,7 @@ controller_inputs! {
     (SYSTEM_CLICK, "system/click", Binary),
     (SYSTEM_TOUCH, "system/touch", Binary),
     (MENU_CLICK, "menu/click", Binary),
+    (MENU_TOUCH, "menu/touch", Binary),
     (BACK_CLICK, "back/click", Binary),
     (A_CLICK, "a/click", Binary),
     (A_TOUCH, "a/touch", Binary),
@@ -133,9 +135,11 @@ controller_inputs! {
     (SQUEEZE_TOUCH, "squeeze/touch", Binary),
     (SQUEEZE_VALUE, "squeeze/value", Scalar),
     (SQUEEZE_FORCE, "squeeze/force", Scalar),
+    (SQUEEZE_SENSOR_VALUE, "squeeze/sensor/value", Scalar),
     (TRIGGER_CLICK, "trigger/click", Binary),
     (TRIGGER_VALUE, "trigger/value", Scalar),
     (TRIGGER_TOUCH, "trigger/touch", Binary),
+    (TRIGGER_SENSOR_VALUE, "trigger/sensor/value", Scalar),
     (THUMBSTICK_X, "thumbstick/x", Scalar),
     (THUMBSTICK_Y, "thumbstick/y", Scalar),
     (THUMBSTICK_CLICK, "thumbstick/click", Binary),
@@ -411,6 +415,56 @@ pub static CONTROLLER_PROFILE_INFO: LazyLock<HashMap<u64, InteractionProfileInfo
                         *RIGHT_SQUEEZE_CLICK_ID,
                         *RIGHT_SQUEEZE_VALUE_ID,
                         *RIGHT_THUMBREST_TOUCH_ID,
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+            ),
+            (
+                *PSVR2_CONTROLLER_PROFILE_ID,
+                InteractionProfileInfo {
+                    path: PSVR2_CONTROLLER_PROFILE_PATH,
+                    button_set: [
+                        *LEFT_X_CLICK_ID,
+                        *LEFT_X_TOUCH_ID,
+                        *LEFT_Y_CLICK_ID,
+                        *LEFT_Y_TOUCH_ID,
+                        *LEFT_MENU_CLICK_ID,
+                        *LEFT_MENU_TOUCH_ID,
+                        *LEFT_SYSTEM_CLICK_ID,
+                        *LEFT_SYSTEM_TOUCH_ID,
+                        *LEFT_TRIGGER_CLICK_ID,
+                        *LEFT_TRIGGER_VALUE_ID,
+                        *LEFT_TRIGGER_TOUCH_ID,
+                        *LEFT_TRIGGER_SENSOR_VALUE_ID,
+                        *LEFT_THUMBSTICK_Y_ID,
+                        *LEFT_THUMBSTICK_X_ID,
+                        *LEFT_THUMBSTICK_CLICK_ID,
+                        *LEFT_THUMBSTICK_TOUCH_ID,
+                        *LEFT_SQUEEZE_CLICK_ID,
+                        *LEFT_SQUEEZE_VALUE_ID,
+                        *LEFT_SQUEEZE_TOUCH_ID,
+                        *LEFT_SQUEEZE_SENSOR_VALUE_ID,
+                        *RIGHT_A_CLICK_ID,
+                        *RIGHT_A_TOUCH_ID,
+                        *RIGHT_B_CLICK_ID,
+                        *RIGHT_B_TOUCH_ID,
+                        *RIGHT_SYSTEM_CLICK_ID,
+                        *RIGHT_SYSTEM_TOUCH_ID,
+                        *RIGHT_MENU_CLICK_ID,
+                        *RIGHT_MENU_TOUCH_ID,
+                        *RIGHT_TRIGGER_CLICK_ID,
+                        *RIGHT_TRIGGER_VALUE_ID,
+                        *RIGHT_TRIGGER_TOUCH_ID,
+                        *RIGHT_TRIGGER_SENSOR_VALUE_ID,
+                        *RIGHT_THUMBSTICK_Y_ID,
+                        *RIGHT_THUMBSTICK_X_ID,
+                        *RIGHT_THUMBSTICK_CLICK_ID,
+                        *RIGHT_THUMBSTICK_TOUCH_ID,
+                        *RIGHT_SQUEEZE_CLICK_ID,
+                        *RIGHT_SQUEEZE_VALUE_ID,
+                        *RIGHT_SQUEEZE_TOUCH_ID,
+                        *RIGHT_SQUEEZE_SENSOR_VALUE_ID,
                     ]
                     .into_iter()
                     .collect(),

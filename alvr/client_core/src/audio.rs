@@ -6,8 +6,8 @@ use alvr_common::{
 use alvr_session::AudioBufferingConfig;
 use alvr_sockets::{StreamReceiver, StreamSender};
 use ndk::audio::{
-    AudioCallbackResult, AudioDirection, AudioError, AudioFormat, AudioPerformanceMode,
-    AudioSharingMode, AudioStreamBuilder,
+    AudioCallbackResult, AudioDirection, AudioError, AudioFormat, AudioInputPreset,
+    AudioPerformanceMode, AudioSharingMode, AudioStreamBuilder,
 };
 use std::{
     collections::VecDeque,
@@ -44,6 +44,7 @@ pub fn record_audio_blocking(
         .channel_count(1)
         .sample_rate(sample_rate as _)
         .format(AudioFormat::PCM_I16)
+        .input_preset(AudioInputPreset::VoiceCommunication)
         .performance_mode(AudioPerformanceMode::LowLatency)
         .sharing_mode(AudioSharingMode::Shared)
         .data_callback(Box::new(move |_, data_ptr, frames_count| {
@@ -75,11 +76,7 @@ pub fn record_audio_blocking(
 
     while is_running() && error.lock().is_none() {
         while let Ok(sample_buffer) = samples_receiver.recv_timeout(INPUT_RECV_TIMEOUT) {
-            let mut buffer = sender.get_buffer(&()).unwrap();
-            buffer
-                .get_range_mut(0, sample_buffer.len())
-                .copy_from_slice(&sample_buffer);
-            sender.send(buffer).ok();
+            sender.send_header_with_payload(&(), &sample_buffer).ok();
         }
     }
 

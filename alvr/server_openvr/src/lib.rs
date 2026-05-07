@@ -90,6 +90,10 @@ fn event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                     let track_body = headset_config.body_tracking.enabled();
 
                     let tracked = controllers_config.as_ref().is_some_and(|c| c.tracked);
+                    let detached_controllers = headset_config
+                        .multimodal_tracking
+                        .as_option()
+                        .is_some_and(|c| c.detached_controllers_steamvr_sink);
 
                     if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
                         let target_timestamp =
@@ -115,22 +119,37 @@ fn event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                             FfiDeviceMotion::default()
                         };
 
-                        let ffi_left_controller_motion = context
-                            .get_device_motion(*HAND_LEFT_ID, poll_timestamp)
-                            .map(|motion| {
-                                let motion =
-                                    motion.predict(poll_timestamp, target_controller_timestamp);
-                                tracking::to_ffi_motion(*HAND_LEFT_ID, motion)
-                            })
-                            .filter(|_| tracked);
-                        let ffi_right_controller_motion = context
-                            .get_device_motion(*HAND_RIGHT_ID, poll_timestamp)
-                            .map(|motion| {
-                                let motion =
-                                    motion.predict(poll_timestamp, target_controller_timestamp);
-                                tracking::to_ffi_motion(*HAND_RIGHT_ID, motion)
-                            })
-                            .filter(|_| tracked);
+                        let (ffi_left_controller_motion, ffi_right_controller_motion) =
+                            if tracked && let Some(config) = &controllers_config {
+                                let ffi_left_controller_motion = context
+                                    .get_device_motion(*HAND_LEFT_ID, poll_timestamp)
+                                    .map(|motion| {
+                                        let motion = motion
+                                            .predict(poll_timestamp, target_controller_timestamp);
+                                        let motion = tracking::offset_controller_motion(
+                                            config,
+                                            *HAND_LEFT_ID,
+                                            motion,
+                                        );
+                                        tracking::to_ffi_motion(*HAND_LEFT_ID, motion)
+                                    });
+                                let ffi_right_controller_motion = context
+                                    .get_device_motion(*HAND_RIGHT_ID, poll_timestamp)
+                                    .map(|motion| {
+                                        let motion = motion
+                                            .predict(poll_timestamp, target_controller_timestamp);
+                                        let motion = tracking::offset_controller_motion(
+                                            config,
+                                            *HAND_RIGHT_ID,
+                                            motion,
+                                        );
+                                        tracking::to_ffi_motion(*HAND_RIGHT_ID, motion)
+                                    });
+
+                                (ffi_left_controller_motion, ffi_right_controller_motion)
+                            } else {
+                                (None, None)
+                            };
 
                         let (
                             ffi_left_hand_skeleton,
@@ -245,7 +264,7 @@ fn event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                             predictHandSkeleton: predict_hand_skeleton,
                         };
 
-                        let ffi_body_tracker_motions = if track_body {
+                        let ffi_body_tracker_motions = if track_body || detached_controllers {
                             tracking::BODY_TRACKER_IDS
                                 .iter()
                                 .filter_map(|id| {
@@ -383,6 +402,9 @@ fn event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
 
                     unsafe { ShutdownSteamvr() };
                 }
+                ServerCoreEvent::ProximityState(headset_is_worn) => unsafe {
+                    SetProximityState(headset_is_worn)
+                },
             }
         }
 
@@ -567,19 +589,10 @@ pub unsafe extern "C" fn HmdDriverFactory(
         return ptr::null_mut();
     };
 
-    let dashboard_process_paths = sysinfo::System::new_all()
+    let system = sysinfo::System::new_all();
+    let dashboard_processes = system
         .processes_by_name(OsStr::new(&afs::dashboard_fname()))
-        .filter_map(|proc| Some(proc.exe()?.to_owned()))
         .collect::<Vec<_>>();
-
-    // Check that there is no active dashboard instance not part of this driver installation
-    // Note: if the iterator is empty, `all()` returns true
-    if !dashboard_process_paths
-        .iter()
-        .all(|path| *path == filesystem_layout.dashboard_exe())
-    {
-        return ptr::null_mut();
-    }
 
     static ONCE: Once = Once::new();
     ONCE.call_once(move || {
@@ -632,7 +645,7 @@ pub unsafe extern "C" fn HmdDriverFactory(
             // When there is already a ALVR dashboard running, initialize the HMD device early to
             // avoid buggy SteamVR behavior
             // NB: we already bail out before if the dashboards don't belong to this streamer
-            let early_hmd_initialization = !dashboard_process_paths.is_empty();
+            let early_hmd_initialization = !dashboard_processes.is_empty();
 
             CppInit(early_hmd_initialization);
         }

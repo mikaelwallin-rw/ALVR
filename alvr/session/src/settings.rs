@@ -766,6 +766,7 @@ If you want to reduce the amount of pixelation on the edges, increase the center
     #[schema(flag = "steamvr-restart")]
     pub adapter_index: u32,
 
+    #[schema(strings(display_name = "Client-side foveation"))]
     pub clientside_foveation: Switch<ClientsideFoveationConfig>,
 
     #[schema(strings(
@@ -865,14 +866,46 @@ pub struct AudioConfig {
 pub enum HeadsetEmulationMode {
     #[schema(strings(display_name = "Rift S"))]
     RiftS,
+    #[schema(strings(display_name = "Quest 1"))]
+    Quest1,
     #[schema(strings(display_name = "Quest 2"))]
     Quest2,
     #[schema(strings(display_name = "Quest Pro"))]
     QuestPro,
+    #[schema(strings(display_name = "Pico 4"))]
+    Pico4,
     Vive,
     Custom {
         serial_number: String,
     },
+}
+
+#[derive(SettingsSchema, Serialize, Deserialize, PartialEq, Clone)]
+pub enum PerformanceLevel {
+    #[schema(strings(display_name = "Power Saving"))]
+    PowerSavings,
+    #[schema(strings(display_name = "Sustained Low"))]
+    SustainedLow,
+    #[schema(strings(display_name = "Sustained High"))]
+    SustainedHigh,
+    #[schema(flag = "hidden")]
+    Boost,
+}
+
+#[derive(SettingsSchema, Serialize, Deserialize, PartialEq, Clone)]
+pub struct PerformanceLevelConfig {
+    #[schema(flag = "real-time")]
+    #[schema(strings(
+        display_name = "CPU",
+        help = "When disabling this, the client needs to be restarted for the change to be applied."
+    ))]
+    pub cpu: Switch<PerformanceLevel>,
+    #[schema(flag = "real-time")]
+    #[schema(strings(
+        display_name = "GPU",
+        help = "When disabling this, the client needs to be restarted for the change to be applied."
+    ))]
+    pub gpu: Switch<PerformanceLevel>,
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq)]
@@ -962,6 +995,8 @@ pub struct VMCConfig {
 pub enum ControllersEmulationMode {
     #[schema(strings(display_name = "Rift S Touch"))]
     RiftSTouch,
+    #[schema(strings(display_name = "Quest 1 Touch"))]
+    Quest1Touch,
     #[schema(strings(display_name = "Quest 2 Touch"))]
     Quest2Touch,
     #[schema(strings(display_name = "Quest 3 Touch Plus"))]
@@ -970,6 +1005,8 @@ pub enum ControllersEmulationMode {
     QuestPro,
     #[schema(strings(display_name = "Pico 4"))]
     Pico4,
+    #[schema(strings(display_name = "PSVR2 Sense Controller"))]
+    PSVR2Sense,
     #[schema(strings(display_name = "Valve Index"))]
     ValveIndex,
     #[schema(strings(display_name = "Vive Wand"))]
@@ -1125,6 +1162,7 @@ pub struct HapticsConfig {
 pub struct HandSkeletonConfig {
     #[schema(flag = "steamvr-restart")]
     #[schema(strings(
+        display_name = "SteamVR input 2.0",
         help = r"Enabling this will use separate tracker objects with the full skeletal tracking level when hand tracking is detected. This is required for VRChat hand tracking."
     ))]
     pub steamvr_input_2_0: bool,
@@ -1149,12 +1187,6 @@ pub struct ControllersConfig {
     ))]
     pub hand_skeleton: Switch<HandSkeletonConfig>,
 
-    #[schema(strings(
-        help = r"Track hand skeleton while holding controllers. This will reduce hand tracking frequency to 30Hz.
-Because of runtime limitations, this option is ignored when body tracking is active."
-    ))]
-    pub multimodal_tracking: bool,
-
     #[schema(flag = "real-time")]
     #[schema(strings(
         help = "Enabling this allows using hand gestures to emulate controller inputs."
@@ -1177,6 +1209,7 @@ Currently this cannot be reliably estimated automatically. The correct value sho
     pub emulation_mode: ControllersEmulationMode,
 
     #[schema(flag = "steamvr-restart")]
+    #[schema(strings(display_name = "Extra OpenVR properties"))]
     pub extra_openvr_props: Vec<OpenvrProperty>,
 
     #[schema(flag = "real-time")]
@@ -1217,40 +1250,64 @@ Currently this cannot be reliably estimated automatically. The correct value sho
     pub button_mapping_config: AutomaticButtonMappingConfig,
 }
 
-#[derive(SettingsSchema, Serialize, Deserialize, Clone, Copy)]
-pub enum PositionRecenteringMode {
-    Disabled,
+#[derive(SettingsSchema, Serialize, Deserialize, Clone)]
+pub enum RecenteringMode {
+    Stage,
     LocalFloor,
     Local {
         #[schema(gui(slider(min = 0.0, max = 3.0)), suffix = "m")]
         view_height: f32,
     },
+    Tilted {
+        #[schema(gui(slider(min = 0.0, max = 3.0)), suffix = "m")]
+        view_height: f32,
+    },
+}
+
+#[derive(SettingsSchema, Serialize, Deserialize, Clone)]
+pub struct MarkerColocationConfig {
+    #[schema(strings(display_string = "QR Code string"))]
+    pub qr_code_string: String,
+
+    #[schema(flag = "real-time")]
+    #[schema(strings(
+        help = r"Offset coordinate on the floor between the marker and the playspace origin.
+The height of the marker doesn't need to be measured"
+    ))]
+    #[schema(suffix = "m")]
+    pub floor_offset: [f32; 2],
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone, Copy)]
-pub enum RotationRecenteringMode {
-    Disabled,
-    Yaw,
-    Tilted,
+pub struct MultimodalTracking {
+    pub enabled: bool,
+
+    #[schema(flag = "steamvr-restart")]
+    #[schema(strings(
+        display_name = "Map non-held controllers to SteamVR trackers",
+        help = "Non-held controllers are mapped to left and right feet.
+This will be configurable in the future."
+    ))]
+    pub detached_controllers_steamvr_sink: bool,
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
 pub struct HeadsetConfig {
     #[schema(strings(
-        help = r#"Disabled: the playspace origin is determined by the room-scale guardian setup.
-Local floor: the origin is on the floor and resets when long pressing the oculus button.
-Local: the origin resets when long pressing the oculus button, and is calculated as an offset from the current head position."#
+        help = r"Stage: the playspace origin is determined by the room-scale guardian setup. Can be synchnonized using a marker.
+Local floor: the origin is on the floor and resets when long pressing the recentering button.
+Local: the origin resets when long pressing the recentering button, and is calculated as an offset from the current head position.
+Tilted: the world gets tilted when long pressing the recentering button. This is useful for using VR while laying down."
     ))]
     #[schema(flag = "real-time")]
-    pub position_recentering_mode: PositionRecenteringMode,
+    pub recentering_mode: RecenteringMode,
 
     #[schema(strings(
-        help = r#"Disabled: the playspace orientation is determined by the room-scale guardian setup.
-Yaw: the forward direction is reset when long pressing the oculus button.
-Tilted: the world gets tilted when long pressing the oculus button. This is useful for using VR while laying down."#
+        string = "Marker-based co-location",
+        help = "Use a QR code to synchronize the playspace origin between players.",
+        notice = "Print at https://www.qr-code-generator.com"
     ))]
-    #[schema(flag = "real-time")]
-    pub rotation_recentering_mode: RotationRecenteringMode,
+    pub marker_colocation: Switch<MarkerColocationConfig>,
 
     #[schema(flag = "steamvr-restart")]
     pub controllers: Switch<ControllersConfig>,
@@ -1258,7 +1315,16 @@ Tilted: the world gets tilted when long pressing the oculus button. This is usef
     #[schema(flag = "steamvr-restart")]
     pub emulation_mode: HeadsetEmulationMode,
 
+    #[schema(strings(
+        help = r#"Power Savings might increase latency or reduce framerate consistency but decreases temperatures and improves battery life.
+Sustained Low provides consistent framerates but might increase latency if necessary.
+Sustained High provides consistent framerates but increases temperature.
+This is mainly for Quest headsets, mileage may vary on other devices."#
+    ))]
+    pub performance_level: PerformanceLevelConfig,
+
     #[schema(flag = "steamvr-restart")]
+    #[schema(strings(display_name = "Extra OpenVR properties"))]
     pub extra_openvr_props: Vec<OpenvrProperty>,
 
     #[schema(flag = "steamvr-restart")]
@@ -1268,6 +1334,13 @@ Tilted: the world gets tilted when long pressing the oculus button. This is usef
     pub enable_vive_tracker_proxy: bool,
 
     pub face_tracking: Switch<FaceTrackingConfig>,
+
+    #[schema(flag = "steamvr-restart")]
+    #[schema(strings(
+        help = r"Track hand skeleton while holding controllers. This will reduce hand tracking frequency to 30Hz.
+Because of runtime limitations, this option is ignored when body tracking is active."
+    ))]
+    pub multimodal_tracking: Switch<MultimodalTracking>,
 
     #[schema(flag = "steamvr-restart")]
     pub body_tracking: Switch<BodyTrackingConfig>,
@@ -1301,11 +1374,28 @@ pub struct DiscoveryConfig {
     pub auto_trust_clients: bool,
 }
 
-#[derive(SettingsSchema, Serialize, Deserialize, Clone, Copy)]
+#[derive(SettingsSchema, Serialize, Deserialize, Clone, Copy, Default)]
 pub enum SocketBufferSize {
+    #[default]
     Default,
     Maximum,
     Custom(#[schema(suffix = "B")] u32),
+}
+
+#[derive(SettingsSchema, Serialize, Deserialize, Clone, Copy, Default)]
+pub struct SocketBufferConfig {
+    #[schema(strings(display_name = "Send size"))]
+    pub send_size_bytes: SocketBufferSize,
+    #[schema(strings(display_name = "Receive size"))]
+    pub recv_size_bytes: SocketBufferSize,
+}
+
+#[derive(SettingsSchema, Serialize, Deserialize, Clone)]
+pub struct WiredClientAutoLaunchConfig {
+    #[schema(strings(
+        help = "Delay in seconds to wait after booting the headset before trying to launch the client."
+    ))]
+    pub boot_delay: u32,
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
@@ -1326,7 +1416,7 @@ TCP: Slower than UDP, but more stable. Pick this if you experience video or audi
     #[schema(strings(
         help = r#"Wether ALVR should try to automatically launch the client when establishing a wired connection."#
     ))]
-    pub wired_client_autolaunch: bool,
+    pub wired_client_autolaunch: Switch<WiredClientAutoLaunchConfig>,
 
     #[cfg_attr(
         windows,
@@ -1358,9 +1448,9 @@ TCP: Slower than UDP, but more stable. Pick this if you experience video or audi
     pub enable_on_disconnect_script: bool,
 
     #[schema(strings(
+        display_name = "Allow untrusted HTTP",
         help = "Allow cross-origin browser requests to control ALVR settings remotely."
     ))]
-    #[schema(flag = "real-time")]
     pub allow_untrusted_http: bool,
 
     #[schema(strings(
@@ -1373,19 +1463,12 @@ TCP: Slower than UDP, but more stable. Pick this if you experience video or audi
 
     pub stream_port: u16,
     pub web_server_port: u16,
+
+    #[schema(strings(display_name = "Local OSC port"))]
     pub osc_local_port: u16,
 
-    #[schema(strings(display_name = "Streamer send buffer size"))]
-    pub server_send_buffer_bytes: SocketBufferSize,
-
-    #[schema(strings(display_name = "Streamer receive buffer size"))]
-    pub server_recv_buffer_bytes: SocketBufferSize,
-
-    #[schema(strings(display_name = "Client send buffer size"))]
-    pub client_send_buffer_bytes: SocketBufferSize,
-
-    #[schema(strings(display_name = "Client receive buffer size"))]
-    pub client_recv_buffer_bytes: SocketBufferSize,
+    pub server_buffer_config: SocketBufferConfig,
+    pub client_buffer_config: SocketBufferConfig,
 
     #[schema(strings(
         help = r#"The server discards video packets if it can't push them to the network.
@@ -1401,6 +1484,7 @@ This could happen on TCP. A IDR frame is requested in this case."#
     #[schema(gui(slider(min = 5, max = 1000, step = 5)), suffix = "ms")]
     pub minimum_idr_interval_ms: u64,
 
+    #[schema(strings(display_name = "DSCP (packet prio hints)"))]
     pub dscp: Option<DscpTos>,
 }
 
@@ -1470,8 +1554,23 @@ pub struct LoggingConfig {
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
 pub struct SteamvrLauncher {
-    #[schema(strings(display_name = "Open and close SteamVR with dashboard"))]
+    #[schema(strings(
+        display_name = "Open and close SteamVR automatically",
+        help = "Launches SteamVR automatically when the ALVR dashboard is opened, and closes it when the dashboard is closed."
+    ))]
     pub open_close_steamvr_with_dashboard: bool,
+
+    #[cfg_attr(
+        windows,
+        schema(strings(help = "Directly start the VR server, bypassing Steam. \
+                Will run start_server.bat if it exists alongside session.json, and try to automatically find SteamVR otherwise."))
+    )]
+    #[cfg_attr(
+        not(windows),
+        schema(strings(help = "Directly start the VR server, bypassing Steam. \
+                Will run start_server.sh if it exists alongside session.json, and try to automatically find SteamVR otherwise."))
+    )]
+    pub direct_launch: bool,
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
@@ -1513,6 +1612,7 @@ pub struct NewVersionPopupConfig {
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
 pub struct ExtraConfig {
+    #[schema(strings(display_name = "SteamVR Launcher"))]
     pub steamvr_launcher: SteamvrLauncher,
     pub capture: CaptureConfig,
     pub logging: LoggingConfig,
@@ -1568,6 +1668,10 @@ pub fn session_settings_default() -> SettingsDefault {
     let socket_buffer = SocketBufferSizeDefault {
         Custom: 100000,
         variant: SocketBufferSizeDefaultVariant::Maximum,
+    };
+    let socket_buffer_config = SocketBufferConfigDefault {
+        send_size_bytes: socket_buffer.clone(),
+        recv_size_bytes: socket_buffer,
     };
 
     SettingsDefault {
@@ -1868,6 +1972,20 @@ pub fn session_settings_default() -> SettingsDefault {
                 },
                 variant: HeadsetEmulationModeDefaultVariant::Quest2,
             },
+            performance_level: PerformanceLevelConfigDefault {
+                cpu: SwitchDefault {
+                    enabled: false,
+                    content: PerformanceLevelDefault {
+                        variant: PerformanceLevelDefaultVariant::PowerSavings,
+                    },
+                },
+                gpu: SwitchDefault {
+                    enabled: false,
+                    content: PerformanceLevelDefault {
+                        variant: PerformanceLevelDefaultVariant::PowerSavings,
+                    },
+                },
+            },
             extra_openvr_props: default_custom_openvr_props.clone(),
             tracking_ref_only: false,
             enable_vive_tracker_proxy: false,
@@ -1882,6 +2000,13 @@ pub fn session_settings_default() -> SettingsDefault {
                         VrchatEyeOsc: FaceTrackingSinkConfigVrchatEyeOscDefault { port: 9000 },
                         variant: FaceTrackingSinkConfigDefaultVariant::VrchatEyeOsc,
                     },
+                },
+            },
+            multimodal_tracking: SwitchDefault {
+                enabled: false,
+                content: MultimodalTrackingDefault {
+                    enabled: true,
+                    detached_controllers_steamvr_sink: false,
                 },
             },
             body_tracking: SwitchDefault {
@@ -1930,7 +2055,6 @@ pub fn session_settings_default() -> SettingsDefault {
                             predict: false,
                         },
                     },
-                    multimodal_tracking: false,
                     emulation_mode: ControllersEmulationModeDefault {
                         Custom: ControllersEmulationModeCustomDefault {
                             serial_number: "ALVR Controller".into(),
@@ -2034,12 +2158,20 @@ pub fn session_settings_default() -> SettingsDefault {
                     },
                 },
             },
-            position_recentering_mode: PositionRecenteringModeDefault {
-                Local: PositionRecenteringModeLocalDefault { view_height: 1.5 },
-                variant: PositionRecenteringModeDefaultVariant::LocalFloor,
+            recentering_mode: RecenteringModeDefault {
+                Local: RecenteringModeLocalDefault { view_height: 1.5 },
+                Tilted: RecenteringModeTiltedDefault { view_height: 1.5 },
+                variant: RecenteringModeDefaultVariant::LocalFloor,
             },
-            rotation_recentering_mode: RotationRecenteringModeDefault {
-                variant: RotationRecenteringModeDefaultVariant::Yaw,
+            marker_colocation: SwitchDefault {
+                enabled: false,
+                content: MarkerColocationConfigDefault {
+                    qr_code_string: String::new(),
+                    floor_offset: ArrayDefault {
+                        gui_collapsed: false,
+                        content: [0.0, 0.0],
+                    },
+                },
             },
             max_prediction_ms: 100,
         },
@@ -2061,7 +2193,10 @@ pub fn session_settings_default() -> SettingsDefault {
                     ClientFlavorDefaultVariant::Github
                 },
             },
-            wired_client_autolaunch: true,
+            wired_client_autolaunch: SwitchDefault {
+                enabled: true,
+                content: WiredClientAutoLaunchConfigDefault { boot_delay: 0 },
+            },
             web_server_port: 8082,
             stream_port: 9944,
             osc_local_port: 9942,
@@ -2078,10 +2213,8 @@ pub fn session_settings_default() -> SettingsDefault {
                     variant: DscpTosDefaultVariant::ExpeditedForwarding,
                 },
             },
-            server_send_buffer_bytes: socket_buffer.clone(),
-            server_recv_buffer_bytes: socket_buffer.clone(),
-            client_send_buffer_bytes: socket_buffer.clone(),
-            client_recv_buffer_bytes: socket_buffer,
+            server_buffer_config: socket_buffer_config.clone(),
+            client_buffer_config: socket_buffer_config,
             max_queued_server_video_frames: 1024,
             avoid_video_glitching: false,
             minimum_idr_interval_ms: 100,
@@ -2133,6 +2266,7 @@ pub fn session_settings_default() -> SettingsDefault {
             },
             steamvr_launcher: SteamvrLauncherDefault {
                 open_close_steamvr_with_dashboard: false,
+                direct_launch: false,
             },
             capture: CaptureConfigDefault {
                 startup_video_recording: false,

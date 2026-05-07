@@ -7,7 +7,8 @@ use alvr_client_core::{
     video_decoder::{self, VideoDecoderConfig, VideoDecoderSource},
 };
 use alvr_common::{
-    HAND_LEFT_ID, HAND_RIGHT_ID, HEAD_ID, Pose, RelaxedAtomic, ViewParams,
+    DETACHED_CONTROLLER_LEFT_ID, DETACHED_CONTROLLER_RIGHT_ID, HAND_LEFT_ID, HAND_RIGHT_ID,
+    HEAD_ID, Pose, RelaxedAtomic, ViewParams,
     anyhow::Result,
     error,
     glam::{UVec2, Vec2},
@@ -106,7 +107,6 @@ impl StreamContext {
         xr_session: xr::Session<xr::OpenGlEs>,
         gfx_ctx: Rc<GraphicsContext>,
         interaction_ctx: Arc<RwLock<InteractionContext>>,
-        platform: Platform,
         config: ParsedStreamConfig,
     ) -> StreamContext {
         interaction_ctx
@@ -193,8 +193,11 @@ impl StreamContext {
             ],
             format,
             config.foveated_encoding_config.clone(),
-            platform != Platform::Lynx && !((platform.is_pico()) && config.enable_hdr),
-            !config.enable_hdr,
+            !((core_ctx.platform().is_pico()
+                || (core_ctx.platform() == Platform::SamsungGalaxyXR))
+                && config.enable_hdr),
+            // TODO: Find a driver heuristic for the limited range bug instead?
+            core_ctx.platform() != Platform::SamsungGalaxyXR && !config.enable_hdr,
             config.encoding_gamma,
             config.upscaling.clone(),
         );
@@ -225,6 +228,7 @@ impl StreamContext {
         ));
 
         let mut this = StreamContext {
+            use_custom_reprojection: core_ctx.platform().is_yvr(),
             core_context: core_ctx,
             xr_session,
             interaction_context: interaction_ctx,
@@ -238,7 +242,6 @@ impl StreamContext {
             target_view_resolution,
             renderer,
             decoder: None,
-            use_custom_reprojection: platform.is_yvr(),
         };
 
         this.update_reference_space();
@@ -519,8 +522,6 @@ fn stream_input_loop(
     refresh_rate: f32,
     running: Arc<RelaxedAtomic>,
 ) {
-    let platform = alvr_system_info::platform();
-
     let mut last_controller_poses = [Pose::IDENTITY; 2];
     let mut last_palm_poses = [Pose::IDENTITY; 2];
     let mut last_view_params = [ViewParams::DUMMY; 2];
@@ -528,7 +529,8 @@ fn stream_input_loop(
     let mut deadline = Instant::now();
     let frame_interval = Duration::from_secs_f32(1.0 / refresh_rate);
     while running.value() {
-        let int_ctx = &*interaction_ctx.read();
+        let int_ctx_lock = interaction_ctx.read();
+        let int_ctx = &*int_ctx_lock;
         // Streaming related inputs are updated here. Make sure every input poll is done in this
         // thread
         if let Err(e) = xr_session.sync_actions(&[(&int_ctx.action_set).into()]) {
@@ -546,7 +548,7 @@ fn stream_input_loop(
 
         let Some((head_motion, local_views)) = interaction::get_head_data(
             &xr_session,
-            platform,
+            core_ctx.platform(),
             stage_reference_space,
             view_reference_space,
             now,
@@ -565,9 +567,9 @@ fn stream_input_loop(
 
         device_motions.push((*HEAD_ID, head_motion));
 
-        let (left_hand_motion, left_hand_skeleton) = crate::interaction::get_hand_data(
+        let left_hand_data = crate::interaction::get_hand_data(
             &xr_session,
-            platform,
+            core_ctx.platform(),
             stage_reference_space,
             now,
             target_time,
@@ -575,9 +577,9 @@ fn stream_input_loop(
             &mut last_controller_poses[0],
             &mut last_palm_poses[0],
         );
-        let (right_hand_motion, right_hand_skeleton) = crate::interaction::get_hand_data(
+        let right_hand_data = crate::interaction::get_hand_data(
             &xr_session,
-            platform,
+            core_ctx.platform(),
             stage_reference_space,
             now,
             target_time,
@@ -588,15 +590,26 @@ fn stream_input_loop(
 
         // Note: When multimodal input is enabled, we are sure that when free hands are used
         // (not holding controllers) the controller data is None.
-        if (int_ctx.multimodal_hands_enabled || left_hand_skeleton.is_none())
-            && let Some(motion) = left_hand_motion
+        if (int_ctx.multimodal_hands_enabled || left_hand_data.skeleton_joints.is_none())
+            && let Some(motion) = left_hand_data.grip_motion
         {
             device_motions.push((*HAND_LEFT_ID, motion));
         }
-        if (int_ctx.multimodal_hands_enabled || right_hand_skeleton.is_none())
-            && let Some(motion) = right_hand_motion
+        if (int_ctx.multimodal_hands_enabled || right_hand_data.skeleton_joints.is_none())
+            && let Some(motion) = right_hand_data.grip_motion
         {
             device_motions.push((*HAND_RIGHT_ID, motion));
+        }
+
+        if int_ctx.multimodal_hands_enabled
+            && let Some(detached_controller) = left_hand_data.detached_grip_motion
+        {
+            device_motions.push((*DETACHED_CONTROLLER_LEFT_ID, detached_controller));
+        }
+        if int_ctx.multimodal_hands_enabled
+            && let Some(detached_controller) = right_hand_data.detached_grip_motion
+        {
+            device_motions.push((*DETACHED_CONTROLLER_RIGHT_ID, detached_controller));
         }
 
         let face = interaction::get_face_data(
@@ -615,6 +628,15 @@ fn stream_input_loop(
             device_motions.append(&mut interaction::get_bd_motion_trackers(source, now));
         }
 
+        drop(int_ctx_lock);
+
+        let markers = interaction_ctx
+            .write()
+            .marker_spatial_context
+            .as_mut()
+            .and_then(|ctx| interaction::get_marker_poses(ctx, stage_reference_space, now))
+            .unwrap_or_default();
+
         // Even though the server is already adding the motion-to-photon latency, here we use
         // target_time as the poll_timestamp to compensate for the fact that video frames are sent
         // with the poll timestamp instead of the vsync time. This is to ensure correctness when
@@ -623,12 +645,17 @@ fn stream_input_loop(
         core_ctx.send_tracking(TrackingData {
             poll_timestamp: target_time,
             device_motions,
-            hand_skeletons: [left_hand_skeleton, right_hand_skeleton],
+            hand_skeletons: [
+                left_hand_data.skeleton_joints,
+                right_hand_data.skeleton_joints,
+            ],
             face,
             body,
+            markers,
         });
 
-        let button_entries = interaction::update_buttons(&xr_session, &int_ctx.button_actions);
+        let button_entries =
+            interaction::update_buttons(&xr_session, &interaction_ctx.read().button_actions);
         if !button_entries.is_empty() {
             core_ctx.send_buttons(button_entries);
         }
