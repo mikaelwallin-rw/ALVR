@@ -166,11 +166,7 @@ pub fn entry_point() {
     // Using a provisional platform, before we can get the runtime info
     let (loader_suffix, openxr_version) = match alvr_system_info::platform(None, None) {
         Platform::Quest1 => ("_quest1", LEGACY_OPENXR_VERSION),
-        Platform::PicoNeo3
-        | Platform::PicoG3
-        | Platform::Pico4
-        | Platform::Pico4Pro
-        | Platform::Pico4Enterprise => ("_pico_old", LEGACY_OPENXR_VERSION),
+        p if p.is_pico() => ("_pico_old", LEGACY_OPENXR_VERSION),
         p if p.is_vive() => ("", LEGACY_OPENXR_VERSION),
         p if p.is_yvr() => ("_yvr", LEGACY_OPENXR_VERSION),
         _ => ("", CURRENT_OPENXR_VERSION),
