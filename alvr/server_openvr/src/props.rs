@@ -621,21 +621,30 @@ pub extern "C" fn set_device_openvr_props(instance_ptr: *mut c_void, device_id: 
                 // Ensure SteamVR resolves {alvr_server} token to this driver's resources
                 set_prop(ResourceRootString, "alvr_server");
 
+                // Use the Pico 4 controller render model + profile for the
+                // hand-tracker device. The dedicated alvr_hand_left/right
+                // OBJs are placeholder triangles with no real geometry, and
+                // the svl_hand_interaction_augmented input profile does not
+                // exist in our fork, upstream ALVR, or Pico Business
+                // Streaming. Pointing at the controller resources matches
+                // what Business Streaming does — the user sees a Pico
+                // controller hovering at the wrist with finger curl from
+                // skeletal input when using hand tracking.
                 if left_hand {
                     set_prop(
                         RenderModelNameString,
-                        "{alvr_server}/rendermodels/alvr_hand_left",
+                        "{alvr_server}/rendermodels/pico_4s_leftcontroller",
                     );
                 } else if right_hand {
                     set_prop(
                         RenderModelNameString,
-                        "{alvr_server}/rendermodels/alvr_hand_right",
+                        "{alvr_server}/rendermodels/pico_4s_rightcontroller",
                     );
                 }
-                set_prop(ControllerTypeString, "svl_hand_interaction_augmented");
+                set_prop(ControllerTypeString, "pico_controller");
                 set_prop(
                     InputProfilePathString,
-                    "{alvr_server}/input/svl_hand_interaction_augmented_input_profile.json",
+                    "{alvr_server}/input/pico_controller_profile.json",
                 );
 
                 if left_hand {
