@@ -58,12 +58,11 @@ bool Controller::activate() {
         vr::VRScalarUnits_NormalizedOneSided
     );
 
-    // Only create a skeleton component for dedicated hand-tracker devices.
-    // Creating a skeleton component on controller devices makes runtimes expose
-    // the device as a Hand visual. To keep controllers reported as controllers
-    // by the runtime (unless a separate hand tracker device exists) we only
-    // register skeleton components for HAND_TRACKER_* device IDs.
-    if (this->device_id == HAND_TRACKER_LEFT_ID) {
+    // Create skeleton component on both regular controller and hand-tracker
+    // device IDs. Stock ALVR / Business Streaming both expose the skeletal
+    // input on the controller itself so SteamVR can translate finger curl into
+    // XR_EXT_hand_tracking joint output for OpenXR clients.
+    if (this->device_id == HAND_LEFT_ID || this->device_id == HAND_TRACKER_LEFT_ID) {
         vr_driver_input->CreateSkeletonComponent(
             this->prop_container,
             "/input/skeleton/left",
@@ -74,7 +73,7 @@ bool Controller::activate() {
             0U,
             &m_compSkeleton
         );
-    } else if (this->device_id == HAND_TRACKER_RIGHT_ID) {
+    } else {
         vr_driver_input->CreateSkeletonComponent(
             this->prop_container,
             "/input/skeleton/right",
@@ -85,15 +84,10 @@ bool Controller::activate() {
             0U,
             &m_compSkeleton
         );
-    } else {
-        // Leave m_compSkeleton as invalid for regular controller devices so we
-        // don't advertise skeleton capability to the runtime.
-        m_compSkeleton = vr::k_ulInvalidInputComponentHandle;
     }
 
     // NB: here we set some initial values for the hand skeleton to fix the frozen hand bug
-    // Only update the skeleton if the component was actually created.
-    if (m_compSkeleton != vr::k_ulInvalidInputComponentHandle) {
+    {
         vr::VRBoneTransform_t boneTransforms[SKELETON_BONE_COUNT];
         GetBoneTransform(false, boneTransforms);
 
