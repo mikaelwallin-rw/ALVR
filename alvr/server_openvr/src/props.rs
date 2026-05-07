@@ -406,10 +406,7 @@ pub extern "C" fn set_device_openvr_props(instance_ptr: *mut c_void, device_id: 
                 }
                 ControllersEmulationMode::Pico4 => {
                     set_prop(TrackingSystemNameString, "alvr_server");
-                    set_prop(TrackingSystemNameString, "alvr_server");
                     set_prop(ManufacturerNameString, "ByteDance");
-                    // Ensure SteamVR resolves {alvr_server} token to this driver's resources
-                    set_prop(ResourceRootString, "alvr_server");
                     // Ensure SteamVR resolves {alvr_server} token to this driver's resources
                     set_prop(ResourceRootString, "alvr_server");
                     if left_hand {
@@ -417,21 +414,19 @@ pub extern "C" fn set_device_openvr_props(instance_ptr: *mut c_void, device_id: 
                         set_prop(
                             RenderModelNameString,
                             "{alvr_server}/rendermodels/pico_4s_leftcontroller",
-                            "{alvr_server}/rendermodels/pico_4s_leftcontroller",
                         );
-                    set_icons("{alvr_server}/icons_phoenix/left_controller");
-                } else if right_hand {
-                    set_prop(ModelNumberString, "PICO 4 (Right Controller)");
-                    set_prop(
-                        RenderModelNameString,
-                        "{alvr_server}/rendermodels/pico_4s_rightcontroller",
-                    );
-                    set_icons("{alvr_server}/icons_phoenix/right_controller");
-                }
+                        set_icons("{alvr_server}/icons_phoenix/left_controller");
+                    } else if right_hand {
+                        set_prop(ModelNumberString, "PICO 4 (Right Controller)");
+                        set_prop(
+                            RenderModelNameString,
+                            "{alvr_server}/rendermodels/pico_4s_rightcontroller",
+                        );
+                        set_icons("{alvr_server}/icons_phoenix/right_controller");
+                    }
                     set_prop(ControllerTypeString, "pico_controller");
                     set_prop(
                         InputProfilePathString,
-                        "{alvr_server}/input/pico_controller_profile.json",
                         "{alvr_server}/input/pico_controller_profile.json",
                     );
                 }
@@ -587,7 +582,6 @@ pub extern "C" fn set_device_openvr_props(instance_ptr: *mut c_void, device_id: 
                     set_prop(
                         RegisteredDeviceTypeString,
                         "alvr_server/alvr_serverQ_HandTracker_Left",
-                        "alvr_server/alvr_serverQ_HandTracker_Left",
                     );
                     set_prop(SerialNumberString, "alvr_serverQ_Hand_Left");
                     set_prop(AttachedDeviceIdString, "alvr_serverQ_Hand_Left");
@@ -632,4 +626,3 @@ pub extern "C" fn set_device_openvr_props(instance_ptr: *mut c_void, device_id: 
         }
     }
 }
-

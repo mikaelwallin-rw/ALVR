@@ -213,7 +213,8 @@ fn event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                                 ptr::null()
                             },
                             // Mark as hand tracker only when we are not preferring the controller.
-                            isHandTracker: !prefer_left_controller && ffi_left_hand_skeleton.is_some(),
+                            isHandTracker: !prefer_left_controller
+                                && ffi_left_hand_skeleton.is_some(),
                             predictHandSkeleton: predict_hand_skeleton,
                         };
                         let ffi_right_hand_data = FfiHandData {
@@ -239,7 +240,8 @@ fn event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                                 ptr::null()
                             },
                             // Mark as hand tracker only when we are not preferring the controller.
-                            isHandTracker: !prefer_right_controller && ffi_right_hand_skeleton.is_some(),
+                            isHandTracker: !prefer_right_controller
+                                && ffi_right_hand_skeleton.is_some(),
                             predictHandSkeleton: predict_hand_skeleton,
                         };
 
@@ -275,9 +277,7 @@ fn event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                             let right_using_hand = !prefer_right_controller && right_skel;
 
                             static PREV_SET_TRACKING: Lazy<
-                                Mutex<Option<(
-                                    bool, bool, bool, bool, bool, bool, bool
-                                )>>
+                                Mutex<Option<(bool, bool, bool, bool, bool, bool, bool)>>,
                             > = Lazy::new(|| Mutex::new(None));
 
                             let mut prev = PREV_SET_TRACKING.lock();
