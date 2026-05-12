@@ -91,12 +91,18 @@ pub fn connection_lifecycle_loop(
     lifecycle_state: Arc<RwLock<LifecycleState>>,
     event_queue: Arc<Mutex<VecDeque<ClientCoreEvent>>>,
 ) {
-    dbg_connection!("connection_lifecycle_loop: Begin");
+    info!("connection_lifecycle_loop: Begin");
 
     set_hud_message(&event_queue, INITIAL_MESSAGE);
 
     while *lifecycle_state.read() != LifecycleState::ShuttingDown {
-        if *lifecycle_state.read() == LifecycleState::Resumed {
+        let is_resumed = *lifecycle_state.read() == LifecycleState::Resumed;
+        info!(
+            "connection_lifecycle_loop: iter (resumed={is_resumed}, lifecycle={:?})",
+            *lifecycle_state.read()
+        );
+
+        if is_resumed {
             if let Err(e) = connection_pipeline(
                 capabilities.clone(),
                 Arc::clone(&ctx),
@@ -106,6 +112,8 @@ pub fn connection_lifecycle_loop(
                 let message = format!("Connection error:\n{e}\nCheck the PC for more details");
                 set_hud_message(&event_queue, &message);
                 error!("Connection error: {e}");
+            } else {
+                info!("connection_lifecycle_loop: pipeline returned Ok, will retry");
             }
         } else {
             debug!("Skip try connection because the device is sleeping");
@@ -117,7 +125,7 @@ pub fn connection_lifecycle_loop(
         thread::sleep(CONNECTION_RETRY_INTERVAL);
     }
 
-    dbg_connection!("connection_lifecycle_loop: End");
+    info!("connection_lifecycle_loop: End");
 }
 
 fn connection_pipeline(
@@ -126,16 +134,30 @@ fn connection_pipeline(
     lifecycle_state: Arc<RwLock<LifecycleState>>,
     event_queue: Arc<Mutex<VecDeque<ClientCoreEvent>>>,
 ) -> ConResult {
-    dbg_connection!("connection_pipeline: Begin");
+    info!("connection_pipeline: Begin");
 
     let (mut proto_control_socket, server_ip) = {
         let config = Config::load();
+        info!(
+            "connection_pipeline: creating announcer (hostname={})",
+            config.hostname
+        );
         let announcer_socket = AnnouncerSocket::new(&config.hostname).to_con()?;
-        let listener_socket =
-            alvr_sockets::get_server_listener(HANDSHAKE_ACTION_TIMEOUT).to_con()?;
+        info!("connection_pipeline: binding server listener on control port");
+        let listener_socket = match alvr_sockets::get_server_listener(HANDSHAKE_ACTION_TIMEOUT) {
+            Ok(l) => {
+                info!("connection_pipeline: listener bound");
+                l
+            }
+            Err(e) => {
+                error!("connection_pipeline: get_server_listener FAILED: {e}");
+                return Err(e).to_con();
+            }
+        };
 
         loop {
             if *lifecycle_state.write() != LifecycleState::Resumed {
+                info!("connection_pipeline: lifecycle no longer Resumed, exiting");
                 return Ok(());
             }
 
@@ -145,6 +167,7 @@ fn connection_pipeline(
                 SOCKET_INIT_RETRY_INTERVAL,
                 PeerType::Server(&listener_socket),
             ) {
+                info!("connection_pipeline: server connected; proceeding with handshake");
                 set_hud_message(&event_queue, SUCCESS_CONNECT_MESSAGE);
                 break pair;
             }
@@ -214,7 +237,9 @@ fn connection_pipeline(
             set_hud_message(&event_queue, STREAM_STARTING_MESSAGE);
         }
         Ok(ServerControlPacket::Restarting) => {
-            info!("Server restarting");
+            info!(
+                "Server restarting; exiting pipeline so listener can be rebound on next iteration"
+            );
             set_hud_message(&event_queue, SERVER_RESTART_MESSAGE);
             return Ok(());
         }
