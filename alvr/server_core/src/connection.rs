@@ -254,6 +254,34 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
     while *lifecycle_state.read() != LifecycleState::ShuttingDown {
         dbg_connection!("handshake_loop: Try connect to wired device");
 
+        // Self-heal a leaked Disconnecting state on the wired client. The state
+        // is set by web_server::update_client_connections when something sends
+        // RemoveEntry on a non-Disconnected client (e.g. UI toggle), and is
+        // supposed to be cleared by the post-connection thread in try_connect.
+        // If that thread terminated abnormally (panic, hang) the entry stays
+        // stuck in Disconnecting and this loop never retries wired (the check
+        // below requires state == Disconnected). If no removal is actually
+        // pending (clients_to_be_removed does not contain it), force the state
+        // back to Disconnected so wired streaming can resume on its own.
+        let wired_needs_reset = {
+            let session = SESSION_MANAGER.read();
+            let pending_remove = ctx.clients_to_be_removed.lock();
+            session
+                .client_list()
+                .get(WIRED_CLIENT_HOSTNAME)
+                .is_some_and(|info| {
+                    info.connection_state == ConnectionState::Disconnecting
+                        && !pending_remove.contains(WIRED_CLIENT_HOSTNAME)
+                })
+        };
+        if wired_needs_reset {
+            info!("handshake_loop: clearing stuck Disconnecting on {WIRED_CLIENT_HOSTNAME}");
+            SESSION_MANAGER.write().update_client_connections(
+                WIRED_CLIENT_HOSTNAME.to_owned(),
+                ClientConnectionsAction::SetConnectionState(ConnectionState::Disconnected),
+            );
+        }
+
         let mut wired_client_ips = HashMap::new();
         if SESSION_MANAGER
             .read()
