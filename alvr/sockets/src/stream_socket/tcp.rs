@@ -52,6 +52,13 @@ pub fn accept_from_server(
     }
 
     socket.set_read_timeout(Some(timeout)).to_con()?;
+    // Bound blocking writes. write_all on std::net::TcpStream blocks
+    // indefinitely by default; if the remote stops consuming the stream
+    // (e.g. during its own cleanup, or USB-adb back-pressure under load),
+    // the video send loop parks forever, the worker can't observe the
+    // is_streaming flip to false, and connection_pipeline.join() at shutdown
+    // hangs -- leaving the session stuck at Disconnecting.
+    socket.set_write_timeout(Some(timeout)).to_con()?;
     socket.set_nodelay(true).to_con()?;
 
     Ok(socket)
@@ -78,6 +85,10 @@ pub fn connect_to_client(
 
     crate::set_socket_buffers(&socket, buffer_config).ok();
     socket.set_read_timeout(Some(timeout)).to_con()?;
+    // See comment in accept_from_server: blocking writes are unbounded by
+    // default; this prevents the video send loop from deadlocking shutdown
+    // when the remote (Pico) stalls during cleanup.
+    socket.set_write_timeout(Some(timeout)).to_con()?;
 
     let socket = TcpStream::from(socket);
 

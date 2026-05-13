@@ -49,6 +49,15 @@ pub fn accept_from_server(
     }
 
     socket.set_read_timeout(Some(timeout)).to_con()?;
+    // Bound blocking writes (write_all on std::net::TcpStream blocks forever
+    // by default). Without this, if the remote stops draining the recv buffer
+    // -- e.g. during its own cleanup, or over an adb-USB tunnel that's
+    // back-pressured -- our send threads (keepalive, RealTimeConfig, decoder
+    // config replies) park indefinitely on write_all while holding the
+    // control_sender Mutex. That freezes every other sender, and the worker
+    // joins on shutdown never complete, leaving the session stuck at
+    // Disconnecting forever.
+    socket.set_write_timeout(Some(timeout)).to_con()?;
     socket.set_nodelay(true).to_con()?;
 
     Ok((socket.try_clone().to_con()?, socket))
@@ -75,6 +84,9 @@ pub fn connect_to_client(
 
     crate::set_socket_buffers(&socket, buffer_config).ok();
     socket.set_read_timeout(Some(timeout)).to_con()?;
+    // See comment in accept_from_server: write_all is unbounded by default,
+    // and a stalled remote during shutdown can deadlock our worker joins.
+    socket.set_write_timeout(Some(timeout)).to_con()?;
 
     let socket = TcpStream::from(socket);
 
@@ -222,6 +234,12 @@ impl ProtoControlSocket {
         timeout: Duration,
     ) -> Result<(ControlSocketSender<S>, ControlSocketReceiver<R>)> {
         self.inner.set_read_timeout(Some(timeout))?;
+        // Mirror set_read_timeout with a write_timeout so framed_send (which
+        // uses blocking write_all) cannot park forever on a stalled remote.
+        // Without this, the keepalive thread, RealTimeConfig thread, etc. can
+        // hang on the same Mutex<TcpStream>, blocking worker joins and
+        // wedging connection shutdown at the Disconnecting state.
+        self.inner.set_write_timeout(Some(timeout))?;
 
         Ok((
             ControlSocketSender {
