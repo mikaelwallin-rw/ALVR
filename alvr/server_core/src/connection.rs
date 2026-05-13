@@ -1457,7 +1457,7 @@ fn connection_pipeline(
     *ctx.video_recording_file.lock() = None;
 
     session_manager_lock.update_client_connections(
-        client_hostname,
+        client_hostname.clone(),
         ClientConnectionsAction::SetConnectionState(ConnectionState::Disconnecting),
     );
 
@@ -1485,18 +1485,39 @@ fn connection_pipeline(
     // Allow threads to shutdown correctly
     drop(session_manager_lock);
 
-    // Ensure shutdown of threads
-    dbg_connection!("connection_pipeline: Shutdown threads");
-    video_send_thread.join().ok();
-    game_audio_thread.join().ok();
-    microphone_thread.join().ok();
-    tracking_receive_thread.join().ok();
-    statistics_thread.join().ok();
-    real_time_update_thread.join().ok();
-    control_receive_thread.join().ok();
-    stream_receive_thread.join().ok();
-    keepalive_thread.join().ok();
-    lifecycle_check_thread.join().ok();
+    // Ensure shutdown of threads. Each join is logged so that if any thread
+    // hangs in the future (e.g. blocked on a socket write_all with no
+    // timeout, the failure mode that wedged shutdown at the Disconnecting
+    // state), we can see in vrserver.txt which thread is the culprit.
+    let join_started = Instant::now();
+    info!("connection_pipeline: starting worker-thread joins for {client_hostname}");
+
+    fn join_logged<T>(name: &str, thread: thread::JoinHandle<T>) {
+        let t0 = Instant::now();
+        thread.join().ok();
+        let elapsed_ms = t0.elapsed().as_millis();
+        if elapsed_ms > 100 {
+            warn!("connection_pipeline: join {name} took {elapsed_ms} ms");
+        } else {
+            info!("connection_pipeline: join {name} ok ({elapsed_ms} ms)");
+        }
+    }
+
+    join_logged("video_send_thread", video_send_thread);
+    join_logged("game_audio_thread", game_audio_thread);
+    join_logged("microphone_thread", microphone_thread);
+    join_logged("tracking_receive_thread", tracking_receive_thread);
+    join_logged("statistics_thread", statistics_thread);
+    join_logged("real_time_update_thread", real_time_update_thread);
+    join_logged("control_receive_thread", control_receive_thread);
+    join_logged("stream_receive_thread", stream_receive_thread);
+    join_logged("keepalive_thread", keepalive_thread);
+    join_logged("lifecycle_check_thread", lifecycle_check_thread);
+
+    info!(
+        "connection_pipeline: all worker joins done for {client_hostname} in {} ms",
+        join_started.elapsed().as_millis()
+    );
 
     ctx.events_sender
         .send(ServerCoreEvent::ClientDisconnected)
