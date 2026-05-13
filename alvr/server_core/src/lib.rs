@@ -102,6 +102,12 @@ pub struct ConnectionContext {
     video_recording_file: Mutex<Option<File>>,
     connection_threads: Mutex<Vec<JoinHandle<()>>>,
     clients_to_be_removed: Mutex<HashSet<String>>,
+    // Set of hostnames whose connection_pipeline is currently alive. Insertions
+    // happen in try_connect before spawning the worker; removal happens via a
+    // Drop guard inside the worker closure so it fires on panic unwind too.
+    // Used by handshake_loop to detect leaked Connecting/Streaming/Disconnecting
+    // states (state machine survived but worker died without cleanup).
+    active_pipelines: Mutex<HashSet<String>>,
     video_channel_sender: Mutex<Option<SyncSender<VideoPacket>>>,
     haptics_sender: Mutex<Option<StreamSender<Haptics>>>,
 }
@@ -213,6 +219,7 @@ impl ServerCoreContext {
             video_recording_file: Mutex::new(None),
             connection_threads: Mutex::new(Vec::new()),
             clients_to_be_removed: Mutex::new(HashSet::new()),
+            active_pipelines: Mutex::new(HashSet::new()),
             video_channel_sender: Mutex::new(None),
             haptics_sender: Mutex::new(None),
         });

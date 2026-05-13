@@ -254,28 +254,35 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
     while *lifecycle_state.read() != LifecycleState::ShuttingDown {
         dbg_connection!("handshake_loop: Try connect to wired device");
 
-        // Self-heal a leaked Disconnecting state on the wired client. The state
-        // is set by web_server::update_client_connections when something sends
-        // RemoveEntry on a non-Disconnected client (e.g. UI toggle), and is
-        // supposed to be cleared by the post-connection thread in try_connect.
-        // If that thread terminated abnormally (panic, hang) the entry stays
-        // stuck in Disconnecting and this loop never retries wired (the check
-        // below requires state == Disconnected). If no removal is actually
-        // pending (clients_to_be_removed does not contain it), force the state
-        // back to Disconnected so wired streaming can resume on its own.
-        let wired_needs_reset = {
+        // Self-heal any leaked non-Disconnected state on the wired client.
+        // Connection states are normally driven by the connection_pipeline
+        // worker thread (set to Connecting on entry, Streaming/Disconnecting
+        // in flight, Disconnected by the post-cleanup at the end of
+        // try_connect). If that worker terminates abnormally (panic, hang,
+        // killed) the state is stranded at whatever it was when the worker
+        // died and the eligibility check below (state == Disconnected) skips
+        // wired forever. Detect "no live worker for wired AND no removal
+        // pending AND state != Disconnected" and force a reset so the loop
+        // can retry. active_pipelines is populated by try_connect and cleared
+        // by a Drop guard inside the worker closure (panic-safe).
+        let wired_state_to_reset: Option<ConnectionState> = {
             let session = SESSION_MANAGER.read();
             let pending_remove = ctx.clients_to_be_removed.lock();
+            let active = ctx.active_pipelines.lock();
             session
                 .client_list()
                 .get(WIRED_CLIENT_HOSTNAME)
-                .is_some_and(|info| {
-                    info.connection_state == ConnectionState::Disconnecting
+                .and_then(|info| {
+                    let stuck = info.connection_state != ConnectionState::Disconnected
                         && !pending_remove.contains(WIRED_CLIENT_HOSTNAME)
+                        && !active.contains(WIRED_CLIENT_HOSTNAME);
+                    stuck.then(|| info.connection_state.clone())
                 })
         };
-        if wired_needs_reset {
-            info!("handshake_loop: clearing stuck Disconnecting on {WIRED_CLIENT_HOSTNAME}");
+        if let Some(stuck_state) = wired_state_to_reset {
+            info!(
+                "handshake_loop: clearing leaked {stuck_state:?} on {WIRED_CLIENT_HOSTNAME} (no active worker, no pending removal)"
+            );
             SESSION_MANAGER.write().update_client_connections(
                 WIRED_CLIENT_HOSTNAME.to_owned(),
                 ClientConnectionsAction::SetConnectionState(ConnectionState::Disconnected),
@@ -500,9 +507,37 @@ fn try_connect(
 
     dbg_connection!("try_connect: Pushing new client connection thread");
 
+    // Track this hostname as having a live pipeline before spawning, so
+    // handshake_loop's self-heal can tell "state Connecting and active worker"
+    // (legitimate, leave alone) apart from "state Connecting but worker dead"
+    // (stuck, reset). Removal is handled by a Drop guard inside the spawned
+    // closure so it fires on panic unwind too -- panics are exactly the case
+    // where the post-cleanup below would otherwise be skipped.
+    ctx.active_pipelines
+        .lock()
+        .insert(client_hostname.clone());
+
+    struct PipelineGuard {
+        ctx: Arc<ConnectionContext>,
+        hostname: String,
+    }
+    impl Drop for PipelineGuard {
+        fn drop(&mut self) {
+            self.ctx.active_pipelines.lock().remove(&self.hostname);
+        }
+    }
+
     ctx.connection_threads.lock().push(thread::spawn({
         let ctx = Arc::clone(&ctx);
         move || {
+            // Drop runs last in the closure (declared first = dropped last),
+            // so by the time active_pipelines is cleared, the post-cleanup
+            // below has already written the final state to the session.
+            let _guard = PipelineGuard {
+                ctx: Arc::clone(&ctx),
+                hostname: client_hostname.clone(),
+            };
+
             if let Err(e) = connection_pipeline(
                 Arc::clone(&ctx),
                 lifecycle_state,
