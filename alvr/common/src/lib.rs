@@ -9,6 +9,7 @@ mod version;
 use parking_lot::{Condvar, Mutex, RwLockWriteGuard};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 pub use anyhow;
 pub use glam;
@@ -70,5 +71,38 @@ pub fn wait_rwlock<T>(condvar: &Condvar, guard: &mut RwLockWriteGuard<'_, T>) {
     let mut inner_guard = staging_mutex.lock();
     RwLockWriteGuard::unlocked(guard, move || {
         condvar.wait(&mut inner_guard);
+    });
+}
+
+/// Timeout-bounded variant of [`wait_rwlock`].
+///
+/// Same semantics as [`wait_rwlock`] -- the outer write guard is released
+/// while the thread parks on the Condvar -- but the wait returns after at
+/// most `timeout` even if no notification arrives. Intended to be used in a
+/// predicate loop:
+///
+/// ```ignore
+/// while !shutdown_complete(&*guard) {
+///     wait_rwlock_timeout(&cond, &mut guard, Duration::from_millis(500));
+/// }
+/// ```
+///
+/// This pattern is immune to the lost-wakeup race that [`wait_rwlock`] has:
+/// between releasing the outer RwLock and entering `condvar.wait()`, a
+/// `notify_one` call can fire and be dropped (Condvar wakeups are
+/// edge-triggered and not buffered). With a timeout-bounded wait, even if
+/// every wakeup is lost, the predicate is re-evaluated within `timeout` and
+/// the loop exits as soon as the authoritative state says so.
+pub fn wait_rwlock_timeout<T>(
+    condvar: &Condvar,
+    guard: &mut RwLockWriteGuard<'_, T>,
+    timeout: Duration,
+) {
+    let staging_mutex = Mutex::<()>::new(());
+    let mut inner_guard = staging_mutex.lock();
+    RwLockWriteGuard::unlocked(guard, move || {
+        // Discard the WaitTimeoutResult -- the caller's predicate loop is the
+        // real authority on whether to keep waiting.
+        let _ = condvar.wait_for(&mut inner_guard, timeout);
     });
 }

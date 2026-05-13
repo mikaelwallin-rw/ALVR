@@ -20,6 +20,7 @@ pub mod video_decoder;
 use alvr_common::{
     ConnectionState, LifecycleState, ViewParams, dbg_client_core, error,
     glam::{UVec2, Vec2},
+    info,
     parking_lot::{Mutex, RwLock},
     warn,
 };
@@ -141,12 +142,57 @@ impl ClientCoreContext {
 
         *self.lifecycle_state.write() = LifecycleState::Idle;
 
-        // We want to shutdown streaming when pausing.
-        if *connection_state_lock != ConnectionState::Disconnected {
-            alvr_common::wait_rwlock(
+        // Wait until the connection is actually torn down before returning to
+        // the OpenXR main thread (this is called from the XR_STOPPING handler).
+        //
+        // The original implementation used a single `wait_rwlock(...)` here.
+        // That has a lost-wakeup race: `wait_rwlock` releases the outer
+        // RwLock BEFORE parking the thread on the inner Condvar, so a
+        // `notify_one` that fires in that window is dropped (Condvar wakeups
+        // are edge-triggered, not buffered). When the wakeup is lost, the main
+        // UI thread blocks indefinitely, Android raises an ANR, and the Pico
+        // runtime steals the display (visible to the user as the Pico loading
+        // ring and a fully wedged ALVR client that requires `am force-stop`
+        // to recover).
+        //
+        // The predicate loop below is immune to that race: it re-checks the
+        // authoritative `connection_state` after every wake / timeout. Even
+        // if every notification gets lost, the loop exits as soon as the
+        // state is observed to be Disconnected. Worst-case latency is the
+        // wait_rwlock_timeout argument (500 ms).
+        const WAIT_POLL: Duration = Duration::from_millis(500);
+        const HEARTBEAT_EVERY: u32 = 4; // every ~2s
+        let start = std::time::Instant::now();
+        let initial_state = (*connection_state_lock).clone();
+        let mut iter = 0u32;
+
+        while *connection_state_lock != ConnectionState::Disconnected {
+            if iter == 0 {
+                info!(
+                    "pause: connection_state is {initial_state:?}, waiting for it to reach Disconnected"
+                );
+            } else if iter % HEARTBEAT_EVERY == 0 {
+                warn!(
+                    "pause: still waiting after {} ms (iter {iter}, state={:?})",
+                    start.elapsed().as_millis(),
+                    *connection_state_lock,
+                );
+            }
+            iter += 1;
+            alvr_common::wait_rwlock_timeout(
                 &self.connection_context.disconnected_notif,
                 &mut connection_state_lock,
+                WAIT_POLL,
             );
+        }
+
+        if iter > 0 {
+            info!(
+                "pause: connection reached Disconnected after {} ms ({iter} wait iterations, initial state {initial_state:?})",
+                start.elapsed().as_millis(),
+            );
+        } else {
+            dbg_client_core!("pause: already Disconnected on entry, returning immediately");
         }
     }
 
