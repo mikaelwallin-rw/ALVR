@@ -8,11 +8,18 @@ use std::{
     marker::PhantomData,
     mem,
     net::{IpAddr, SocketAddr, TcpListener, TcpStream},
+    thread,
     time::{Duration, Instant},
 };
 
 // This corresponds to the length of the payload
 const FRAMED_PREFIX_LENGTH: usize = mem::size_of::<u32>();
+
+// Poll backoff while a framed packet prefix/body trickles in. peek()/read() on a
+// blocking socket return immediately when a partial frame is already buffered (the
+// read timeout only fires on a fully empty socket), so without a small yield the recv
+// loop busy-spins a core until the deadline. Mirrors stream_socket/tcp.rs.
+const RECV_POLL_BACKOFF: Duration = Duration::from_millis(1);
 
 pub fn bind(
     timeout: Duration,
@@ -128,9 +135,21 @@ fn framed_recv<R: DeserializeOwned>(
             let count = socket.peek(&mut payload_size_bytes).handle_try_again()?;
             if count == FRAMED_PREFIX_LENGTH {
                 break;
-            } else if Instant::now() > deadline {
+            }
+            if count == 0 {
+                // Orderly peer/ADB-forward close (FIN): peek returns Ok(0) instantly
+                // and forever (not a WouldBlock, so the read timeout never fires). Bail
+                // with a real error so the connection tears down instead of busy-
+                // spinning a core -- the control-socket twin of the stream_socket EOF
+                // guard. Without this, a wedged-but-reachable peer pegs vrserver.
+                con_bail!("Control socket closed by peer (EOF) while reading frame prefix");
+            }
+            if Instant::now() > deadline {
                 return alvr_common::try_again();
             }
+            // A partial (1..FRAMED_PREFIX_LENGTH) prefix re-peeks the same bytes with no
+            // block; yield briefly so we poll instead of pegging the CPU.
+            thread::sleep(RECV_POLL_BACKOFF);
         }
 
         let size = FRAMED_PREFIX_LENGTH + u32::from_le_bytes(payload_size_bytes) as usize;
@@ -140,9 +159,15 @@ fn framed_recv<R: DeserializeOwned>(
     };
 
     loop {
-        *recv_cursor_ref += socket
+        let count = socket
             .read(&mut buffer[*recv_cursor_ref..])
             .handle_try_again()?;
+        if count == 0 {
+            // EOF mid-frame: read returns Ok(0), so the cursor never advances and the
+            // loop would spin to the deadline. Treat as peer disconnect.
+            con_bail!("Control socket closed by peer (EOF) mid-frame");
+        }
+        *recv_cursor_ref += count;
 
         if *recv_cursor_ref == buffer.len() {
             break;

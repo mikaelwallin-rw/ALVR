@@ -10,7 +10,7 @@ use std::{
     io::Write,
     mem::{self, MaybeUninit},
     net::{IpAddr, SocketAddr, TcpListener, TcpStream},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub const PACKET_PREFIX_SIZE: usize = mem::size_of::<u16>() // stream ID
@@ -145,6 +145,7 @@ impl MultiplexedSocketReader for MultiplexedTcpReader {
         } else {
             let mut prefix_bytes = [0u8; PACKET_PREFIX_SIZE];
 
+            let prefix_deadline = Instant::now() + self.used_buffers_poll_timeout;
             loop {
                 let count = self
                     .inner
@@ -152,8 +153,24 @@ impl MultiplexedSocketReader for MultiplexedTcpReader {
                         &mut *(&mut prefix_bytes as *mut [u8] as *mut [MaybeUninit<u8>])
                     })
                     .handle_try_again()?;
+                if count == 0 {
+                    // Graceful peer/ADB-forward close (FIN). socket2 returns Ok(0) on
+                    // orderly shutdown; without this the loop spins forever (0 !=
+                    // PACKET_PREFIX_SIZE), stream_receive_thread never observes the
+                    // is_streaming flip, and its join() wedges connection shutdown at
+                    // the Disconnecting state.
+                    con_bail!("Stream socket closed by peer (EOF) while reading packet prefix");
+                }
                 if count == PACKET_PREFIX_SIZE {
                     break;
+                }
+                // A half-closed peer that delivered a partial (1..PACKET_PREFIX_SIZE)
+                // prefix and then stalled re-peeks the same bytes forever without
+                // blocking, so the socket read timeout never fires. Bail after the poll
+                // timeout, mirroring the per-iteration deadline in
+                // control_socket::framed_recv.
+                if Instant::now() > prefix_deadline {
+                    con_bail!("Stream socket stalled on partial packet prefix");
                 }
             }
 
@@ -189,7 +206,13 @@ impl MultiplexedSocketReader for MultiplexedTcpReader {
             let sub_buffer = &mut in_progress_packet.buffer.spare_capacity_mut()
                 [in_progress_packet.cursor..in_progress_packet.buffer_size];
 
-            in_progress_packet.cursor += self.inner.recv(sub_buffer).handle_try_again()?;
+            let count = self.inner.recv(sub_buffer).handle_try_again()?;
+            if count == 0 {
+                // EOF mid-payload: recv returns Ok(0), so cursor += 0 would spin
+                // forever. Treat as peer disconnect so stream_receive_thread exits.
+                con_bail!("Stream socket closed by peer (EOF) mid-payload");
+            }
+            in_progress_packet.cursor += count;
         }
 
         // All writing was done to uninit capacity, here we set the final buffer length
