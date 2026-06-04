@@ -171,7 +171,7 @@ impl ClientCoreContext {
                 info!(
                     "pause: connection_state is {initial_state:?}, waiting for it to reach Disconnected"
                 );
-            } else if iter % HEARTBEAT_EVERY == 0 {
+            } else if iter.is_multiple_of(HEARTBEAT_EVERY) {
                 warn!(
                     "pause: still waiting after {} ms (iter {iter}, state={:?})",
                     start.elapsed().as_millis(),

@@ -295,9 +295,9 @@ fn event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                             let left_using_hand = !prefer_left_controller && left_skel;
                             let right_using_hand = !prefer_right_controller && right_skel;
 
-                            static PREV_SET_TRACKING: Lazy<
-                                Mutex<Option<(bool, bool, bool, bool, bool, bool, bool)>>,
-                            > = Lazy::new(|| Mutex::new(None));
+                            type SetTrackingFlags = (bool, bool, bool, bool, bool, bool, bool);
+                            static PREV_SET_TRACKING: Lazy<Mutex<Option<SetTrackingFlags>>> =
+                                Lazy::new(|| Mutex::new(None));
 
                             let mut prev = PREV_SET_TRACKING.lock();
                             let changed = match *prev {
