@@ -154,7 +154,22 @@ impl Default for SessionConfig {
                 capture_frame_dir: "/tmp".into(),
                 ..<_>::default()
             },
-            client_connections: HashMap::new(),
+            // Enable the wired (USB/ADB) connection by default. This mirrors the
+            // dashboard "Wired Connection" toggle (see server_io update path:
+            // AddIfMissing { trusted: true }). The key must stay in sync with
+            // alvr_sockets::WIRED_CLIENT_HOSTNAME ("client.wired"); it is hard-coded
+            // here because alvr_sockets depends on alvr_session, so we cannot depend
+            // on it back without a dependency cycle.
+            client_connections: HashMap::from([(
+                "client.wired".to_owned(),
+                ClientConnectionConfig {
+                    display_name: "Unknown".into(),
+                    current_ip: None,
+                    manual_ips: HashSet::new(),
+                    trusted: true,
+                    connection_state: ConnectionState::Disconnected,
+                },
+            )]),
             session_settings: settings::session_settings_default(),
         }
     }

@@ -1970,7 +1970,7 @@ pub fn session_settings_default() -> SettingsDefault {
                 Custom: HeadsetEmulationModeCustomDefault {
                     serial_number: "Unknown".into(),
                 },
-                variant: HeadsetEmulationModeDefaultVariant::Quest2,
+                variant: HeadsetEmulationModeDefaultVariant::Pico4,
             },
             performance_level: PerformanceLevelConfigDefault {
                 cpu: SwitchDefault {
@@ -2064,7 +2064,7 @@ pub fn session_settings_default() -> SettingsDefault {
                                 content: vec![],
                             },
                         },
-                        variant: ControllersEmulationModeDefaultVariant::Quest2Touch,
+                        variant: ControllersEmulationModeDefaultVariant::Pico4,
                     },
                     extra_openvr_props: default_custom_openvr_props,
                     button_mappings: OptionalDefault {
@@ -2112,7 +2112,7 @@ pub fn session_settings_default() -> SettingsDefault {
                         force_threshold: 0.8,
                     },
                     hand_tracking_interaction: SwitchDefault {
-                        enabled: false,
+                        enabled: true,
                         content: HandTrackingInteractionConfigDefault {
                             only_touch: false,
                             pinch_touch_distance: 0.0,
@@ -2265,8 +2265,8 @@ pub fn session_settings_default() -> SettingsDefault {
                 },
             },
             steamvr_launcher: SteamvrLauncherDefault {
-                open_close_steamvr_with_dashboard: false,
-                direct_launch: false,
+                open_close_steamvr_with_dashboard: true,
+                direct_launch: true,
             },
             capture: CaptureConfigDefault {
                 startup_video_recording: false,
