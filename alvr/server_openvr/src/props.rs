@@ -293,7 +293,7 @@ pub extern "C" fn set_device_openvr_props(instance_ptr: *mut c_void, device_id: 
                 set_oculus_common_headset_props();
             }
             HeadsetEmulationMode::Pico4 => {
-                set_prop(TrackingSystemNameString, "vrlink");
+                set_prop(TrackingSystemNameString, "pico");
                 set_prop(ModelNumberString, "PICO 4");
                 set_prop(ManufacturerNameString, "ByteDance");
                 set_prop(RenderModelNameString, "generic_hmd");
@@ -335,10 +335,10 @@ pub extern "C" fn set_device_openvr_props(instance_ptr: *mut c_void, device_id: 
         }
 
         // If controllers are configured as Pico4, prefer phoenix icons for headset status.
-        if let Switch::Enabled(controllers) = &settings.headset.controllers {
-            if matches!(controllers.emulation_mode, ControllersEmulationMode::Pico4) {
-                set_icons("{alvr_server}/icons_phoenix/headset");
-            }
+        if let Switch::Enabled(controllers) = &settings.headset.controllers
+            && matches!(controllers.emulation_mode, ControllersEmulationMode::Pico4)
+        {
+            set_icons("{alvr_server}/icons_phoenix/headset");
         }
     } else if device_id == *HAND_LEFT_ID
         || device_id == *HAND_RIGHT_ID
@@ -622,12 +622,12 @@ pub extern "C" fn set_device_openvr_props(instance_ptr: *mut c_void, device_id: 
                 set_prop(ResourceRootString, "alvr_server");
 
                 // Use the Pico 4 controller render model + profile for the
-                // hand-tracker device. The dedicated alvr_hand_left/right
-                // OBJs are placeholder triangles with no real geometry, and
-                // the svl_hand_interaction_augmented input profile does not
-                // exist in our fork, upstream ALVR, or Pico Business
-                // Streaming. Pointing at the controller resources matches
-                // what Business Streaming does — the user sees a Pico
+                // hand-tracker device. The dedicated pico_hand_left/right
+                // OBJs are not shipped in the build's rendermodels.zip and
+                // the svl_hand_interaction_augmented input profile cannot be
+                // rendered by overlay apps (and is not co-installed with our
+                // fork). Pointing at the controller resources matches what
+                // Pico Business Streaming does — the user sees a Pico
                 // controller hovering at the wrist with finger curl from
                 // skeletal input when using hand tracking.
                 if left_hand {
