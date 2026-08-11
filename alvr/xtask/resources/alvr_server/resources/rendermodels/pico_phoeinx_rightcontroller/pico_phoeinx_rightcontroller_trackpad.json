@@ -140,20 +140,6 @@
         "rotate_xyz": [ 0.037, 0.0, 0.0 ]
       }
     },
-    //"circle": {
-    //  "filename": "RCircle.obj",
-    //  "component_local": {
-    //    "origin": [ 0.0, 0.003, 0.097 ],
-    //    "rotate_xyz": [ 0.037, 0.0, 0.0 ]
-    //  }
-    //},
-    //"piece": {
-    //  "filename": "RDefault01.obj",
-    //  "component_local": {
-    //    "origin": [ 0.0, 0.003, 0.097 ],
-    //    "rotate_xyz": [ 0.037, 0.0, 0.0 ]
-    //  }
-    //},
     "base": {
       "component_local": {
         "origin": [ 0.0, -0.014, 0.174 ],
