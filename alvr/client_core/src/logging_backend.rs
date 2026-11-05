@@ -96,11 +96,10 @@ pub fn init_logging() {
             android_logger::Config::default()
                 .with_tag("[ALVR NATIVE-RUST]")
                 .format(|f, record| {
-                    if send_log(record) {
-                        writeln!(f, "{}", record.args())
-                    } else {
-                        Ok(())
-                    }
+                    // The report level only filters what is sent to the server: logcat always
+                    // gets everything up to the max level, so headset diagnostics stay visible
+                    send_log(record);
+                    writeln!(f, "{}", record.args())
                 })
                 .with_max_level(alvr_common::log::LevelFilter::Info),
         );
