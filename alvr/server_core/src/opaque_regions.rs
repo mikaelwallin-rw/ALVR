@@ -73,9 +73,18 @@ mod windows_impl {
     #[derive(Clone, Copy, PartialEq, Debug)]
     enum Status {
         NotOpen,
-        InvalidHeader { magic: u32, version: u32, space: u32 },
-        Stale { age_ms: u64 },
-        Active { raw_count: u32, valid_count: usize },
+        InvalidHeader {
+            magic: u32,
+            version: u32,
+            space: u32,
+        },
+        Stale {
+            age_ms: u64,
+        },
+        Active {
+            raw_count: u32,
+            valid_count: usize,
+        },
     }
 
     impl Status {
@@ -312,8 +321,15 @@ mod windows_impl {
                 self.last_regions = Self::parse_block(&block).unwrap_or_default();
 
                 let age_ms = unsafe { GetTickCount64() }.saturating_sub(heartbeat_ms);
-                let status = if magic != MAGIC || version != VERSION || space != SPACE_RAW_AND_UNCALIBRATED {
-                    Status::InvalidHeader { magic, version, space }
+                let status = if magic != MAGIC
+                    || version != VERSION
+                    || space != SPACE_RAW_AND_UNCALIBRATED
+                {
+                    Status::InvalidHeader {
+                        magic,
+                        version,
+                        space,
+                    }
                 } else if age_ms > STALE_MS {
                     Status::Stale { age_ms }
                 } else {
@@ -329,7 +345,9 @@ mod windows_impl {
                 } else {
                     let since = *self.invalid_since.get_or_insert_with(Instant::now);
                     if since.elapsed() > REOPEN_AFTER_INVALID {
-                        info!("Opaque regions: no valid data for {REOPEN_AFTER_INVALID:?}, reopening the mapping");
+                        info!(
+                            "Opaque regions: no valid data for {REOPEN_AFTER_INVALID:?}, reopening the mapping"
+                        );
                         self.mapping = None;
                         self.invalid_since = None;
                     }
