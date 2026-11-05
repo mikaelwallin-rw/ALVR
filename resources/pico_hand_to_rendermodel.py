@@ -5,19 +5,31 @@
 # (Content/PICOOpenXR/Meshes/Hand), exported as ASCII FBX; their skeleton bones are named after the
 # XR_EXT_hand_tracking joints, which gives the palm joint frame. Requires Blender 4.5+ (wm.fbx_import
 # reads ASCII FBX). Usage, from the repo root:
-#   blender -b --factory-startup --python resources/pico_hand_to_rendermodel.py -- #     resources/SM_Hand_L.FBX left #     alvr/xtask/resources/alvr_server/resources/rendermodels/pico_hand_left/pico_hand_left.obj #     pico_hand_left
+#   blender -b --factory-startup --python resources/pico_hand_to_rendermodel.py -- #     resources/SM_Hand_L.FBX left #     alvr/xtask/resources/alvr_server/resources/rendermodels/pico_hand_left/pico_hand_left.obj #     pico_hand_left #     alvr/xtask/resources/alvr_server/resources/rendermodels/pico_hand_left/pico_hand_albedo.png
 # (same with SM_Hand_R.FBX / right). The mesh only lines up with the default hand tracking offsets
 # in settings.rs; regenerate it if those defaults change.
 import bpy, sys, math
 from mathutils import Vector, Matrix, Quaternion, Euler
 argv = sys.argv[sys.argv.index("--")+1:]
 fbx, side, out_obj, mtl_name = argv[0], argv[1], argv[2], argv[3]
+out_png = argv[4] if len(argv) > 4 else None
 bpy.ops.wm.read_factory_settings(use_empty=True)
 bpy.ops.wm.fbx_import(filepath=fbx)
 arm = next(o for o in bpy.data.objects if o.type == 'ARMATURE')
 mesh_obj = next(o for o in bpy.data.objects if o.type == 'MESH')
 arm.data.pose_position = 'REST'
 bpy.context.view_layer.update()
+
+# Pico's DiffuseUV is a planar projection: palm and back share texels, which makes baked shading
+# impossible. Unwrap into a new, non-overlapping UV layer used for both the OBJ and the bake.
+for o in bpy.context.view_layer.objects: o.select_set(False)
+mesh_obj.select_set(True)
+bpy.context.view_layer.objects.active = mesh_obj
+mesh_obj.data.uv_layers.active = mesh_obj.data.uv_layers.new(name="BakeUV")
+bpy.ops.object.mode_set(mode='EDIT')
+bpy.ops.mesh.select_all(action='SELECT')
+bpy.ops.uv.smart_project(angle_limit=math.radians(66), island_margin=0.004)
+bpy.ops.object.mode_set(mode='OBJECT')
 p = side  # 'left' / 'right'
 def head(name): return arm.matrix_world @ arm.data.bones[f"{p}_{name}"].head_local
 
@@ -85,3 +97,80 @@ with open(out_obj, "w", newline="\n") as f:
     for n in vns: f.write(f"vn {n.x:.4f} {n.y:.4f} {n.z:.4f}\n")
     f.write(f"usemtl {mtl_name}\ns 1\n")
     for face in faces: f.write("f " + " ".join(f"{a}/{b}/{c}" for a, b, c in face) + "\n")
+
+
+# SteamVR draws rendermodels unlit, so shading is baked into the albedo (like the controller
+# textures): Pico's hand look (dark InnerColor body, light OutColor fresnel rim, from MI_Hand)
+# approximated view-independently with a rim on surfaces that face sideways relative to the back
+# of the hand, plus ambient occlusion between the fingers.
+if out_png:
+    INNER = (0.1311, 0.1543, 0.2448)
+    RIM = (0.7101, 0.7946, 1.0)
+    scene = bpy.context.scene
+    scene.render.engine = 'CYCLES'
+    scene.cycles.device = 'CPU'
+    scene.cycles.samples = 64
+    scene.view_settings.view_transform = 'Standard'
+    img = bpy.data.images.new("hand_bake", 1024, 1024, alpha=False)
+    img.colorspace_settings.name = 'sRGB'
+    dorsal_obj = (mesh_obj.matrix_world.to_3x3().inverted() @ y).normalized()
+
+    mat = bpy.data.materials.new("bake")
+    mat.use_nodes = True
+    nt = mat.node_tree; nodes = nt.nodes; links = nt.links
+    nodes.clear()
+    out = nodes.new("ShaderNodeOutputMaterial")
+    emit = nodes.new("ShaderNodeEmission")
+    links.new(emit.outputs[0], out.inputs[0])
+    texco = nodes.new("ShaderNodeTexCoord")
+    dot = nodes.new("ShaderNodeVectorMath"); dot.operation = 'DOT_PRODUCT'
+    dot.inputs[1].default_value = dorsal_obj
+    links.new(texco.outputs["Normal"], dot.inputs[0])
+    absn = nodes.new("ShaderNodeMath"); absn.operation = 'ABSOLUTE'
+    links.new(dot.outputs["Value"], absn.inputs[0])
+    inv = nodes.new("ShaderNodeMath"); inv.operation = 'SUBTRACT'; inv.inputs[0].default_value = 1.0
+    links.new(absn.outputs[0], inv.inputs[1])
+    pw = nodes.new("ShaderNodeMath"); pw.operation = 'POWER'; pw.inputs[1].default_value = 4.0
+    links.new(inv.outputs[0], pw.inputs[0])
+    # Back of the hand slightly brighter than the palm: a soft key light from the dorsal side
+    key = nodes.new("ShaderNodeMath"); key.operation = 'MULTIPLY_ADD'
+    key.inputs[1].default_value = 0.25; key.inputs[2].default_value = 1.0
+    links.new(dot.outputs["Value"], key.inputs[0])
+    body = nodes.new("ShaderNodeMix"); body.data_type = 'RGBA'; body.blend_type = 'MULTIPLY'
+    body.inputs["Factor"].default_value = 1.0
+    body.inputs[6].default_value = (*INNER, 1)
+    comb = nodes.new("ShaderNodeCombineXYZ")
+    for i in range(3): links.new(key.outputs[0], comb.inputs[i])
+    links.new(comb.outputs[0], body.inputs[7])
+    rim = nodes.new("ShaderNodeMix"); rim.data_type = 'RGBA'
+    rimf = nodes.new("ShaderNodeMath"); rimf.operation = 'MULTIPLY'; rimf.inputs[1].default_value = 0.75
+    links.new(pw.outputs[0], rimf.inputs[0])
+    links.new(rimf.outputs[0], rim.inputs["Factor"])
+    links.new(body.outputs[2], rim.inputs[6])
+    rim.inputs[7].default_value = (*RIM, 1)
+    ao = nodes.new("ShaderNodeAmbientOcclusion"); ao.samples = 16; ao.inputs["Distance"].default_value = 0.03
+    aom = nodes.new("ShaderNodeMapRange")
+    aom.inputs["To Min"].default_value = 0.45
+    links.new(ao.outputs["AO"], aom.inputs["Value"])
+    shade = nodes.new("ShaderNodeMix"); shade.data_type = 'RGBA'; shade.blend_type = 'MULTIPLY'
+    shade.inputs["Factor"].default_value = 1.0
+    links.new(rim.outputs[2], shade.inputs[6])
+    aoc = nodes.new("ShaderNodeCombineXYZ")
+    for i in range(3): links.new(aom.outputs[0], aoc.inputs[i])
+    links.new(aoc.outputs[0], shade.inputs[7])
+    links.new(shade.outputs[2], emit.inputs["Color"])
+    tex = nodes.new("ShaderNodeTexImage"); tex.image = img
+    nodes.active = tex
+
+    mesh_obj.data.materials.clear()
+    mesh_obj.data.materials.append(mat)
+    mesh_obj.data.uv_layers.active = mesh_obj.data.uv_layers["BakeUV"]
+    for o in bpy.context.view_layer.objects: o.select_set(False)
+    mesh_obj.select_set(True)
+    bpy.context.view_layer.objects.active = mesh_obj
+    scene.render.bake.margin = 16
+    bpy.ops.object.bake(type='EMIT')
+    img.filepath_raw = out_png
+    img.file_format = 'PNG'
+    img.save()
+    print("BAKED", out_png)
