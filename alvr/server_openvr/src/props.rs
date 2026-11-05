@@ -621,24 +621,20 @@ pub extern "C" fn set_device_openvr_props(instance_ptr: *mut c_void, device_id: 
                 // Ensure SteamVR resolves {alvr_server} token to this driver's resources
                 set_prop(ResourceRootString, "alvr_server");
 
-                // Use the Pico 4 controller render model + profile for the
-                // hand-tracker device. The dedicated pico_hand_left/right
-                // OBJs are not shipped in the build's rendermodels.zip and
-                // the svl_hand_interaction_augmented input profile cannot be
-                // rendered by overlay apps (and is not co-installed with our
-                // fork). Pointing at the controller resources matches what
-                // Pico Business Streaming does — the user sees a Pico
-                // controller hovering at the wrist with finger curl from
-                // skeletal input when using hand tracking.
+                // Hand-tracker devices show Pico's hand mesh (SM_Hand_L/R from the PICO OpenXR
+                // Unreal plugin), converted to a static OBJ in the hand-tracker device frame
+                // (palm joint * hand tracking offsets, see tracking.rs). SteamVR only draws
+                // static rendermodels, so the hand follows the tracked pose but the fingers do
+                // not bend. Input profile and controller type stay those of the Pico controller.
                 if left_hand {
                     set_prop(
                         RenderModelNameString,
-                        "{alvr_server}/rendermodels/pico_4s_leftcontroller",
+                        "{alvr_server}/rendermodels/pico_hand_left",
                     );
                 } else if right_hand {
                     set_prop(
                         RenderModelNameString,
-                        "{alvr_server}/rendermodels/pico_4s_rightcontroller",
+                        "{alvr_server}/rendermodels/pico_hand_right",
                     );
                 }
                 set_prop(ControllerTypeString, "pico_controller");
