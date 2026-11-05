@@ -1655,6 +1655,12 @@ pub struct LoggingConfig {
     #[schema(flag = "real-time")]
     pub log_haptics: bool,
 
+    #[schema(strings(
+        help = "Log the headset's controller and hand tracking state (interaction profile, pose flags, which source is streamed) to the headset log (logcat). Used to debug controller/hand switching."
+    ))]
+    #[schema(flag = "real-time")]
+    pub log_input_diagnostics: bool,
+
     #[cfg_attr(not(debug_assertions), schema(flag = "hidden"))]
     #[schema(strings(help = "These settings enable extra spammy logs for debugging purposes."))]
     pub debug_groups: DebugGroupsConfig,
@@ -2358,6 +2364,7 @@ pub fn session_settings_default() -> SettingsDefault {
                 log_button_presses: false,
                 log_tracking: false,
                 log_haptics: false,
+                log_input_diagnostics: false,
                 notification_level: LogSeverityDefault {
                     variant: if cfg!(debug_assertions) {
                         LogSeverityDefaultVariant::Info

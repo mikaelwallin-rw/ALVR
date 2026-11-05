@@ -51,6 +51,7 @@ pub struct ParsedStreamConfig {
     pub buffering_history_weight: f32,
     pub decoder_options: Vec<(String, MediacodecProperty)>,
     pub interaction_sources: InteractionSourcesConfig,
+    pub log_input_diagnostics: bool,
 }
 
 impl ParsedStreamConfig {
@@ -84,6 +85,7 @@ impl ParsedStreamConfig {
             buffering_history_weight: config.settings.video.buffering_history_weight,
             decoder_options: config.settings.video.mediacodec_extra_options.clone(),
             interaction_sources: InteractionSourcesConfig::new(config),
+            log_input_diagnostics: config.settings.extra.logging.log_input_diagnostics,
         }
     }
 }
@@ -102,6 +104,7 @@ pub struct StreamContext {
     opaque_regions_log_state: Option<(bool, usize)>,
     input_thread: Option<JoinHandle<()>>,
     input_thread_running: Arc<RelaxedAtomic>,
+    input_diagnostics_enabled: Arc<RelaxedAtomic>,
     config: ParsedStreamConfig,
     target_view_resolution: UVec2,
     renderer: StreamRenderer,
@@ -249,6 +252,7 @@ impl StreamContext {
             opaque_regions_log_state: None,
             input_thread: None,
             input_thread_running,
+            input_diagnostics_enabled: Arc::new(RelaxedAtomic::new(config.log_input_diagnostics)),
             config,
             target_view_resolution,
             renderer,
@@ -297,6 +301,7 @@ impl StreamContext {
             let view_reference_space = Arc::clone(&self.view_reference_space);
             let refresh_rate = self.config.refresh_rate_hint;
             let running = Arc::clone(&self.input_thread_running);
+            let input_diagnostics_enabled = Arc::clone(&self.input_diagnostics_enabled);
             move || {
                 stream_input_loop(
                     &core_ctx,
@@ -306,6 +311,7 @@ impl StreamContext {
                     &view_reference_space,
                     refresh_rate,
                     running,
+                    input_diagnostics_enabled,
                 )
             }
         }));
@@ -346,6 +352,8 @@ impl StreamContext {
     pub fn update_real_time_config(&mut self, config: &RealTimeConfig) {
         self.config.passthrough = config.passthrough.clone();
         self.config.clientside_post_processing = config.clientside_post_processing.clone();
+        self.input_diagnostics_enabled
+            .set(config.log_input_diagnostics);
     }
 
     pub fn render(
@@ -575,6 +583,7 @@ impl Drop for StreamContext {
     }
 }
 
+#[expect(clippy::too_many_arguments)]
 fn stream_input_loop(
     core_ctx: &ClientCoreContext,
     xr_session: xr::Session<xr::OpenGlEs>,
@@ -583,11 +592,13 @@ fn stream_input_loop(
     view_reference_space: &xr::Space,
     refresh_rate: f32,
     running: Arc<RelaxedAtomic>,
+    input_diagnostics_enabled: Arc<RelaxedAtomic>,
 ) {
     let mut last_controller_poses = [Pose::IDENTITY; 2];
     let mut last_palm_poses = [Pose::IDENTITY; 2];
     let mut last_view_params = [ViewParams::DUMMY; 2];
     let mut last_controller_buttons_enabled = [true; 2];
+    let mut input_diagnostics = crate::input_diagnostics::InputDiagnostics::new();
 
     let mut deadline = Instant::now();
     let frame_interval = Duration::from_secs_f32(1.0 / refresh_rate);
@@ -682,6 +693,25 @@ fn stream_input_loop(
             device_motions.push((*HAND_RIGHT_ID, motion));
         }
 
+        if input_diagnostics_enabled.value() {
+            input_diagnostics.update(
+                &xr_session,
+                stage_reference_space,
+                crate::xr_runtime_now(xr_session.instance()).unwrap_or(crate::to_xr_time(now)),
+                &int_ctx.hands_interaction,
+                [
+                    device_motions.iter().any(|(id, _)| *id == *HAND_LEFT_ID),
+                    device_motions.iter().any(|(id, _)| *id == *HAND_RIGHT_ID),
+                ],
+                [
+                    left_hand_data.skeleton_joints.is_some(),
+                    right_hand_data.skeleton_joints.is_some(),
+                ],
+            );
+        } else {
+            input_diagnostics.reset();
+        }
+
         if int_ctx.multimodal_hands_enabled
             && let Some(detached_controller) = left_hand_data.detached_grip_motion
         {
@@ -758,6 +788,9 @@ fn stream_input_loop(
         last_controller_buttons_enabled = controller_buttons_enabled;
 
         if !button_entries.is_empty() {
+            if input_diagnostics_enabled.value() {
+                crate::input_diagnostics::log_buttons(&xr_session, &button_entries);
+            }
             core_ctx.send_buttons(button_entries);
         }
 

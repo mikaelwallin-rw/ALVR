@@ -349,6 +349,7 @@ pub struct RealTimeConfig {
     pub clientside_post_processing: Option<ClientsidePostProcessingConfig>,
     pub cpu_performance_level: Option<PerformanceLevel>,
     pub gpu_performance_level: Option<PerformanceLevel>,
+    pub log_input_diagnostics: bool,
     pub ext_str: String,
 }
 
@@ -363,6 +364,7 @@ impl RealTimeConfig {
                 .into_option(),
             cpu_performance_level: settings.headset.performance_level.clone().cpu.into_option(),
             gpu_performance_level: settings.headset.performance_level.clone().gpu.into_option(),
+            log_input_diagnostics: settings.extra.logging.log_input_diagnostics,
             ext_str: String::new(), // No extensions for now
         }
     }

@@ -1,6 +1,7 @@
 mod c_api;
 mod extra_extensions;
 mod graphics;
+mod input_diagnostics;
 mod interaction;
 mod lobby;
 mod passthrough;
@@ -442,8 +443,10 @@ pub fn entry_point() {
                             event.sub_domain(),
                         );
                     }
-                    xr::Event::InteractionProfileChanged(_)
-                    | xr::Event::PassthroughStateChangedFB(_) => {
+                    xr::Event::InteractionProfileChanged(_) => {
+                        input_diagnostics::log_interaction_profiles(&xr_session);
+                    }
+                    xr::Event::PassthroughStateChangedFB(_) => {
                         // todo
                     }
                     xr::Event::UserPresenceChangedEXT(event) => {
