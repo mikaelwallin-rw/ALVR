@@ -164,7 +164,8 @@ pub fn entry_point() {
     const CURRENT_OPENXR_VERSION: xr::Version = xr::Version::new(1, 1, 36);
 
     // Using a provisional platform, before we can get the runtime info
-    let (loader_suffix, openxr_version) = match alvr_system_info::platform(None, None) {
+    let provisional_platform = alvr_system_info::platform(None, None);
+    let (loader_suffix, openxr_version) = match provisional_platform {
         Platform::Quest1 => ("_quest1", LEGACY_OPENXR_VERSION),
         p if p.is_pico() => ("_pico_old", LEGACY_OPENXR_VERSION),
         p if p.is_vive() => ("", LEGACY_OPENXR_VERSION),
@@ -197,6 +198,8 @@ pub fn entry_point() {
     selected_exts.bd_facial_simulation = true;
     selected_exts.ext_future = true;
     selected_exts.ext_eye_gaze_interaction = true;
+    // Only used on Pico, see InteractionContext::new()
+    selected_exts.ext_hand_interaction = provisional_platform.is_pico();
     selected_exts.ext_hand_tracking = true;
     selected_exts.ext_local_floor = true;
     selected_exts.ext_performance_settings = true;

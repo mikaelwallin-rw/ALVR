@@ -7,8 +7,8 @@ use alvr_client_core::{
     video_decoder::{self, VideoDecoderConfig, VideoDecoderSource},
 };
 use alvr_common::{
-    DETACHED_CONTROLLER_LEFT_ID, DETACHED_CONTROLLER_RIGHT_ID, HAND_LEFT_ID, HAND_RIGHT_ID,
-    HEAD_ID, Pose, RelaxedAtomic, ViewParams,
+    BUTTON_INFO, DETACHED_CONTROLLER_LEFT_ID, DETACHED_CONTROLLER_RIGHT_ID, HAND_LEFT_ID,
+    HAND_RIGHT_ID, HEAD_ID, Pose, RelaxedAtomic, ViewParams,
     anyhow::Result,
     error,
     glam::{UVec2, Vec2},
@@ -587,6 +587,7 @@ fn stream_input_loop(
     let mut last_controller_poses = [Pose::IDENTITY; 2];
     let mut last_palm_poses = [Pose::IDENTITY; 2];
     let mut last_view_params = [ViewParams::DUMMY; 2];
+    let mut last_controller_buttons_enabled = [true; 2];
 
     let mut deadline = Instant::now();
     let frame_interval = Duration::from_secs_f32(1.0 / refresh_rate);
@@ -649,6 +650,24 @@ fn stream_input_loop(
             &mut last_controller_poses[1],
             &mut last_palm_poses[1],
         );
+        let left_selection = crate::interaction::resolve_hand_sources(
+            &xr_session,
+            core_ctx.platform(),
+            &int_ctx.hands_interaction[0],
+            left_hand_data,
+        );
+        let right_selection = crate::interaction::resolve_hand_sources(
+            &xr_session,
+            core_ctx.platform(),
+            &int_ctx.hands_interaction[1],
+            right_hand_data,
+        );
+        let controller_buttons_enabled = [
+            left_selection.controller_buttons_enabled,
+            right_selection.controller_buttons_enabled,
+        ];
+        let left_hand_data = left_selection.hand_data;
+        let right_hand_data = right_selection.hand_data;
 
         // Note: When multimodal input is enabled, we are sure that when free hands are used
         // (not holding controllers) the controller data is None.
@@ -716,8 +735,28 @@ fn stream_input_loop(
             markers,
         });
 
-        let button_entries =
-            interaction::update_buttons(&xr_session, &interaction_ctx.read().button_actions);
+        let button_entries = {
+            let button_actions = &interaction_ctx.read().button_actions;
+
+            let mut entries = interaction::update_buttons(&xr_session, button_actions);
+            for (idx, hand_id) in [*HAND_LEFT_ID, *HAND_RIGHT_ID].into_iter().enumerate() {
+                if !controller_buttons_enabled[idx] {
+                    entries.retain(|entry| {
+                        BUTTON_INFO
+                            .get(&entry.path_id)
+                            .is_none_or(|info| info.device_id != hand_id)
+                    });
+
+                    if last_controller_buttons_enabled[idx] {
+                        entries.extend(interaction::released_buttons(button_actions, hand_id));
+                    }
+                }
+            }
+
+            entries
+        };
+        last_controller_buttons_enabled = controller_buttons_enabled;
+
         if !button_entries.is_empty() {
             core_ctx.send_buttons(button_entries);
         }

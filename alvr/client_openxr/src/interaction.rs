@@ -20,6 +20,7 @@ use std::{
 use xr::SpaceLocationFlags;
 
 const IPD_CHANGE_EPS: f32 = 0.001;
+const HAND_INTERACTION_PROFILE_PATH: &str = "/interaction_profiles/ext/hand_interaction_ext";
 
 // Most OpenXR runtime, including Meta's one, do not follow perfectly the specification regarding
 // controller pose. The Z axis should point down through the center of the controller grip, the X
@@ -110,6 +111,10 @@ pub struct HandInteraction {
 
     pub detached_grip_action: Option<xr::Action<xr::Posef>>,
     pub detached_grip_space: Option<xr::Space>,
+
+    // Bound to the hand interaction profile. Only used to let the runtime know that hand tracking
+    // is supported, so that it can deactivate the controller actions when it switches to hands.
+    pub hand_interaction_grip_action: Option<xr::Action<xr::Posef>>,
 
     pub vibration_action: xr::Action<xr::Haptic>,
     pub skeleton_tracker: Option<xr::HandTracker>,
@@ -365,6 +370,50 @@ impl InteractionContext {
             )
             .unwrap();
 
+        // Pico runtimes do not support simultaneous hands and controllers, and they keep reporting
+        // active hand joints for a hand that holds a controller. Suggesting bindings for the hand
+        // interaction profile lets the runtime switch the current interaction profile to hands
+        // when the system selects hand tracking. The controller actions then become inactive.
+        let mut left_hand_interaction_grip_action = None;
+        let mut right_hand_interaction_grip_action = None;
+        if platform.is_pico() && xr_instance.exts().ext_hand_interaction.is_some() {
+            let left_action = left_hand_interaction_grip_action.insert(
+                action_set
+                    .create_action::<xr::Posef>(
+                        "left_hand_interaction_grip_pose",
+                        "Left hand interaction grip pose",
+                        &[],
+                    )
+                    .unwrap(),
+            );
+            let right_action = right_hand_interaction_grip_action.insert(
+                action_set
+                    .create_action::<xr::Posef>(
+                        "right_hand_interaction_grip_pose",
+                        "Right hand interaction grip pose",
+                        &[],
+                    )
+                    .unwrap(),
+            );
+
+            if let Err(e) = xr_instance.suggest_interaction_profile_bindings(
+                xr_instance
+                    .string_to_path(HAND_INTERACTION_PROFILE_PATH)
+                    .unwrap(),
+                &[
+                    binding(left_action, "/user/hand/left/input/grip/pose"),
+                    binding(right_action, "/user/hand/right/input/grip/pose"),
+                ],
+            ) {
+                warn!("Failed to suggest hand interaction bindings: {e}");
+
+                // Without these bindings the runtime never switches profile; fall back to deciding
+                // from the controller tracking state (see resolve_hand_sources())
+                left_hand_interaction_grip_action = None;
+                right_hand_interaction_grip_action = None;
+            }
+        }
+
         let left_grip_space = left_grip_action
             .create_space(&xr_session, xr::Path::NULL, xr::Posef::IDENTITY)
             .unwrap();
@@ -479,6 +528,7 @@ impl InteractionContext {
                     aim_space: left_aim_space,
                     detached_grip_action: left_detached_grip_action,
                     detached_grip_space: left_detached_grip_space,
+                    hand_interaction_grip_action: left_hand_interaction_grip_action,
                     vibration_action: left_vibration_action,
                     skeleton_tracker: left_hand_tracker,
                 },
@@ -492,6 +542,7 @@ impl InteractionContext {
                     aim_space: right_aim_space,
                     detached_grip_action: right_detached_grip_action,
                     detached_grip_space: right_detached_grip_space,
+                    hand_interaction_grip_action: right_hand_interaction_grip_action,
                     vibration_action: right_vibration_action,
                     skeleton_tracker: right_hand_tracker,
                 },
@@ -828,12 +879,20 @@ pub fn get_hand_data(
     let xr_time = crate::to_xr_time(time);
     let xr_now = crate::xr_runtime_now(xr_session.instance()).unwrap_or(xr_time);
 
+    // Note: Without hand interaction bindings, Pico runtimes keep the grip action active after
+    // switching to hand tracking, while the idle controller pose is reported as neither valid nor
+    // tracked. Do not stream a stale controller pose in that case, so that hand tracking can take
+    // over (see resolve_hand_sources()).
     let grip_motion = if hand_source
         .grip_action
         .is_active(xr_session, xr::Path::NULL)
         .unwrap_or(false)
         && let Ok((location, velocity)) = hand_source.grip_space.relate(reference_space, xr_time)
-    {
+        && (!platform.is_pico()
+            || hand_source.hand_interaction_grip_action.is_some()
+            || location.location_flags.contains(
+                xr::SpaceLocationFlags::ORIENTATION_VALID | xr::SpaceLocationFlags::POSITION_VALID,
+            )) {
         let orientation_valid = location
             .location_flags
             .contains(xr::SpaceLocationFlags::ORIENTATION_VALID);
@@ -958,6 +1017,77 @@ pub fn get_hand_data(
         detached_grip_motion,
         skeleton_joints,
     }
+}
+
+pub struct HandSourceSelection {
+    pub hand_data: HandData,
+    // False when the runtime selected the bare hand as input source. Controller button input for
+    // this hand must then be ignored.
+    pub controller_buttons_enabled: bool,
+}
+
+// Pico runtimes do not support simultaneous hands and controllers, yet they keep reporting active
+// hand joints for a hand that is holding a controller, so the skeleton cannot be used to detect
+// free hands. Instead:
+// * With hand interaction bindings, the runtime switches the current interaction profile between
+//   controller and hands following the system input mode. The controller pose action is active
+//   only while the controller profile is current: then the skeleton is dropped, otherwise the
+//   controller buttons are ignored (the runtime keeps reporting them as active).
+// * Otherwise, a tracked controller takes precedence over the skeleton.
+pub fn resolve_hand_sources(
+    xr_session: &xr::Session<xr::OpenGlEs>,
+    platform: Platform,
+    hand_source: &HandInteraction,
+    mut hand_data: HandData,
+) -> HandSourceSelection {
+    if !platform.is_pico() {
+        return HandSourceSelection {
+            hand_data,
+            controller_buttons_enabled: true,
+        };
+    }
+
+    let follows_interaction_profile = hand_source.hand_interaction_grip_action.is_some();
+    let controller_selected = if follows_interaction_profile {
+        hand_source
+            .grip_action
+            .is_active(xr_session, xr::Path::NULL)
+            .unwrap_or(false)
+    } else {
+        hand_data.grip_motion.is_some()
+    };
+
+    if controller_selected {
+        hand_data.skeleton_joints = None;
+    }
+
+    HandSourceSelection {
+        hand_data,
+        controller_buttons_enabled: controller_selected || !follows_interaction_profile,
+    }
+}
+
+// Entries that reset every button of a hand, used when its button input gets disabled so that no
+// button stays pressed on the server.
+pub fn released_buttons(
+    button_actions: &HashMap<u64, ButtonAction>,
+    hand_device_id: u64,
+) -> Vec<ButtonEntry> {
+    button_actions
+        .iter()
+        .filter(|(id, _)| {
+            BUTTON_INFO
+                .get(id)
+                .is_some_and(|info| info.device_id == hand_device_id)
+        })
+        .map(|(id, action)| ButtonEntry {
+            path_id: *id,
+            value: match action {
+                ButtonAction::Binary(_) => ButtonValue::Binary(false),
+                ButtonAction::Scalar(_) => ButtonValue::Scalar(0.0),
+            },
+        })
+        .collect()
 }
 
 pub fn update_buttons(
