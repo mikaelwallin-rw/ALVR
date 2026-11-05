@@ -1,4 +1,5 @@
 mod lobby;
+mod opaque_regions;
 mod staging;
 mod stream;
 

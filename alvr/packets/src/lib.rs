@@ -233,11 +233,29 @@ pub struct TrackingData {
     pub markers: Vec<(String, Pose)>,
 }
 
+/// A region of the frame that must stay opaque when chroma keying, reported by an overlay app
+/// (e.g. a virtual screen). It is one OpenVR overlay quad: the quad lies in the local XY plane of
+/// `pose` and faces +Z. With `curvature` > 0 it bends around the local Y axis toward +Z, as an arc
+/// of a cylinder with radius `width / (2 * PI * curvature)` (OpenVR overlay semantics).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct OpaqueRegion {
+    /// Overlay centre, in the same space as the frame view params
+    pub pose: Pose,
+    /// Full width (arc length when curved), in meters
+    pub width: f32,
+    pub height: f32,
+    pub curvature: f32,
+    /// Inward margin applied to every edge before forcing the region opaque, in meters
+    pub inset: f32,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct VideoPacketHeader {
     pub timestamp: Duration,
     pub global_view_params: [ViewParams; 2],
     pub is_idr: bool,
+    // Regions that were visible when this frame was rendered. Usually empty.
+    pub opaque_regions: Vec<OpaqueRegion>,
 }
 
 #[derive(Serialize, Deserialize)]

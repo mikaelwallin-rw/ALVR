@@ -20,7 +20,7 @@ use alvr_common::{
     parking_lot::Mutex,
 };
 use alvr_events::{EventType, TrackingEvent};
-use alvr_packets::TrackingData;
+use alvr_packets::{OpaqueRegion, TrackingData};
 use alvr_session::{
     BodyTrackingConfig, HeadsetConfig, MarkerColocationConfig, RecenteringMode, Settings,
     VMCConfig, settings_schema::Switch,
@@ -334,6 +334,14 @@ impl TrackingManager {
     pub fn unrecenter_view_params(&self, view_params: &mut [ViewParams; 2]) {
         for params in view_params {
             params.pose = self.inverse_recentering_origin.inverse() * params.pose;
+        }
+    }
+
+    // Same transform as unrecenter_view_params, for poses reported in OpenVR driver space
+    pub fn unrecenter_opaque_regions(&self, regions: &mut [OpaqueRegion]) {
+        let recentering_origin = self.inverse_recentering_origin.inverse();
+        for region in regions {
+            region.pose = recentering_origin * region.pose;
         }
     }
 

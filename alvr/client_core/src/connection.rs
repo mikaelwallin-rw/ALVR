@@ -15,8 +15,9 @@ use alvr_common::{
 };
 use alvr_packets::{
     AUDIO, ClientConnectionResult, ClientControlPacket, ClientStatistics, ConnectionAcceptedInfo,
-    HAPTICS, Haptics, STATISTICS, ServerControlPacket, StreamConfigPacket, TRACKING, TrackingData,
-    VIDEO, VideoPacketHeader, VideoStreamingCapabilities, VideoStreamingCapabilitiesExt,
+    HAPTICS, Haptics, OpaqueRegion, STATISTICS, ServerControlPacket, StreamConfigPacket, TRACKING,
+    TrackingData, VIDEO, VideoPacketHeader, VideoStreamingCapabilities,
+    VideoStreamingCapabilitiesExt,
 };
 use alvr_session::{SocketProtocol, settings_schema::Switch};
 use alvr_sockets::{
@@ -55,6 +56,12 @@ const MAX_UNREAD_PACKETS: usize = 10; // Applies per stream
 
 pub type DecoderCallback = dyn FnMut(Duration, &[u8]) -> bool + Send;
 
+pub struct GlobalViewParamsEntry {
+    pub timestamp: Duration,
+    pub view_params: [ViewParams; 2],
+    pub opaque_regions: Arc<Vec<OpaqueRegion>>,
+}
+
 #[derive(Default)]
 pub struct ConnectionContext {
     pub state: RwLock<ConnectionState>,
@@ -64,7 +71,7 @@ pub struct ConnectionContext {
     pub statistics_sender: Mutex<Option<StreamSender<ClientStatistics>>>,
     pub statistics_manager: Mutex<Option<StatisticsManager>>,
     pub decoder_callback: Mutex<Option<Box<DecoderCallback>>>,
-    pub global_view_params_queue: Mutex<VecDeque<(Duration, [ViewParams; 2])>>,
+    pub global_view_params_queue: Mutex<VecDeque<GlobalViewParamsEntry>>,
     pub max_prediction: RwLock<Duration>,
 }
 
@@ -331,8 +338,11 @@ fn connection_pipeline(
                         let global_view_params_queue_lock =
                             &mut ctx.global_view_params_queue.lock();
 
-                        global_view_params_queue_lock
-                            .push_back((header.timestamp, header.global_view_params));
+                        global_view_params_queue_lock.push_back(GlobalViewParamsEntry {
+                            timestamp: header.timestamp,
+                            view_params: header.global_view_params,
+                            opaque_regions: Arc::new(header.opaque_regions),
+                        });
 
                         while global_view_params_queue_lock.len() > 128 {
                             global_view_params_queue_lock.pop_front();

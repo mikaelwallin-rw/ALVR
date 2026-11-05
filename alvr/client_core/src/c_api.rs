@@ -14,8 +14,8 @@ use alvr_common::{
     warn,
 };
 use alvr_graphics::{
-    GraphicsContext, HandData, LobbyRenderer, LobbyViewParams, SDR_FORMAT_GL, StreamRenderer,
-    StreamViewParams,
+    GraphicsContext, HandData, LobbyRenderer, LobbyViewParams, OpaqueRegionsParams, SDR_FORMAT_GL,
+    StreamRenderer, StreamViewParams,
 };
 use alvr_packets::{ButtonEntry, ButtonValue, FaceData, TrackingData};
 use alvr_session::{
@@ -765,7 +765,7 @@ pub extern "C" fn alvr_render_stream_opengl(
     hardware_buffer: *mut c_void,
     view_params: *const AlvrStreamViewParams,
 ) {
-    STREAM_RENDERER.with_borrow(|renderer| {
+    STREAM_RENDERER.with_borrow_mut(|renderer| {
         if let Some(renderer) = renderer {
             let left_params = unsafe { &*view_params };
             let right_params = unsafe { &*view_params.offset(1) };
@@ -806,6 +806,13 @@ pub extern "C" fn alvr_render_stream_opengl(
                     },
                 ],
                 None,
+                &OpaqueRegionsParams {
+                    regions: &[],
+                    edge_band: 0.0,
+                    edge_key_px: 0.0,
+                    edge_despill_px: 0.0,
+                    debug_tint: false,
+                },
             );
         }
     });

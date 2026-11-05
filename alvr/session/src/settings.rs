@@ -562,6 +562,60 @@ pub struct RgbChromaKeyConfig {
     #[schema(flag = "real-time")]
     #[schema(gui(slider(min = 0.01, max = 1.0, step = 0.01)))]
     pub feathering: f32,
+
+    #[schema(strings(
+        help = "Shrinks the opaque (non-keyed) area by this many pixels wherever it touches keyed pixels.
+Removes the key-colour fringe left by video compression around opaque content. 0 disables it."
+    ))]
+    #[schema(flag = "real-time")]
+    #[schema(gui(slider(min = 0, max = 3)), suffix = "px")]
+    pub edge_erosion_px: u8,
+
+    #[schema(strings(
+        help = "Removes the key colour from opaque pixels next to keyed pixels (or partially keyed pixels).
+Pixels far from keyed areas are left untouched. 0 disables it."
+    ))]
+    #[schema(flag = "real-time")]
+    #[schema(gui(slider(min = 0.0, max = 1.0, step = 0.01)))]
+    pub edge_despill: f32,
+
+    #[schema(strings(
+        help = "Never key out the areas an overlay app reports as opaque (e.g. ScreenVR virtual screens),
+published through the shared memory Local\\VROpaqueRegions_v1. Windows only."
+    ))]
+    #[schema(flag = "real-time")]
+    pub opaque_regions: bool,
+
+    #[schema(strings(
+        help = "Force keying in a band of this width just outside each opaque region's edge (unless inside another region),
+to remove the key-colour fringe around virtual screens. 0 disables it."
+    ))]
+    #[schema(flag = "real-time")]
+    #[schema(gui(slider(min = 0.0, max = 5.0, step = 0.1)), suffix = "cm")]
+    pub opaque_regions_edge_band_cm: f32,
+
+    #[schema(strings(
+        help = "The forced keying also extends this many stream pixels inside each opaque region's edge,
+to remove the filtered/compressed edge pixels. The rest of the region is never keyed."
+    ))]
+    #[schema(flag = "real-time")]
+    #[schema(gui(slider(min = 0.0, max = 8.0, step = 0.1)), suffix = "px")]
+    pub opaque_regions_edge_key_px: f32,
+
+    #[schema(strings(
+        help = "Pixels further inside the forced keyed edge strip, within this many stream pixels, stay opaque
+but get their key colour spill removed, so the compositor's filtering can't bleed key colour."
+    ))]
+    #[schema(flag = "real-time")]
+    #[schema(gui(slider(min = 0.0, max = 8.0, step = 0.1)), suffix = "px")]
+    pub opaque_regions_edge_despill_px: f32,
+
+    #[schema(strings(
+        help = "Debug: tint forced opaque pixels green, the despill ring yellow, the forced keyed strip inside
+the edge red and the band outside the edge blue (all opaque)."
+    ))]
+    #[schema(flag = "real-time")]
+    pub opaque_regions_debug_tint: bool,
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -617,6 +671,60 @@ pub struct HsvChromaKeyConfig {
     #[schema(flag = "real-time")]
     #[schema(gui(slider(min = -0.5, max = 1.5, step = 0.01)))]
     pub value_end_max: f32,
+
+    #[schema(strings(
+        help = "Shrinks the opaque (non-keyed) area by this many pixels wherever it touches keyed pixels.
+Removes the key-colour fringe left by video compression around opaque content. 0 disables it."
+    ))]
+    #[schema(flag = "real-time")]
+    #[schema(gui(slider(min = 0, max = 3)), suffix = "px")]
+    pub edge_erosion_px: u8,
+
+    #[schema(strings(
+        help = "Removes the key colour from opaque pixels next to keyed pixels (or partially keyed pixels).
+Pixels far from keyed areas are left untouched. 0 disables it."
+    ))]
+    #[schema(flag = "real-time")]
+    #[schema(gui(slider(min = 0.0, max = 1.0, step = 0.01)))]
+    pub edge_despill: f32,
+
+    #[schema(strings(
+        help = "Never key out the areas an overlay app reports as opaque (e.g. ScreenVR virtual screens),
+published through the shared memory Local\\VROpaqueRegions_v1. Windows only."
+    ))]
+    #[schema(flag = "real-time")]
+    pub opaque_regions: bool,
+
+    #[schema(strings(
+        help = "Force keying in a band of this width just outside each opaque region's edge (unless inside another region),
+to remove the key-colour fringe around virtual screens. 0 disables it."
+    ))]
+    #[schema(flag = "real-time")]
+    #[schema(gui(slider(min = 0.0, max = 5.0, step = 0.1)), suffix = "cm")]
+    pub opaque_regions_edge_band_cm: f32,
+
+    #[schema(strings(
+        help = "The forced keying also extends this many stream pixels inside each opaque region's edge,
+to remove the filtered/compressed edge pixels. The rest of the region is never keyed."
+    ))]
+    #[schema(flag = "real-time")]
+    #[schema(gui(slider(min = 0.0, max = 8.0, step = 0.1)), suffix = "px")]
+    pub opaque_regions_edge_key_px: f32,
+
+    #[schema(strings(
+        help = "Pixels further inside the forced keyed edge strip, within this many stream pixels, stay opaque
+but get their key colour spill removed, so the compositor's filtering can't bleed key colour."
+    ))]
+    #[schema(flag = "real-time")]
+    #[schema(gui(slider(min = 0.0, max = 8.0, step = 0.1)), suffix = "px")]
+    pub opaque_regions_edge_despill_px: f32,
+
+    #[schema(strings(
+        help = "Debug: tint forced opaque pixels green, the despill ring yellow, the forced keyed strip inside
+the edge red and the band outside the edge blue (all opaque)."
+    ))]
+    #[schema(flag = "real-time")]
+    pub opaque_regions_debug_tint: bool,
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -1690,6 +1798,13 @@ pub fn session_settings_default() -> SettingsDefault {
                         blue: 0,
                         distance_threshold: 85,
                         feathering: 0.05,
+                        edge_erosion_px: 0,
+                        edge_despill: 0.0,
+                        opaque_regions: true,
+                        opaque_regions_edge_band_cm: 1.5,
+                        opaque_regions_edge_key_px: 2.0,
+                        opaque_regions_edge_despill_px: 2.0,
+                        opaque_regions_debug_tint: false,
                     },
                     HsvChromaKey: HsvChromaKeyConfigDefault {
                         hue_start_max_deg: 70.0,
@@ -1704,6 +1819,13 @@ pub fn session_settings_default() -> SettingsDefault {
                         value_start_min: 0.1,
                         value_end_min: 1.0,
                         value_end_max: 1.1,
+                        edge_erosion_px: 0,
+                        edge_despill: 0.0,
+                        opaque_regions: true,
+                        opaque_regions_edge_band_cm: 1.5,
+                        opaque_regions_edge_key_px: 2.0,
+                        opaque_regions_edge_despill_px: 2.0,
+                        opaque_regions_debug_tint: false,
                     },
                 },
             },

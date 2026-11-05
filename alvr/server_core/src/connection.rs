@@ -936,9 +936,11 @@ fn connection_pipeline(
                     Err(RecvTimeoutError::Disconnected) => return,
                 };
 
-                ctx.tracking_manager
-                    .read()
-                    .unrecenter_view_params(&mut header.global_view_params);
+                {
+                    let tracking_manager_lock = ctx.tracking_manager.read();
+                    tracking_manager_lock.unrecenter_view_params(&mut header.global_view_params);
+                    tracking_manager_lock.unrecenter_opaque_regions(&mut header.opaque_regions);
+                }
 
                 // todo: use get_buffer and make encoder write to socket buffers directly to avoid copy
                 video_sender

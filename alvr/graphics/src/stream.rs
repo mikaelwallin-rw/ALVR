@@ -1,18 +1,28 @@
-use super::{GraphicsContext, MAX_PUSH_CONSTANTS_SIZE, staging::StagingRenderer};
+use super::{
+    GraphicsContext, MAX_PUSH_CONSTANTS_SIZE,
+    opaque_regions::{
+        EncodedPixelMap, MAX_OPAQUE_REGIONS, OpaqueRegionsRenderer, REGION_CLASS_NONE,
+        REGION_CLASSES, RegionMeshParams, stream_stencil_state,
+    },
+    staging::StagingRenderer,
+};
 use alvr_common::{
-    ViewParams,
+    Pose, ViewParams,
     glam::{self, Mat4, UVec2, Vec3, Vec4},
+    info,
 };
 use alvr_session::{FoveatedEncodingConfig, PassthroughMode, UpscalingConfig};
 use std::{ffi::c_void, iter, mem, rc::Rc};
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
-    BindGroupLayoutEntry, BindingResource, BindingType, Color, ColorTargetState, ColorWrites,
-    FragmentState, LoadOp, PipelineCompilationOptions, PipelineLayoutDescriptor, PrimitiveState,
+    BindGroupLayoutEntry, BindingResource, BindingType, Buffer, BufferBindingType,
+    BufferDescriptor, BufferUsages, Color, ColorTargetState, ColorWrites, FragmentState, LoadOp,
+    Operations, PipelineCompilationOptions, PipelineLayoutDescriptor, PrimitiveState,
     PrimitiveTopology, PushConstantRange, RenderPass, RenderPassColorAttachment,
-    RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, SamplerBindingType,
-    SamplerDescriptor, ShaderStages, StoreOp, TextureSampleType, TextureView,
-    TextureViewDescriptor, TextureViewDimension, VertexState, include_wgsl,
+    RenderPassDepthStencilAttachment, RenderPassDescriptor, RenderPipeline,
+    RenderPipelineDescriptor, SamplerBindingType, SamplerDescriptor, ShaderStages, StoreOp,
+    TextureSampleType, TextureView, TextureViewDescriptor, TextureViewDimension, VertexState,
+    include_wgsl,
 };
 
 const FLOAT_SIZE: u32 = mem::size_of::<f32>() as u32;
@@ -24,15 +34,56 @@ const TRANSFORM_CONST_OFFSET: u32 = 0;
 const VIEW_INDEX_CONST_OFFSET: u32 = TRANSFORM_SIZE;
 const PASSTHROUGH_MODE_OFFSET: u32 = VIEW_INDEX_CONST_OFFSET + U32_SIZE;
 const ALPHA_CONST_OFFSET: u32 = PASSTHROUGH_MODE_OFFSET + U32_SIZE;
-const CK_CHANNEL0_CONST_OFFSET: u32 = ALPHA_CONST_OFFSET + FLOAT_SIZE + U32_SIZE;
+const CK_EDGE_CONST_OFFSET: u32 = ALPHA_CONST_OFFSET + FLOAT_SIZE;
+const CK_CHANNEL0_CONST_OFFSET: u32 = CK_EDGE_CONST_OFFSET + U32_SIZE;
 const CK_CHANNEL1_CONST_OFFSET: u32 = CK_CHANNEL0_CONST_OFFSET + VEC4_SIZE;
 const CK_CHANNEL2_CONST_OFFSET: u32 = CK_CHANNEL1_CONST_OFFSET + VEC4_SIZE;
 const PUSH_CONSTANTS_SIZE: u32 = CK_CHANNEL2_CONST_OFFSET + VEC4_SIZE;
+
+// Chroma key edge cleanup is packed in a single u32 (push constants are at the 128 byte limit):
+// bits 0..8 = erosion radius in texels, bits 8..16 = despill strength quantized to 0..=255.
+// Must match the unpacking in stream.wgsl.
+const CK_EDGE_MAX_EROSION_PX: u8 = 3;
+const CK_EDGE_DESPILL_SHIFT: u32 = 8;
+
+// Must match OpaqueRegions in stream.wgsl: flags, padding, key_chroma_dir
+const OPAQUE_REGIONS_UNIFORM_FLOATS: usize = 4 + 4;
+const OPAQUE_REGIONS_FLAG_DEBUG_TINT: u32 = 1;
+
+// Pipeline variant bits, for logging
+const PIPELINE_EDGE_CLEANUP_BIT: usize = 1;
+const PIPELINE_OPAQUE_REGIONS_BIT: usize = 2;
 
 const _: () = assert!(
     PUSH_CONSTANTS_SIZE <= MAX_PUSH_CONSTANTS_SIZE,
     "Push constants size exceeds the maximum size"
 );
+
+/// A region of the frame that must never be keyed out (see `alvr_packets::OpaqueRegion`). The quad
+/// lies in the local XY plane of `pose` and faces +Z; with `curvature` > 0 it bends around the local
+/// Y axis toward +Z with radius `width / (2 * PI * curvature)`.
+#[derive(Clone, Copy, Debug)]
+pub struct OpaqueRegionGeometry {
+    /// Same space as the stream input view params
+    pub pose: Pose,
+    pub width: f32,
+    pub height: f32,
+    pub curvature: f32,
+    pub inset: f32,
+}
+
+pub struct OpaqueRegionsParams<'a> {
+    pub regions: &'a [OpaqueRegionGeometry],
+    /// Width of the forced-keyed band just outside every region edge, in meters
+    pub edge_band: f32,
+    /// The forced-keyed band also extends this many stream pixels inside every region edge (the
+    /// filtered/compressed edge texel). The region `inset` is not used.
+    pub edge_key_px: f32,
+    /// Opaque pixels within this many stream pixels further inside the keyed strip get despilled
+    pub edge_despill_px: f32,
+    /// Debug: tint the region classes instead of keying
+    pub debug_tint: bool,
+}
 
 pub struct StreamViewParams {
     pub swapchain_index: u32,
@@ -49,8 +100,20 @@ struct ViewObjects {
 pub struct StreamRenderer {
     context: Rc<GraphicsContext>,
     staging_renderer: StagingRenderer,
-    pipeline: RenderPipeline,
+    // Without opaque regions, indexed by edge cleanup
+    plain_pipelines: [RenderPipeline; 2],
+    // With opaque regions (stencil attachment): pixels outside all regions, indexed by edge cleanup
+    region_none_pipelines: [RenderPipeline; 2],
+    // With opaque regions: pixels of each class of REGION_CLASSES
+    region_class_pipelines: [RenderPipeline; 4],
+    encoded_pixel_map: EncodedPixelMap,
+    // (pipeline variant, opaque regions, debug tint), logged on change
+    last_logged_state: Option<(usize, usize, bool)>,
     views_objects: [ViewObjects; 2],
+    opaque_regions_buffer: Buffer,
+    opaque_regions_data: Vec<f32>,
+    opaque_regions_renderer: OpaqueRegionsRenderer,
+    opaque_regions_count: usize,
 }
 
 impl StreamRenderer {
@@ -91,10 +154,26 @@ impl StreamRenderer {
                     ty: BindingType::Sampler(SamplerBindingType::Filtering),
                     count: None,
                 },
+                BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
-        let shader_module = device.create_shader_module(include_wgsl!("../resources/stream.wgsl"));
+        let opaque_regions_data = vec![0.0; OPAQUE_REGIONS_UNIFORM_FLOATS];
+        let opaque_regions_buffer = device.create_buffer(&BufferDescriptor {
+            label: None,
+            size: (OPAQUE_REGIONS_UNIFORM_FLOATS * mem::size_of::<f32>()) as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let mut constants = vec![];
 
@@ -103,15 +182,21 @@ impl StreamRenderer {
             ("ENCODING_GAMMA", encoding_gamma.into()),
         ]);
 
-        let staging_resolution = if let Some(foveated_encoding) = foveated_encoding {
-            let (staging_resolution, ffe_constants) =
-                foveated_encoding_shader_constants(base_view_resolution, foveated_encoding);
-            constants.extend(ffe_constants);
+        let (staging_resolution, encoded_pixel_map) =
+            if let Some(foveated_encoding) = foveated_encoding {
+                let (staging_resolution, ffe_constants) =
+                    foveated_encoding_shader_constants(base_view_resolution, foveated_encoding);
+                let encoded_pixel_map =
+                    EncodedPixelMap::from_foveation_constants(&ffe_constants, staging_resolution);
+                constants.extend(ffe_constants);
 
-            staging_resolution
-        } else {
-            base_view_resolution
-        };
+                (staging_resolution, encoded_pixel_map)
+            } else {
+                (
+                    base_view_resolution,
+                    EncodedPixelMap::identity(base_view_resolution),
+                )
+            };
 
         if let Some(upscaling) = upscaling {
             constants.extend([
@@ -128,54 +213,79 @@ impl StreamRenderer {
             ]);
         };
 
-        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+        // Note: Layout cannot be inferred because of a bug with push constants
+        let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: None,
-            // Note: Layout cannot be inferred because of a bug with push constants
-            layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
-                label: None,
-                bind_group_layouts: &[&bind_group_layout],
-                push_constant_ranges: &[PushConstantRange {
-                    stages: ShaderStages::VERTEX_FRAGMENT,
-                    range: 0..PUSH_CONSTANTS_SIZE,
-                }],
-            })),
-            vertex: VertexState {
-                module: &shader_module,
-                entry_point: None,
-                compilation_options: PipelineCompilationOptions {
-                    constants: &constants,
-                    zero_initialize_workgroup_memory: false,
-                },
-                buffers: &[],
-            },
-            primitive: PrimitiveState {
-                topology: PrimitiveTopology::TriangleStrip,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: Default::default(),
-            fragment: Some(FragmentState {
-                module: &shader_module,
-                entry_point: None,
-                compilation_options: PipelineCompilationOptions {
-                    constants: &constants,
-                    zero_initialize_workgroup_memory: false,
-                },
-                targets: &[Some(ColorTargetState {
-                    format: target_format,
-                    blend: None,
-                    write_mask: ColorWrites::ALL,
-                })],
-            }),
-            multiview: None,
-            cache: None,
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[PushConstantRange {
+                stages: ShaderStages::VERTEX_FRAGMENT,
+                range: 0..PUSH_CONSTANTS_SIZE,
+            }],
         });
+
+        // All variants are created upfront, so toggling a feature never stalls a frame.
+        // Each variant needs its own shader module: the wgpu GLES backend caches linked programs by
+        // shader module and entry point only, ignoring pipeline constants, so variants sharing a
+        // module would all silently get the first compiled program.
+        let create_pipeline = |edge_cleanup: bool, forced_class: u8, with_stencil: bool| {
+            let shader_module =
+                device.create_shader_module(include_wgsl!("../resources/stream.wgsl"));
+            let mut constants = constants.clone();
+            constants.extend([
+                ("ENABLE_EDGE_CLEANUP", edge_cleanup.into()),
+                ("FORCED_REGION_CLASS", f64::from(forced_class)),
+            ]);
+
+            device.create_render_pipeline(&RenderPipelineDescriptor {
+                label: None,
+                layout: Some(&pipeline_layout),
+                vertex: VertexState {
+                    module: &shader_module,
+                    entry_point: None,
+                    compilation_options: PipelineCompilationOptions {
+                        constants: &constants,
+                        zero_initialize_workgroup_memory: false,
+                    },
+                    buffers: &[],
+                },
+                primitive: PrimitiveState {
+                    topology: PrimitiveTopology::TriangleStrip,
+                    ..Default::default()
+                },
+                depth_stencil: with_stencil.then(stream_stencil_state),
+                multisample: Default::default(),
+                fragment: Some(FragmentState {
+                    module: &shader_module,
+                    entry_point: None,
+                    compilation_options: PipelineCompilationOptions {
+                        constants: &constants,
+                        zero_initialize_workgroup_memory: false,
+                    },
+                    targets: &[Some(ColorTargetState {
+                        format: target_format,
+                        blend: None,
+                        write_mask: ColorWrites::ALL,
+                    })],
+                }),
+                multiview: None,
+                cache: None,
+            })
+        };
+        let plain_pipelines = [false, true]
+            .map(|edge_cleanup| create_pipeline(edge_cleanup, REGION_CLASS_NONE, false));
+        let region_none_pipelines = [false, true]
+            .map(|edge_cleanup| create_pipeline(edge_cleanup, REGION_CLASS_NONE, true));
+        let region_class_pipelines =
+            REGION_CLASSES.map(|class| create_pipeline(false, class, true));
 
         let sampler = device.create_sampler(&SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+
+        let opaque_regions_renderer =
+            OpaqueRegionsRenderer::new(Rc::clone(&context), target_view_resolution, target_format);
 
         let mut view_objects = vec![];
         let mut staging_textures_gl = vec![];
@@ -195,6 +305,10 @@ impl StreamRenderer {
                     BindGroupEntry {
                         binding: 1,
                         resource: BindingResource::Sampler(&sampler),
+                    },
+                    BindGroupEntry {
+                        binding: 2,
+                        resource: opaque_regions_buffer.as_entire_binding(),
                     },
                 ],
             });
@@ -236,19 +350,160 @@ impl StreamRenderer {
         Self {
             context,
             staging_renderer,
-            pipeline,
+            plain_pipelines,
+            region_none_pipelines,
+            region_class_pipelines,
+            encoded_pixel_map,
+            last_logged_state: None,
             views_objects: view_objects.try_into().unwrap(),
+            opaque_regions_buffer,
+            opaque_regions_data,
+            opaque_regions_renderer,
+            opaque_regions_count: 0,
         }
+    }
+
+    // Builds the per view region class meshes (relative to each view's render pose and FOV) and
+    // fills the uniform. Returns the number of regions, and whether the uniform must be uploaded.
+    fn update_opaque_regions(
+        &mut self,
+        view_params: &[StreamViewParams; 2],
+        passthrough: Option<&PassthroughMode>,
+        opaque_regions: &OpaqueRegionsParams,
+    ) -> (usize, bool) {
+        let regions = match passthrough {
+            Some(PassthroughMode::RgbChromaKey(_) | PassthroughMode::HsvChromaKey(_)) => {
+                &opaque_regions.regions[..opaque_regions.regions.len().min(MAX_OPAQUE_REGIONS)]
+            }
+            _ => &[],
+        };
+        if regions.is_empty() && self.opaque_regions_count == 0 {
+            return (0, false);
+        }
+        self.opaque_regions_count = regions.len();
+
+        let mesh_params = RegionMeshParams {
+            edge_band: opaque_regions.edge_band,
+            edge_key_px: opaque_regions.edge_key_px,
+            edge_despill_px: opaque_regions.edge_despill_px,
+        };
+        for (view_idx, view) in view_params.iter().enumerate() {
+            self.opaque_regions_renderer.update(
+                view_idx,
+                regions,
+                view.input_view_params.pose,
+                view.input_view_params.fov,
+                &self.encoded_pixel_map,
+                &mesh_params,
+            );
+        }
+
+        let data = &mut self.opaque_regions_data;
+        data.fill(0.0);
+        data[0] = f32::from_bits(if opaque_regions.debug_tint {
+            OPAQUE_REGIONS_FLAG_DEBUG_TINT
+        } else {
+            0
+        });
+        let key_dir = passthrough.map_or(Vec3::ZERO, key_chroma_direction);
+        data[4..7].copy_from_slice(&key_dir.to_array());
+
+        (regions.len(), true)
+    }
+
+    fn log_opaque_regions_diagnostic(
+        &self,
+        opaque_regions: &OpaqueRegionsParams,
+        pipeline_variant: usize,
+    ) {
+        info!(
+            "Stream pipeline variant {pipeline_variant}: opaque regions {}, class mesh vertices \
+             {:?}, debug tint {}, band {:.3} m, key {} px, despill {} px",
+            self.opaque_regions_count,
+            self.opaque_regions_renderer.vertex_counts(),
+            opaque_regions.debug_tint,
+            opaque_regions.edge_band,
+            opaque_regions.edge_key_px,
+            opaque_regions.edge_despill_px,
+        );
+    }
+
+    // Push constants are set again after every pipeline change: the GLES backend emulates them with
+    // per program uniforms
+    fn draw_stream_quad(
+        &self,
+        render_pass: &mut RenderPass,
+        pipeline: &RenderPipeline,
+        view_idx: usize,
+        transform_bytes: &[u8],
+        passthrough: Option<&PassthroughMode>,
+    ) {
+        render_pass.set_pipeline(pipeline);
+        render_pass.set_push_constants(
+            ShaderStages::VERTEX_FRAGMENT,
+            TRANSFORM_CONST_OFFSET,
+            transform_bytes,
+        );
+        render_pass.set_push_constants(
+            ShaderStages::VERTEX_FRAGMENT,
+            VIEW_INDEX_CONST_OFFSET,
+            &(view_idx as u32).to_le_bytes(),
+        );
+        render_pass.set_bind_group(0, &self.views_objects[view_idx].bind_group, &[]);
+        set_passthrough_push_constants(render_pass, passthrough);
+        render_pass.draw(0..4, 0..1);
     }
 
     /// # Safety
     /// `hardware_buffer` must be a valid pointer to a ANativeWindowBuffer.
     pub fn render(
-        &self,
+        &mut self,
         hardware_buffer: *mut c_void,
         view_params: [StreamViewParams; 2],
         passthrough: Option<&PassthroughMode>,
+        opaque_regions: &OpaqueRegionsParams,
     ) {
+        let (opaque_regions_count, upload) =
+            self.update_opaque_regions(&view_params, passthrough, opaque_regions);
+        if upload {
+            let bytes = self
+                .opaque_regions_data
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>();
+            self.context
+                .queue
+                .write_buffer(&self.opaque_regions_buffer, 0, &bytes);
+        }
+
+        let edge_cleanup = match passthrough {
+            Some(PassthroughMode::RgbChromaKey(config)) => {
+                config.edge_erosion_px > 0 || config.edge_despill > 0.0
+            }
+            Some(PassthroughMode::HsvChromaKey(config)) => {
+                config.edge_erosion_px > 0 || config.edge_despill > 0.0
+            }
+            Some(PassthroughMode::Blend { .. }) | None => false,
+        };
+        let pipeline_variant = if edge_cleanup {
+            PIPELINE_EDGE_CLEANUP_BIT
+        } else {
+            0
+        } | if opaque_regions_count > 0 {
+            PIPELINE_OPAQUE_REGIONS_BIT
+        } else {
+            0
+        };
+        let log_state = (
+            pipeline_variant,
+            opaque_regions_count,
+            opaque_regions.debug_tint,
+        );
+        if self.last_logged_state != Some(log_state) {
+            self.last_logged_state = Some(log_state);
+            self.log_opaque_regions_diagnostic(opaque_regions, pipeline_variant);
+        }
+
         // if hardware_buffer is available copy stream to staging texture
         if !hardware_buffer.is_null() {
             self.staging_renderer.render(hardware_buffer);
@@ -260,20 +515,6 @@ impl StreamRenderer {
             .create_command_encoder(&Default::default());
 
         for (view_idx, view_params) in view_params.iter().enumerate() {
-            let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: None,
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &self.views_objects[view_idx].render_target
-                        [view_params.swapchain_index as usize],
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: LoadOp::Clear(Color::BLACK),
-                        store: StoreOp::Store,
-                    },
-                })],
-                ..Default::default()
-            });
-
             let input_fov = view_params.input_view_params.fov;
 
             let tanl = f32::tan(input_fov.left);
@@ -308,30 +549,103 @@ impl StreamRenderer {
 
             let transform = proj_mat * view_mat * model_mat;
 
+            let with_regions = pipeline_variant & PIPELINE_OPAQUE_REGIONS_BIT != 0;
+            let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &self.views_objects[view_idx].render_target
+                        [view_params.swapchain_index as usize],
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Clear(Color::BLACK),
+                        store: StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: with_regions.then(|| RenderPassDepthStencilAttachment {
+                    view: self.opaque_regions_renderer.stencil_view(view_idx),
+                    depth_ops: None,
+                    stencil_ops: Some(Operations {
+                        load: LoadOp::Clear(u32::from(REGION_CLASS_NONE)),
+                        store: StoreOp::Discard,
+                    }),
+                }),
+                ..Default::default()
+            });
+
             let transform_bytes = transform
                 .to_cols_array()
                 .iter()
                 .flat_map(|v| v.to_le_bytes())
                 .collect::<Vec<u8>>();
 
-            render_pass.set_pipeline(&self.pipeline);
-            render_pass.set_push_constants(
-                ShaderStages::VERTEX_FRAGMENT,
-                TRANSFORM_CONST_OFFSET,
-                &transform_bytes,
-            );
-            render_pass.set_push_constants(
-                ShaderStages::VERTEX_FRAGMENT,
-                VIEW_INDEX_CONST_OFFSET,
-                &(view_idx as u32).to_le_bytes(),
-            );
-            render_pass.set_bind_group(0, &self.views_objects[view_idx].bind_group, &[]);
-            set_passthrough_push_constants(&mut render_pass, passthrough);
-            render_pass.draw(0..4, 0..1);
+            let edge_cleanup_idx = usize::from(pipeline_variant & PIPELINE_EDGE_CLEANUP_BIT != 0);
+            if with_regions {
+                self.opaque_regions_renderer.draw_stencil(
+                    &mut render_pass,
+                    view_idx,
+                    &transform_bytes,
+                );
+
+                render_pass.set_stencil_reference(u32::from(REGION_CLASS_NONE));
+                self.draw_stream_quad(
+                    &mut render_pass,
+                    &self.region_none_pipelines[edge_cleanup_idx],
+                    view_idx,
+                    &transform_bytes,
+                    passthrough,
+                );
+                for (class, pipeline) in REGION_CLASSES.iter().zip(&self.region_class_pipelines) {
+                    render_pass.set_stencil_reference(u32::from(*class));
+                    self.draw_stream_quad(
+                        &mut render_pass,
+                        pipeline,
+                        view_idx,
+                        &transform_bytes,
+                        passthrough,
+                    );
+                }
+            } else {
+                self.draw_stream_quad(
+                    &mut render_pass,
+                    &self.plain_pipelines[edge_cleanup_idx],
+                    view_idx,
+                    &transform_bytes,
+                    passthrough,
+                );
+            }
         }
 
         self.context.queue.submit(iter::once(encoder.finish()));
     }
+}
+
+// Normalized chroma (colour minus luma) of the key colour, in the decoded stream colour space.
+// Must match key_color() in stream.wgsl.
+fn key_chroma_direction(config: &PassthroughMode) -> Vec3 {
+    const LUMA: Vec3 = Vec3::new(0.2126, 0.7152, 0.0722);
+
+    let key = match config {
+        PassthroughMode::RgbChromaKey(config) => {
+            Vec3::new(
+                f32::from(config.red),
+                f32::from(config.green),
+                f32::from(config.blue),
+            ) / 255.
+        }
+        PassthroughMode::HsvChromaKey(config) => {
+            // Middle of the fully keyed hue range [start_min, end_min], full saturation and value
+            let start_min = config.hue_start_min_deg / 360.;
+            let end_min = config.hue_end_min_deg / 360.;
+            let hue = (start_min + (end_min - start_min).rem_euclid(1.) * 0.5).rem_euclid(1.);
+            let channel =
+                |offset: f32| (((hue + offset).rem_euclid(1.) * 6. - 3.).abs() - 1.).clamp(0., 1.);
+            Vec3::new(channel(1.), channel(2. / 3.), channel(1. / 3.))
+        }
+        PassthroughMode::Blend { .. } => return Vec3::ZERO,
+    };
+
+    let chroma = key - Vec3::splat(key.dot(LUMA));
+    chroma.try_normalize().unwrap_or(Vec3::ZERO)
 }
 
 fn set_passthrough_push_constants(render_pass: &mut RenderPass, config: Option<&PassthroughMode>) {
@@ -368,17 +682,31 @@ fn set_passthrough_push_constants(render_pass: &mut RenderPass, config: Option<&
         );
     }
 
+    fn pack_edge_config(erosion_px: u8, despill: f32) -> u32 {
+        let erosion_px = u32::from(erosion_px.min(CK_EDGE_MAX_EROSION_PX));
+        let despill = (despill.clamp(0., 1.) * 255.).round() as u32;
+
+        erosion_px | (despill << CK_EDGE_DESPILL_SHIFT)
+    }
+
     match config {
         None => {
             set_u32(render_pass, PASSTHROUGH_MODE_OFFSET, 0);
             set_float(render_pass, ALPHA_CONST_OFFSET, 1.);
+            set_u32(render_pass, CK_EDGE_CONST_OFFSET, 0);
         }
         Some(PassthroughMode::Blend { threshold, .. }) => {
             set_u32(render_pass, PASSTHROUGH_MODE_OFFSET, 0);
             set_float(render_pass, ALPHA_CONST_OFFSET, 1. - threshold);
+            set_u32(render_pass, CK_EDGE_CONST_OFFSET, 0);
         }
         Some(PassthroughMode::RgbChromaKey(config)) => {
             set_u32(render_pass, PASSTHROUGH_MODE_OFFSET, 1);
+            set_u32(
+                render_pass,
+                CK_EDGE_CONST_OFFSET,
+                pack_edge_config(config.edge_erosion_px, config.edge_despill),
+            );
 
             let norm = |v| v as f32 / 255.;
 
@@ -400,6 +728,11 @@ fn set_passthrough_push_constants(render_pass: &mut RenderPass, config: Option<&
         }
         Some(PassthroughMode::HsvChromaKey(config)) => {
             set_u32(render_pass, PASSTHROUGH_MODE_OFFSET, 2);
+            set_u32(
+                render_pass,
+                CK_EDGE_CONST_OFFSET,
+                pack_edge_config(config.edge_erosion_px, config.edge_despill),
+            );
 
             set_vec4(
                 render_pass,

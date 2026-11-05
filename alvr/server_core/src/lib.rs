@@ -5,6 +5,7 @@ mod hand_gestures;
 mod haptics;
 mod input_mapping;
 mod logging_backend;
+mod opaque_regions;
 mod sockets;
 mod statistics;
 mod tracking;
@@ -17,7 +18,7 @@ pub use tracking::HandType;
 use crate::connection::VideoPacket;
 use alvr_common::{
     ConnectionState, DEVICE_ID_TO_PATH, DeviceMotion, LifecycleState, Pose, RelaxedAtomic,
-    ViewParams, dbg_server_core, error,
+    ViewParams, dbg_server_core, error, info,
     glam::Vec2,
     parking_lot::{Mutex, RwLock},
     settings_schema::Switch,
@@ -30,7 +31,7 @@ use alvr_packets::{
     VideoPacketHeader,
 };
 use alvr_server_io::ServerSessionManager;
-use alvr_session::{CodecType, OpenvrProperty, Settings};
+use alvr_session::{CodecType, OpenvrProperty, PassthroughMode, Settings};
 use alvr_sockets::StreamSender;
 use bitrate::{BitrateManager, DynamicEncoderParams};
 use statistics::StatisticsManager;
@@ -57,6 +58,19 @@ static FILESYSTEM_LAYOUT: OnceLock<afs::Layout> = OnceLock::new();
 // needs to be initialized first using initialize_environment().
 // NB: this must remain a global because only one instance should exist for the whole application
 // execution time.
+static OPAQUE_REGIONS_READER: Mutex<opaque_regions::OpaqueRegionsReader> =
+    Mutex::new(opaque_regions::OpaqueRegionsReader::new());
+// Last logged state (starts false, so "enabled" is logged on the first frame)
+static OPAQUE_REGIONS_ENABLED_LOGGED: AtomicBool = AtomicBool::new(false);
+
+fn opaque_regions_enabled(settings: &Settings) -> bool {
+    match settings.video.passthrough.as_option() {
+        Some(PassthroughMode::RgbChromaKey(config)) => config.opaque_regions,
+        Some(PassthroughMode::HsvChromaKey(config)) => config.opaque_regions,
+        Some(PassthroughMode::Blend { .. }) | None => false,
+    }
+}
+
 static SESSION_MANAGER: LazyLock<RwLock<ServerSessionManager>> = LazyLock::new(|| {
     RwLock::new(ServerSessionManager::new(
         FILESYSTEM_LAYOUT.get().map(|l| l.session()),
@@ -430,11 +444,24 @@ impl ServerCoreContext {
                     file.write_all(&nal_buffer).ok();
                 }
 
+                let regions_enabled = opaque_regions_enabled(SESSION_MANAGER.read().settings());
+                if OPAQUE_REGIONS_ENABLED_LOGGED.swap(regions_enabled, Ordering::Relaxed)
+                    != regions_enabled
+                {
+                    info!("Opaque regions forwarding enabled: {regions_enabled}");
+                }
+                let opaque_regions = if regions_enabled {
+                    OPAQUE_REGIONS_READER.lock().read()
+                } else {
+                    Vec::new()
+                };
+
                 let sender_result = sender.try_send(VideoPacket {
                     header: VideoPacketHeader {
                         timestamp,
                         global_view_params,
                         is_idr,
+                        opaque_regions,
                     },
                     payload: nal_buffer,
                 });

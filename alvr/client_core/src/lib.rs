@@ -25,7 +25,8 @@ use alvr_common::{
     warn,
 };
 use alvr_packets::{
-    BatteryInfo, ButtonEntry, ClientControlPacket, RealTimeConfig, StreamConfig, TrackingData,
+    BatteryInfo, ButtonEntry, ClientControlPacket, OpaqueRegion, RealTimeConfig, StreamConfig,
+    TrackingData,
 };
 use alvr_session::CodecType;
 use alvr_system_info::Platform;
@@ -81,6 +82,7 @@ pub struct ClientCoreContext {
     connection_context: Arc<ConnectionContext>,
     connection_thread: Arc<Mutex<Option<JoinHandle<()>>>>,
     last_good_global_view_params: Mutex<[ViewParams; 2]>,
+    last_good_opaque_regions: Mutex<Arc<Vec<OpaqueRegion>>>,
 }
 
 impl ClientCoreContext {
@@ -126,6 +128,7 @@ impl ClientCoreContext {
             connection_context,
             connection_thread: Arc::new(Mutex::new(Some(connection_thread))),
             last_good_global_view_params: Mutex::new([ViewParams::DUMMY; 2]),
+            last_good_opaque_regions: Mutex::new(Arc::new(Vec::new())),
         }
     }
 
@@ -329,14 +332,21 @@ impl ClientCoreContext {
         }
 
         let global_view_params_lock = &mut *self.last_good_global_view_params.lock();
-        for (ts, params) in &*self.connection_context.global_view_params_queue.lock() {
-            if *ts == timestamp {
-                *global_view_params_lock = *params;
+        for entry in &*self.connection_context.global_view_params_queue.lock() {
+            if entry.timestamp == timestamp {
+                *global_view_params_lock = entry.view_params;
+                *self.last_good_opaque_regions.lock() = Arc::clone(&entry.opaque_regions);
                 break;
             }
         }
 
         *global_view_params_lock
+    }
+
+    /// Opaque regions of the frame last passed to `report_compositor_start`, in the same space as
+    /// its view params.
+    pub fn last_frame_opaque_regions(&self) -> Arc<Vec<OpaqueRegion>> {
+        Arc::clone(&self.last_good_opaque_regions.lock())
     }
 
     pub fn report_submit(&self, timestamp: Duration, vsync_queue: Duration) {

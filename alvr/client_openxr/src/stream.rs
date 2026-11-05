@@ -12,10 +12,13 @@ use alvr_common::{
     anyhow::Result,
     error,
     glam::{UVec2, Vec2},
+    info,
     parking_lot::RwLock,
 };
-use alvr_graphics::{GraphicsContext, StreamRenderer, StreamViewParams};
-use alvr_packets::{RealTimeConfig, StreamConfig, TrackingData};
+use alvr_graphics::{
+    GraphicsContext, OpaqueRegionGeometry, OpaqueRegionsParams, StreamRenderer, StreamViewParams,
+};
+use alvr_packets::{OpaqueRegion, RealTimeConfig, StreamConfig, TrackingData};
 use alvr_session::{
     ClientsideFoveationConfig, ClientsideFoveationMode, ClientsidePostProcessingConfig, CodecType,
     FoveatedEncodingConfig, MediacodecProperty, PassthroughMode, UpscalingConfig,
@@ -31,6 +34,7 @@ use std::{
 };
 
 const DECODER_MAX_TIMEOUT_MULTIPLIER: f32 = 0.8;
+const CM_TO_M: f32 = 0.01;
 
 pub struct ParsedStreamConfig {
     pub view_resolution: UVec2,
@@ -92,6 +96,10 @@ pub struct StreamContext {
     view_reference_space: Arc<xr::Space>,
     swapchains: [xr::Swapchain<xr::OpenGlEs>; 2],
     last_good_view_params: [ViewParams; 2],
+    last_good_opaque_regions: Arc<Vec<OpaqueRegion>>,
+    opaque_regions_scratch: Vec<OpaqueRegionGeometry>,
+    // (enabled in the config, regions received with the frame), logged on change
+    opaque_regions_log_state: Option<(bool, usize)>,
     input_thread: Option<JoinHandle<()>>,
     input_thread_running: Arc<RelaxedAtomic>,
     config: ParsedStreamConfig,
@@ -236,6 +244,9 @@ impl StreamContext {
             view_reference_space,
             swapchains,
             last_good_view_params: [ViewParams::DUMMY; 2],
+            last_good_opaque_regions: Arc::new(Vec::new()),
+            opaque_regions_scratch: Vec::new(),
+            opaque_regions_log_state: None,
             input_thread: None,
             input_thread_running,
             config,
@@ -360,6 +371,7 @@ impl StreamContext {
                 let view_params = self.core_context.report_compositor_start(timestamp);
 
                 self.last_good_view_params = view_params;
+                self.last_good_opaque_regions = self.core_context.last_frame_opaque_regions();
 
                 (timestamp, view_params, buffer_ptr)
             } else {
@@ -420,6 +432,49 @@ impl StreamContext {
             openxr_display_time = vsync_time;
         }
 
+        // Regions are in the same space as the frame's (input) view params
+        let (opaque_regions_enabled, edge_band, edge_key_px, edge_despill_px, debug_tint) =
+            match &self.config.passthrough {
+                Some(PassthroughMode::RgbChromaKey(config)) => (
+                    config.opaque_regions,
+                    config.opaque_regions_edge_band_cm * CM_TO_M,
+                    config.opaque_regions_edge_key_px,
+                    config.opaque_regions_edge_despill_px,
+                    config.opaque_regions_debug_tint,
+                ),
+                Some(PassthroughMode::HsvChromaKey(config)) => (
+                    config.opaque_regions,
+                    config.opaque_regions_edge_band_cm * CM_TO_M,
+                    config.opaque_regions_edge_key_px,
+                    config.opaque_regions_edge_despill_px,
+                    config.opaque_regions_debug_tint,
+                ),
+                Some(PassthroughMode::Blend { .. }) | None => (false, 0.0, 0.0, 0.0, false),
+            };
+        let log_state = (opaque_regions_enabled, self.last_good_opaque_regions.len());
+        if self.opaque_regions_log_state != Some(log_state) {
+            info!(
+                "Opaque regions: enabled {}, {} regions received with the frame",
+                log_state.0, log_state.1
+            );
+            self.opaque_regions_log_state = Some(log_state);
+        }
+        self.opaque_regions_scratch.clear();
+        if opaque_regions_enabled {
+            self.opaque_regions_scratch
+                .extend(
+                    self.last_good_opaque_regions
+                        .iter()
+                        .map(|region| OpaqueRegionGeometry {
+                            pose: region.pose,
+                            width: region.width,
+                            height: region.height,
+                            curvature: region.curvature,
+                            inset: region.inset,
+                        }),
+                );
+        }
+
         self.renderer.render(
             buffer_ptr,
             [
@@ -435,6 +490,13 @@ impl StreamContext {
                 },
             ],
             self.config.passthrough.as_ref(),
+            &OpaqueRegionsParams {
+                regions: &self.opaque_regions_scratch,
+                edge_band,
+                edge_key_px,
+                edge_despill_px,
+                debug_tint,
+            },
         );
 
         self.swapchains[0].release_image().unwrap();
