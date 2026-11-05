@@ -7,16 +7,16 @@
   },
   "priority": 6,
   "tracker_types": {
-    "TrackerRole_Waist": "{pico}/input/swift/pico_tracker_waist_profile.json",
-    "TrackerRole_LeftKnee": "{pico}/input/swift/pico_tracker_left_knee_profile.json",
-    "TrackerRole_RightKnee": "{pico}/input/swift/pico_tracker_right_knee_profile.json",
-    "TrackerRole_LeftFoot": "{pico}/input/swift/pico_tracker_left_foot_profile.json",
-    "TrackerRole_RightFoot": "{pico}/input/swift/pico_tracker_right_foot_profile.json",
-    "TrackerRole_LeftShoulder": "{pico}/input/swift/pico_tracker_left_shoulder_profile.json",
-    "TrackerRole_RightShoulder": "{pico}/input/swift/pico_tracker_right_shoulder_profile.json",
-    "TrackerRole_Chest": "{pico}/input/swift/pico_tracker_chest_profile.json",
-    "TrackerRole_LeftElbow": "{pico}/input/swift/pico_tracker_left_elbow_profile.json",
-    "TrackerRole_RightElbow": "{pico}/input/swift/pico_tracker_right_elbow_profile.json"
+    "TrackerRole_Waist": "{alvr_server}/input/swift/pico_tracker_waist_profile.json",
+    "TrackerRole_LeftKnee": "{alvr_server}/input/swift/pico_tracker_left_knee_profile.json",
+    "TrackerRole_RightKnee": "{alvr_server}/input/swift/pico_tracker_right_knee_profile.json",
+    "TrackerRole_LeftFoot": "{alvr_server}/input/swift/pico_tracker_left_foot_profile.json",
+    "TrackerRole_RightFoot": "{alvr_server}/input/swift/pico_tracker_right_foot_profile.json",
+    "TrackerRole_LeftShoulder": "{alvr_server}/input/swift/pico_tracker_left_shoulder_profile.json",
+    "TrackerRole_RightShoulder": "{alvr_server}/input/swift/pico_tracker_right_shoulder_profile.json",
+    "TrackerRole_Chest": "{alvr_server}/input/swift/pico_tracker_chest_profile.json",
+    "TrackerRole_LeftElbow": "{alvr_server}/input/swift/pico_tracker_left_elbow_profile.json",
+    "TrackerRole_RightElbow": "{alvr_server}/input/swift/pico_tracker_right_elbow_profile.json"
   },
   "input_source": {
     "/input/power": {

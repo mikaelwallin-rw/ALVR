@@ -3,7 +3,7 @@
   "controller_type": "pico_hmd",
   "input_bindingui_mode" : "hmd",
   "input_bindingui_right": {
-    "image": "{pico}/icons/headset.svg"
+    "image": "{alvr_server}/icons/headset.svg"
   },
   "input_source" :
   {

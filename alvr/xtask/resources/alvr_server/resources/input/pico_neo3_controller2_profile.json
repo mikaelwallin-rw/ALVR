@@ -4,15 +4,15 @@
   "device_class": "TrackedDeviceClass_Controller",
   "resource_root": "pico",
   "driver_name": "pico",
-  "legacy_binding": "{pico}/input/legacy_bindings_pico_controller2.json",
+  "legacy_binding": "{alvr_server}/input/legacy_bindings_pico_controller2.json",
   "input_bindingui_mode": "controller_handed",
   "should_show_binding_errors": true,
   "compatibility_mode_controller_type": "vive_controller",
   "input_bindingui_left": {
-    "image": "{pico}/icons/neo3_left.svg"
+    "image": "{alvr_server}/icons/neo3_left.svg"
   },
   "input_bindingui_right": {
-    "image": "{pico}/icons/neo3_right.svg"
+    "image": "{alvr_server}/icons/neo3_right.svg"
   },
   "input_source": {
     "/input/trackpad": {
