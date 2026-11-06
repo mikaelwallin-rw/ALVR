@@ -6,6 +6,7 @@ mod hand_gestures;
 mod haptics;
 mod input_mapping;
 mod logging_backend;
+mod native_quads;
 mod opaque_regions;
 mod sockets;
 mod statistics;

@@ -4,6 +4,7 @@ use crate::{
     camera_frames,
     hand_gestures::HandGestureManager,
     input_mapping::ButtonMappingManager,
+    native_quads::NativeQuadsReader,
     sockets::WelcomeSocket,
     statistics::StatisticsManager,
     tracking::{self, TrackingManager},
@@ -22,7 +23,7 @@ use alvr_common::{
 use alvr_events::{AdbEvent, ButtonEvent, EventType};
 use alvr_packets::{
     AUDIO, CameraEye, CameraFramesConfig, ClientConnectionResult, ClientConnectionsAction,
-    ClientControlPacket, ClientStatistics, HAPTICS, NegotiatedStreamingConfig,
+    ClientControlPacket, ClientStatistics, HAPTICS, NativeQuad, NegotiatedStreamingConfig,
     NegotiatedStreamingConfigExt, RealTimeConfig, STATISTICS, ServerControlPacket,
     StreamConfigPacket, TRACKING, TrackingData, VIDEO, VideoPacketHeader,
 };
@@ -1200,6 +1201,10 @@ fn connection_pipeline(
         move || {
             // Last camera frames request sent to the client (the client starts without one)
             let mut sent_camera_frames = None;
+            let mut native_quads_reader = NativeQuadsReader::new();
+            // Last native quads sent to the client, as Debug text for comparison (Pose has no
+            // PartialEq). The client starts without any.
+            let mut sent_native_quads = format!("{:?}", Vec::<NativeQuad>::new());
 
             while is_streaming(&client_hostname) {
                 let camera_frames = tracking_extras::camera_frames_request().map(|right_camera| {
@@ -1221,6 +1226,19 @@ fn connection_pipeline(
                 {
                     info!("Camera frames request sent to the client: {camera_frames:?}");
                     sent_camera_frames = camera_frames;
+                }
+
+                let native_quads = native_quads_reader.read(tracking_extras::stage_epoch());
+                let native_quads_text = format!("{native_quads:?}");
+                let count = native_quads.len();
+                if native_quads_text != sent_native_quads
+                    && control_sender
+                        .lock()
+                        .send(&ServerControlPacket::NativeQuads(native_quads))
+                        .is_ok()
+                {
+                    info!("Native quads sent to the client: {count}");
+                    sent_native_quads = native_quads_text;
                 }
 
                 if let Err(e) = control_sender.lock().send(&ServerControlPacket::KeepAlive) {

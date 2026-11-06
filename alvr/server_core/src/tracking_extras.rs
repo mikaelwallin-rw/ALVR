@@ -42,7 +42,7 @@ pub(crate) fn to_matrix(pose: Pose) -> [[f32; 4]; 3] {
 #[cfg(windows)]
 pub use windows_impl::{
     TRACKING_EXTRAS_WRITER, bump_stage_epoch, camera_frames_request, recenter_counter,
-    report_tracking,
+    report_tracking, stage_epoch,
 };
 
 #[cfg(not(windows))]
@@ -61,6 +61,11 @@ pub fn recenter_counter() -> u32 {
 
 #[cfg(not(windows))]
 pub fn bump_stage_epoch() {}
+
+#[cfg(not(windows))]
+pub fn stage_epoch() -> u32 {
+    0
+}
 
 // Refreshes the heartbeat (and request-derived state) while no tracking packets arrive, e.g.
 // when no headset is connected. Joined on drop, so that the thread never outlives the driver.
@@ -217,6 +222,11 @@ mod windows_impl {
     // Incremented whenever the stage -> driver transform changes
     pub fn recenter_counter() -> u32 {
         TRACKING_EXTRAS_WRITER.lock().recenter_counter
+    }
+
+    // Current STAGE epoch, see bump_stage_epoch()
+    pub fn stage_epoch() -> u32 {
+        TRACKING_EXTRAS_WRITER.lock().stage_epoch
     }
 
     // The client (re)established its STAGE space (new playspace, reference space change or

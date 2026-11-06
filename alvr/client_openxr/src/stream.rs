@@ -380,6 +380,10 @@ impl StreamContext {
         }
     }
 
+    pub fn stage_reference_space(&self) -> Arc<xr::Space> {
+        Arc::clone(&self.stage_reference_space)
+    }
+
     pub fn update_real_time_config(&mut self, config: &RealTimeConfig) {
         self.config.passthrough = config.passthrough.clone();
         self.config.clientside_post_processing = config.clientside_post_processing.clone();

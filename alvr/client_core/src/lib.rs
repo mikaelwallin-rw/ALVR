@@ -25,8 +25,8 @@ use alvr_common::{
     warn,
 };
 use alvr_packets::{
-    BatteryInfo, ButtonEntry, CameraFrame, CameraFramesConfig, ClientControlPacket, OpaqueRegion,
-    RealTimeConfig, StreamConfig, TrackingData,
+    BatteryInfo, ButtonEntry, CameraFrame, CameraFramesConfig, ClientControlPacket, NativeQuad,
+    OpaqueRegion, RealTimeConfig, StreamConfig, TrackingData,
 };
 use alvr_session::CodecType;
 use alvr_system_info::Platform;
@@ -59,6 +59,8 @@ pub enum ClientCoreEvent {
     RealTimeConfig(RealTimeConfig),
     // None stops the camera frames
     CameraFrames(Option<CameraFramesConfig>),
+    // Debug reference quads to draw as native layers (empty = none)
+    NativeQuads(Vec<NativeQuad>),
 }
 
 // Note: this struct may change without breaking network protocol changes

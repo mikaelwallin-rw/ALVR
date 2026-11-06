@@ -5,6 +5,7 @@ mod graphics;
 mod input_diagnostics;
 mod interaction;
 mod lobby;
+mod native_quads;
 mod passthrough;
 mod stream;
 
@@ -26,6 +27,7 @@ use extra_extensions::{
 };
 use interaction::{InteractionContext, InteractionSourcesConfig};
 use lobby::Lobby;
+use native_quads::NativeQuadLayers;
 use openxr as xr;
 use passthrough::PassthroughLayer;
 use std::{collections::HashSet, ffi::CStr, path::Path, rc::Rc, sync::Arc, thread, time::Duration};
@@ -417,6 +419,7 @@ pub fn entry_point() {
         let mut session_running = false;
         let mut stream_context = None::<StreamContext>;
         let mut passthrough_layer = None;
+        let mut native_quads = NativeQuadLayers::default();
 
         let mut event_storage = xr::EventDataBuffer::new();
         let mut headset_is_worn = true;
@@ -529,6 +532,7 @@ pub fn entry_point() {
                             .write()
                             .select_sources(&lobby_interaction_sources);
 
+                        native_quads.clear();
                         stream_context = None;
                     }
                     ClientCoreEvent::Haptics {
@@ -561,6 +565,9 @@ pub fn entry_point() {
                         if let Some(stream) = &mut stream_context {
                             stream.set_camera_frames(config);
                         }
+                    }
+                    ClientCoreEvent::NativeQuads(quads) => {
+                        native_quads.set(&xr_session, &graphics_context, quads);
                     }
                     ClientCoreEvent::RealTimeConfig(config) => {
                         if config.passthrough.is_some() && passthrough_layer.is_none() {
@@ -620,6 +627,11 @@ pub fn entry_point() {
                 continue;
             }
 
+            // Debug reference quads live in the stream's STAGE space (recreated on playspace changes)
+            let native_quads_space = stream_context
+                .as_ref()
+                .map(StreamContext::stage_reference_space);
+
             // todo: allow rendering lobby and stream layers at the same time and add cross fade
             let (layer, display_time) = if let Some(stream) = &mut stream_context {
                 stream.render(frame_interval, vsync_time)
@@ -627,18 +639,25 @@ pub fn entry_point() {
                 (lobby.render(vsync_time), vsync_time)
             };
 
-            let layers: &[&xr::CompositionLayerBase<_>] =
-                if let Some(passthrough_layer) = &passthrough_layer {
-                    &[passthrough_layer, &layer.build()]
-                } else {
-                    &[&layer.build()]
-                };
+            let projection_layer = layer.build();
+            let quad_layers = native_quads_space
+                .as_deref()
+                .map(|space| native_quads.build(space))
+                .unwrap_or_default();
+            let mut layers: Vec<&xr::CompositionLayerBase<_>> =
+                Vec::with_capacity(2 + quad_layers.len());
+            if let Some(passthrough_layer) = &passthrough_layer {
+                layers.push(passthrough_layer);
+            }
+            layers.push(&projection_layer);
+            // On top of the stream: debug reference, always visible
+            layers.extend(quad_layers.iter().map(|layer| &**layer));
 
             graphics_context.make_current();
             let res = xr_frame_stream.end(
                 to_xr_time(display_time),
                 xr::EnvironmentBlendMode::OPAQUE,
-                layers,
+                &layers,
             );
 
             if let Err(e) = res {

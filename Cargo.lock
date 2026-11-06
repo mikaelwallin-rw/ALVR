@@ -263,6 +263,7 @@ dependencies = [
  "alvr_session",
  "alvr_system_info",
  "android-activity",
+ "glow 0.16.0",
  "jni 0.22.4",
  "jpeg-encoder",
  "libc",

@@ -188,6 +188,27 @@ pub struct CameraFrame {
     pub jpeg: Vec<u8>,
 }
 
+/// Debug reference quad drawn natively by the client (OpenXR quad layer) with a procedural
+/// chessboard texture, requested by an overlay app
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct NativeQuad {
+    /// Quad centre in the client STAGE space. The quad lies in the local XY plane, front face +Z,
+    /// texture top toward +Y.
+    pub pose: Pose,
+    /// Full size in meters
+    pub width: f32,
+    pub height: f32,
+    /// Chessboard squares across the width and the height
+    pub columns: u32,
+    pub rows: u32,
+    /// RGBA colors: squares starting top-left, the other squares, and the border
+    pub dark_color: [u8; 4],
+    pub light_color: [u8; 4],
+    pub outline_color: [u8; 4],
+    /// Border width in texture pixels
+    pub outline_pixels: u32,
+}
+
 #[derive(Serialize, Deserialize)]
 pub enum ServerControlPacket {
     StartStream,
@@ -199,6 +220,8 @@ pub enum ServerControlPacket {
     ReservedBuffer(Vec<u8>),
     // None stops the frames
     CameraFrames(Option<CameraFramesConfig>),
+    // Replaces the debug native quads (empty = none)
+    NativeQuads(Vec<NativeQuad>),
 }
 
 #[derive(Serialize, Deserialize, Clone)]
