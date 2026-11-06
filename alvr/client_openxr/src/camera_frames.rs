@@ -27,6 +27,88 @@ const ERROR_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 // Frames per run whose raw poses are logged (CAMPOSE_DIAG) to validate the camera extrinsics
 const POSE_DIAG_FRAMES: u64 = 10;
 
+// Rectified camera poses relative to the head (VIEW space), OpenCV camera axes, per headset
+// model (Android product name). The camera pose reported by SecureMR is relative to SecureMR's
+// own LOCAL space, which does not always match the app's LOCAL space: on a PICO 4 Ultra Enterprise
+// both were identical, and after the runtime re-established its spaces SecureMR's was 8.66 cm
+// away (same rotation). The camera pose is therefore derived from the head pose with these
+// extrinsics. Measured by hand-eye calibration of CAMPOSE_DIAG data (head rotation up to 75
+// degrees, residual below 1 mm, equal in both space regimes to 0.1 mm). Both cameras share one
+// rotation; baseline 64.1 mm.
+const CAMERA_EXTRINSICS: &[(&str, CameraExtrinsics)] = &[(
+    "PICO 4 Ultra Enterprise",
+    CameraExtrinsics {
+        left: Pose {
+            orientation: Quat::from_xyzw(-0.999_959, 0.006_915, 0.001_195, 0.005_793),
+            position: Vec3::new(-0.032_15, 0.039_04, -0.034_95),
+        },
+        right: Pose {
+            orientation: Quat::from_xyzw(-0.999_959, 0.006_835, 0.001_114, 0.005_780),
+            position: Vec3::new(0.031_97, 0.038_16, -0.035_14),
+        },
+    },
+)];
+
+#[derive(Clone, Copy)]
+struct CameraExtrinsics {
+    left: Pose,
+    right: Pose,
+}
+
+impl CameraExtrinsics {
+    fn view_from_camera(&self, eye: CameraEye) -> Pose {
+        let pose = match eye {
+            CameraEye::Left => self.left,
+            CameraEye::Right => self.right,
+        };
+
+        Pose {
+            orientation: pose.orientation.normalize(),
+            position: pose.position,
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+fn product_name() -> String {
+    alvr_system_info::android::product_name()
+}
+
+#[cfg(not(target_os = "android"))]
+fn product_name() -> String {
+    String::new()
+}
+
+fn camera_extrinsics() -> Option<CameraExtrinsics> {
+    let product = product_name();
+    let extrinsics = CAMERA_EXTRINSICS
+        .iter()
+        .find(|(name, _)| *name == product)
+        .map(|(_, extrinsics)| *extrinsics);
+    if extrinsics.is_none() {
+        warn!(
+            "Camera frames: no camera extrinsics for {product:?}, using the SecureMR camera pose \
+            (may be offset if SecureMR's LOCAL space differs from the app's)"
+        );
+    }
+
+    extrinsics
+}
+
+struct ReferenceSpaces<'a> {
+    local: &'a xr::Space,
+    view: &'a xr::Space,
+    stage: &'a xr::Space,
+}
+
+#[derive(Clone, Copy)]
+struct PoseDiagnostics {
+    // Raw poses (CAMPOSE_DIAG)
+    log_poses: bool,
+    // Difference between the SecureMR and the extrinsics camera pose (CAMPOSE_DIFF)
+    log_path_difference: bool,
+}
+
 pub struct CameraFrameSource {
     running: Arc<RelaxedAtomic>,
     thread: Option<JoinHandle<()>>,
@@ -105,9 +187,16 @@ fn capture_loop(
             return;
         }
     };
+    let extrinsics = camera_extrinsics();
     info!(
-        "Camera frames: started, {0}x{0} every {1:?}",
-        config.image_size, config.interval
+        "Camera frames: started, {0}x{0} every {1:?}, camera pose from {2}",
+        config.image_size,
+        config.interval,
+        if extrinsics.is_some() {
+            "the head pose and the model's extrinsics"
+        } else {
+            "SecureMR"
+        }
     );
 
     let started = Instant::now();
@@ -120,12 +209,19 @@ fn capture_loop(
         let frame = result.and_then(|capture| {
             make_frame(
                 xr_session.instance(),
-                &local_reference_space,
-                &view_reference_space,
-                stage_reference_space,
+                &ReferenceSpaces {
+                    local: &local_reference_space,
+                    view: &view_reference_space,
+                    stage: stage_reference_space,
+                },
                 capture,
                 config.eye,
-                sent_count < POSE_DIAG_FRAMES,
+                extrinsics,
+                PoseDiagnostics {
+                    log_poses: sent_count < POSE_DIAG_FRAMES,
+                    // Once per run: the first frame after the warm-up
+                    log_path_difference: sent_count == 0 && started.elapsed() > WARMUP,
+                },
             )
         });
 
@@ -194,12 +290,11 @@ fn pose_text(pose: Pose) -> String {
 
 fn make_frame(
     instance: &xr::Instance,
-    local_reference_space: &xr::Space,
-    view_reference_space: &xr::Space,
-    stage_reference_space: &xr::Space,
+    spaces: &ReferenceSpaces,
     capture: CameraCapture,
     eye: CameraEye,
-    log_poses: bool,
+    extrinsics: Option<CameraExtrinsics>,
+    diagnostics: PoseDiagnostics,
 ) -> Result<CameraFrame, String> {
     let capture_time = to_runtime_time(instance, capture.timestamp)?;
 
@@ -213,8 +308,9 @@ fn make_frame(
         ));
     }
 
-    let stage_from_local = local_reference_space
-        .locate(stage_reference_space, capture_time)
+    let stage_from_local = spaces
+        .local
+        .locate(spaces.stage, capture_time)
         .map_err(|e| format!("cannot locate LOCAL in STAGE: {e}"))?;
     if !stage_from_local.location_flags.contains(
         xr::SpaceLocationFlags::POSITION_VALID | xr::SpaceLocationFlags::ORIENTATION_VALID,
@@ -239,8 +335,9 @@ fn make_frame(
     }
 
     // Head pose and velocity at capture time: angular speed indicates motion blur
-    let (view_location, view_velocity) = view_reference_space
-        .relate(stage_reference_space, capture_time)
+    let (view_location, view_velocity) = spaces
+        .view
+        .relate(spaces.stage, capture_time)
         .map_err(|e| format!("cannot locate VIEW in STAGE: {e}"))?;
     let head_angular_speed = if view_velocity
         .velocity_flags
@@ -251,8 +348,21 @@ fn make_frame(
         0.0
     };
 
-    if log_poses {
-        let stage_from_view = crate::from_xr_pose(view_location.pose);
+    let stage_from_view = crate::from_xr_pose(view_location.pose);
+    let securemr_stage_from_camera = stage_from_local * local_from_camera;
+    let stage_from_camera = if let Some(extrinsics) = extrinsics {
+        if !view_location.location_flags.contains(
+            xr::SpaceLocationFlags::POSITION_VALID | xr::SpaceLocationFlags::ORIENTATION_VALID,
+        ) {
+            return Err("VIEW is not located in STAGE".into());
+        }
+
+        stage_from_view * extrinsics.view_from_camera(eye)
+    } else {
+        securemr_stage_from_camera
+    };
+
+    if diagnostics.log_poses {
         info!(
             "CAMPOSE_DIAG eye={eye:?} t={} stage_from_view {} | stage_from_local {} | securemr_local_from_cam_cv {} | raw_m {:?}",
             capture_time.as_nanos(),
@@ -260,6 +370,22 @@ fn make_frame(
             pose_text(stage_from_local),
             pose_text(local_from_camera),
             m
+        );
+    }
+    if diagnostics.log_path_difference && extrinsics.is_some() {
+        // Nonzero when SecureMR's LOCAL space differs from the app's (or the extrinsics are off)
+        let difference = securemr_stage_from_camera.position - stage_from_camera.position;
+        let angle = securemr_stage_from_camera
+            .orientation
+            .angle_between(stage_from_camera.orientation);
+        info!(
+            "CAMPOSE_DIFF eye={eye:?} securemr - extrinsics: position ({:.1}, {:.1}, {:.1}) cm \
+            (|{:.1}| cm), rotation {:.2} deg",
+            difference.x * 100.0,
+            difference.y * 100.0,
+            difference.z * 100.0,
+            difference.length() * 100.0,
+            angle.to_degrees()
         );
     }
 
@@ -289,7 +415,7 @@ fn make_frame(
         fy: k[4],
         cx: k[2],
         cy: k[5],
-        stage_from_camera: stage_from_local * local_from_camera,
+        stage_from_camera,
         head_angular_speed,
         jpeg,
     })
