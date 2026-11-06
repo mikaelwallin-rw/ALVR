@@ -303,6 +303,8 @@ pub extern "C" fn alvr_poll_event(out_event: *mut AlvrEvent) -> bool {
                 }
             }
             ClientCoreEvent::RealTimeConfig(_) => AlvrEvent::RealTimeConfig {},
+            // Camera frames are only produced by the OpenXR client
+            ClientCoreEvent::CameraFrames(_) => return false,
         };
 
         unsafe { *out_event = event };

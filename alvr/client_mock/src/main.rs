@@ -261,7 +261,9 @@ fn client_thread(
 
                     window_output.decoder_codec = Some(codec);
                 }
-                ClientCoreEvent::Haptics { .. } | ClientCoreEvent::RealTimeConfig(_) => (),
+                ClientCoreEvent::Haptics { .. }
+                | ClientCoreEvent::RealTimeConfig(_)
+                | ClientCoreEvent::CameraFrames(_) => (),
             }
 
             output_sender.send(window_output.clone()).ok();

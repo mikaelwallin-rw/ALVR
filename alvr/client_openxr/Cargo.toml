@@ -18,6 +18,7 @@ alvr_session.workspace = true
 alvr_system_info.workspace = true
 
 jni = "0.22"
+jpeg-encoder = "0.7"
 openxr = "0.21"
 
 [target.'cfg(target_os = "android")'.dependencies]
@@ -71,6 +72,9 @@ name = "android.permission.RECORD_AUDIO"
 # https://developer.android.com/reference/android/net/wifi/WifiManager.WifiLock
 [[package.metadata.android.uses_permission]]
 name = "android.permission.WAKE_LOCK"
+# Pico: headset camera frames through SecureMR (overlay calibration)
+[[package.metadata.android.uses_permission]]
+name = "android.permission.CAMERA"
 [[package.metadata.android.uses_permission]]
 name = "org.khronos.openxr.permission.OPENXR"
 [[package.metadata.android.uses_permission]]
@@ -202,6 +206,10 @@ value = "OpenXR"
 [[package.metadata.android.application.meta_data]]
 name = "pxr.sdk.version_code"
 value = "5900"
+# Enables XR_PICO_secure_mixed_reality (headset camera frames)
+[[package.metadata.android.application.meta_data]]
+name = "pvr.app.secure_mr"
+value = "1"
 
 # Yvr entries
 [[package.metadata.android.application.meta_data]]

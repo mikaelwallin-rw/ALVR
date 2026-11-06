@@ -1,6 +1,7 @@
 use crate::{
     ConnectionContext, FILESYSTEM_LAYOUT, SESSION_MANAGER, ServerCoreEvent,
     bitrate::BitrateManager,
+    camera_frames,
     hand_gestures::HandGestureManager,
     input_mapping::ButtonMappingManager,
     sockets::WelcomeSocket,
@@ -20,9 +21,10 @@ use alvr_common::{
 };
 use alvr_events::{AdbEvent, ButtonEvent, EventType};
 use alvr_packets::{
-    AUDIO, ClientConnectionResult, ClientConnectionsAction, ClientControlPacket, ClientStatistics,
-    HAPTICS, NegotiatedStreamingConfig, NegotiatedStreamingConfigExt, RealTimeConfig, STATISTICS,
-    ServerControlPacket, StreamConfigPacket, TRACKING, TrackingData, VIDEO, VideoPacketHeader,
+    AUDIO, CameraEye, CameraFramesConfig, ClientConnectionResult, ClientConnectionsAction,
+    ClientControlPacket, ClientStatistics, HAPTICS, NegotiatedStreamingConfig,
+    NegotiatedStreamingConfigExt, RealTimeConfig, STATISTICS, ServerControlPacket,
+    StreamConfigPacket, TRACKING, TrackingData, VIDEO, VideoPacketHeader,
 };
 use alvr_session::{
     BodyTrackingSinkConfig, CodecType, ControllersEmulationMode, FrameSize, H264Profile,
@@ -45,6 +47,10 @@ const RETRY_CONNECT_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const HANDSHAKE_ACTION_TIMEOUT: Duration = Duration::from_secs(2);
 pub const STREAMING_RECV_TIMEOUT: Duration = Duration::from_millis(500);
 const REAL_TIME_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+// Headset camera frames for overlay calibration (see VrCameraFrame.h): full rectified resolution,
+// a few frames per second
+const CAMERA_FRAME_SIZE: u32 = 2048;
+const CAMERA_FRAME_INTERVAL: Duration = Duration::from_millis(250);
 
 const MAX_UNREAD_PACKETS: usize = 10; // Applies per stream
 
@@ -1192,7 +1198,31 @@ fn connection_pipeline(
         let disconnect_notif = Arc::clone(&disconnect_notif);
         let client_hostname = client_hostname.clone();
         move || {
+            // Last camera frames request sent to the client (the client starts without one)
+            let mut sent_camera_frames = None;
+
             while is_streaming(&client_hostname) {
+                let camera_frames = tracking_extras::camera_frames_request().map(|right_camera| {
+                    CameraFramesConfig {
+                        image_size: CAMERA_FRAME_SIZE,
+                        interval: CAMERA_FRAME_INTERVAL,
+                        eye: if right_camera {
+                            CameraEye::Right
+                        } else {
+                            CameraEye::Left
+                        },
+                    }
+                });
+                if camera_frames != sent_camera_frames
+                    && control_sender
+                        .lock()
+                        .send(&ServerControlPacket::CameraFrames(camera_frames))
+                        .is_ok()
+                {
+                    info!("Camera frames request sent to the client: {camera_frames:?}");
+                    sent_camera_frames = camera_frames;
+                }
+
                 if let Err(e) = control_sender.lock().send(&ServerControlPacket::KeepAlive) {
                     info!("Client disconnected. Cause: {e:?}");
 
@@ -1371,6 +1401,11 @@ fn connection_pipeline(
                         ctx.events_sender
                             .send(ServerCoreEvent::ProximityState(headset_is_worn))
                             .ok();
+                    }
+                    ClientControlPacket::CameraFrame(frame) => {
+                        if let Err(e) = camera_frames::publish_frame(&frame) {
+                            warn!("Camera frame dropped: {e:?}");
+                        }
                     }
                     ClientControlPacket::Reserved(_) | ClientControlPacket::ReservedBuffer(_) => (),
                 }

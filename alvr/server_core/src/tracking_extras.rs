@@ -40,10 +40,24 @@ pub(crate) fn to_matrix(pose: Pose) -> [[f32; 4]; 3] {
 }
 
 #[cfg(windows)]
-pub use windows_impl::{TRACKING_EXTRAS_WRITER, bump_stage_epoch, report_tracking};
+pub use windows_impl::{
+    TRACKING_EXTRAS_WRITER, bump_stage_epoch, camera_frames_request, recenter_counter,
+    report_tracking,
+};
 
 #[cfg(not(windows))]
 pub fn report_tracking(_driver_from_stage: Pose, _fingertips: [Option<Pose>; 2]) {}
+
+// Camera frames requested by the overlay: Some(use the right camera)
+#[cfg(not(windows))]
+pub fn camera_frames_request() -> Option<bool> {
+    None
+}
+
+#[cfg(not(windows))]
+pub fn recenter_counter() -> u32 {
+    0
+}
 
 #[cfg(not(windows))]
 pub fn bump_stage_epoch() {}
@@ -67,6 +81,7 @@ impl TrackingExtrasHeartbeat {
                     while running.load(Ordering::Relaxed) {
                         #[cfg(windows)]
                         TRACKING_EXTRAS_WRITER.lock().refresh();
+                        crate::camera_frames::refresh_heartbeat();
 
                         thread::sleep(HEARTBEAT_INTERVAL);
                     }
@@ -131,6 +146,9 @@ mod windows_impl {
     const MARKER_STATUS_UNSUPPORTED: u32 = 3;
     // VrTrackingRequestBlock::requestMarkers is a bit set
     const REQUEST_MARKERS_BIT: u32 = 1;
+    const REQUEST_FRAMES_BIT: u32 = 2;
+    // With REQUEST_FRAMES_BIT: frames from the right camera instead of the left one
+    const REQUEST_RIGHT_CAMERA_BIT: u32 = 4;
 
     #[repr(C, packed(4))]
     #[derive(Clone, Copy, Default)]
@@ -187,6 +205,19 @@ mod windows_impl {
 
     pub static TRACKING_EXTRAS_WRITER: Mutex<TrackingExtrasWriter> =
         Mutex::new(TrackingExtrasWriter::new());
+
+    // Camera frames requested by the overlay: Some(use the right camera)
+    pub fn camera_frames_request() -> Option<bool> {
+        let writer = TRACKING_EXTRAS_WRITER.lock();
+        writer
+            .frames_requested
+            .then_some(writer.frames_right_camera)
+    }
+
+    // Incremented whenever the stage -> driver transform changes
+    pub fn recenter_counter() -> u32 {
+        TRACKING_EXTRAS_WRITER.lock().recenter_counter
+    }
 
     // The client (re)established its STAGE space (new playspace, reference space change or
     // reconnection): poses stored in stage or driver space from before are no longer valid
@@ -275,6 +306,8 @@ mod windows_impl {
         recenter_counter: u32,
         fingertips: [FingertipState; 2],
         marker_status: u32,
+        frames_requested: bool,
+        frames_right_camera: bool,
         stage_epoch: u32,
     }
 
@@ -294,6 +327,8 @@ mod windows_impl {
                     changed_ms: 0,
                 }; 2],
                 marker_status: MARKER_STATUS_OFF,
+                frames_requested: false,
+                frames_right_camera: false,
                 stage_epoch: 0,
             }
         }
@@ -335,6 +370,18 @@ mod windows_impl {
         // Heartbeat: re-read the request and republish
         pub fn refresh(&mut self) {
             let request_flags = self.read_request().map_or(0, |r| r.request_markers);
+
+            let frames_requested = request_flags & REQUEST_FRAMES_BIT != 0;
+            let frames_right_camera = request_flags & REQUEST_RIGHT_CAMERA_BIT != 0;
+            if (frames_requested, frames_right_camera)
+                != (self.frames_requested, self.frames_right_camera)
+            {
+                info!(
+                    "Tracking extras: camera frames requested: {frames_requested} (right camera: {frames_right_camera})"
+                );
+                self.frames_requested = frames_requested;
+                self.frames_right_camera = frames_right_camera;
+            }
 
             let marker_status = if request_flags & REQUEST_MARKERS_BIT != 0 {
                 MARKER_STATUS_UNSUPPORTED

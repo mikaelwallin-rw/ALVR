@@ -528,6 +528,11 @@ fn connection_pipeline(
                             .lock()
                             .push_back(ClientCoreEvent::RealTimeConfig(config));
                     }
+                    Ok(ServerControlPacket::CameraFrames(config)) => {
+                        event_queue
+                            .lock()
+                            .push_back(ClientCoreEvent::CameraFrames(config));
+                    }
                     Ok(ServerControlPacket::StartStream) => {
                         error!("Unexpected StartStream paceket");
                     }

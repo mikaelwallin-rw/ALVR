@@ -9,6 +9,7 @@ mod motion_tracking_bd;
 mod multimodal_input;
 mod passthrough_fb;
 mod passthrough_htc;
+mod secure_mr_camera;
 mod spatial_marker_tracking;
 
 pub use body_tracking_bd::*;
@@ -22,6 +23,7 @@ pub use motion_tracking_bd::*;
 pub use multimodal_input::*;
 pub use passthrough_fb::*;
 pub use passthrough_htc::*;
+pub use secure_mr_camera::*;
 pub use spatial_marker_tracking::*;
 
 use openxr::{self as xr, AsHandle, sys};

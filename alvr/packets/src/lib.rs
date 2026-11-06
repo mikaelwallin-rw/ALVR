@@ -150,6 +150,44 @@ pub struct DecoderInitializationConfig {
     pub ext_str: String,
 }
 
+/// Headset camera frames requested by an overlay app (e.g. for monitor calibration)
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct CameraFramesConfig {
+    /// Side of the square, rectified camera image, in pixels
+    pub image_size: u32,
+    /// Minimum time between frames
+    pub interval: Duration,
+    pub eye: CameraEye,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CameraEye {
+    Left,
+    Right,
+}
+
+/// One rectified headset camera image, as grayscale JPEG
+#[derive(Serialize, Deserialize)]
+pub struct CameraFrame {
+    /// Headset runtime time (XrTime) when the image was taken
+    pub capture_time: Duration,
+    pub eye: CameraEye,
+    pub width: u32,
+    pub height: u32,
+    /// Pinhole intrinsics of exactly this image, in pixels. The image is rectified (no
+    /// distortion).
+    pub fx: f32,
+    pub fy: f32,
+    pub cx: f32,
+    pub cy: f32,
+    /// Camera pose in the client STAGE space at capture time, with OpenCV camera axes (+X right,
+    /// +Y down, +Z viewing direction)
+    pub stage_from_camera: Pose,
+    /// Head angular speed at capture time, in radians per second (motion blur indicator)
+    pub head_angular_speed: f32,
+    pub jpeg: Vec<u8>,
+}
+
 #[derive(Serialize, Deserialize)]
 pub enum ServerControlPacket {
     StartStream,
@@ -159,6 +197,8 @@ pub enum ServerControlPacket {
     RealTimeConfig(RealTimeConfig),
     Reserved(String),
     ReservedBuffer(Vec<u8>),
+    // None stops the frames
+    CameraFrames(Option<CameraFramesConfig>),
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -201,6 +241,7 @@ pub enum ClientControlPacket {
     ProximityState(bool),
     Reserved(String),
     ReservedBuffer(Vec<u8>),
+    CameraFrame(Box<CameraFrame>),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

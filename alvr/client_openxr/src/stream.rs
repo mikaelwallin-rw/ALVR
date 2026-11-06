@@ -1,4 +1,5 @@
 use crate::{
+    camera_frames::CameraFrameSource,
     graphics::{self, ProjectionLayerAlphaConfig, ProjectionLayerBuilder},
     interaction::{self, InteractionContext, InteractionSourcesConfig},
 };
@@ -18,7 +19,7 @@ use alvr_common::{
 use alvr_graphics::{
     GraphicsContext, OpaqueRegionGeometry, OpaqueRegionsParams, StreamRenderer, StreamViewParams,
 };
-use alvr_packets::{OpaqueRegion, RealTimeConfig, StreamConfig, TrackingData};
+use alvr_packets::{CameraFramesConfig, OpaqueRegion, RealTimeConfig, StreamConfig, TrackingData};
 use alvr_session::{
     ClientsideFoveationConfig, ClientsideFoveationMode, ClientsidePostProcessingConfig, CodecType,
     FoveatedEncodingConfig, MediacodecProperty, PassthroughMode, UpscalingConfig,
@@ -110,6 +111,8 @@ pub struct StreamContext {
     renderer: StreamRenderer,
     decoder: Option<(VideoDecoderConfig, VideoDecoderSource)>,
     use_custom_reprojection: bool,
+    // Running while the server requests headset camera frames
+    camera_frames: Option<(CameraFramesConfig, CameraFrameSource)>,
 }
 
 impl StreamContext {
@@ -240,6 +243,7 @@ impl StreamContext {
 
         let mut this = StreamContext {
             use_custom_reprojection: core_ctx.platform().is_yvr(),
+            camera_frames: None,
             core_context: core_ctx,
             xr_session,
             interaction_context: interaction_ctx,
@@ -345,6 +349,33 @@ impl StreamContext {
 
             self.core_context.set_decoder_input_callback(Box::new(
                 move |timestamp, buffer| -> bool { sink.push_nal(timestamp, buffer) },
+            ));
+        }
+    }
+
+    // Starts, restarts (new config) or stops the headset camera frames
+    pub fn set_camera_frames(&mut self, config: Option<CameraFramesConfig>) {
+        if self.camera_frames.as_ref().map(|(current, _)| *current) == config {
+            return;
+        }
+
+        // Stop the current source first: only one SecureMR camera at a time
+        self.camera_frames = None;
+
+        if let Some(config) = config {
+            if !self.core_context.platform().is_pico() {
+                alvr_common::warn!("Camera frames are only supported on Pico");
+                return;
+            }
+
+            self.camera_frames = Some((
+                config,
+                CameraFrameSource::new(
+                    Arc::clone(&self.core_context),
+                    self.xr_session.clone(),
+                    Arc::clone(&self.stage_reference_space),
+                    config,
+                ),
             ));
         }
     }

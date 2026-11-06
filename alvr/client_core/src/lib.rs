@@ -25,8 +25,8 @@ use alvr_common::{
     warn,
 };
 use alvr_packets::{
-    BatteryInfo, ButtonEntry, ClientControlPacket, OpaqueRegion, RealTimeConfig, StreamConfig,
-    TrackingData,
+    BatteryInfo, ButtonEntry, CameraFrame, CameraFramesConfig, ClientControlPacket, OpaqueRegion,
+    RealTimeConfig, StreamConfig, TrackingData,
 };
 use alvr_session::CodecType;
 use alvr_system_info::Platform;
@@ -57,6 +57,8 @@ pub enum ClientCoreEvent {
         config_nal: Vec<u8>,
     },
     RealTimeConfig(RealTimeConfig),
+    // None stops the camera frames
+    CameraFrames(Option<CameraFramesConfig>),
 }
 
 // Note: this struct may change without breaking network protocol changes
@@ -274,6 +276,16 @@ impl ClientCoreContext {
             if let Some(stats) = &mut *self.connection_context.statistics_manager.lock() {
                 stats.report_input_acquired(data.poll_timestamp);
             }
+        }
+    }
+
+    pub fn send_camera_frame(&self, frame: CameraFrame) {
+        dbg_client_core!("send_camera_frame");
+
+        if let Some(sender) = &mut *self.connection_context.control_sender.lock() {
+            sender
+                .send(&ClientControlPacket::CameraFrame(Box::new(frame)))
+                .ok();
         }
     }
 

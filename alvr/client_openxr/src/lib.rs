@@ -1,4 +1,5 @@
 mod c_api;
+mod camera_frames;
 mod extra_extensions;
 mod graphics;
 mod input_diagnostics;
@@ -21,7 +22,7 @@ use alvr_session::{BodyTrackingBDConfig, BodyTrackingSourcesConfig, PerformanceL
 use alvr_system_info::Platform;
 use extra_extensions::{
     BD_MOTION_TRACKING_EXTENSION_NAME, META_BODY_TRACKING_FIDELITY_EXTENSION_NAME,
-    PICO_CONFIGURATION_EXTENSION_NAME,
+    PICO_CONFIGURATION_EXTENSION_NAME, READBACK_TENSOR_EXTENSION_NAME, SECURE_MR_EXTENSION_NAME,
 };
 use interaction::{InteractionContext, InteractionSourcesConfig};
 use lobby::Lobby;
@@ -246,6 +247,14 @@ pub fn entry_point() {
     ]
     .into_iter()
     .map(|s| s.as_bytes().to_vec())
+    // Note: the names reported by the runtime (and used by intersection() below) are nul
+    // terminated, so the names above never match and stay disabled. The SecureMR names are
+    // nul terminated so that they do get enabled.
+    .chain(
+        [SECURE_MR_EXTENSION_NAME, READBACK_TENSOR_EXTENSION_NAME]
+            .into_iter()
+            .map(|s| format!("{s}\0").into_bytes()),
+    )
     .collect();
 
     selected_exts = selected_exts.intersection(&available_exts);
@@ -546,6 +555,11 @@ pub fn entry_point() {
                     ClientCoreEvent::DecoderConfig { codec, config_nal } => {
                         if let Some(stream) = &mut stream_context {
                             stream.maybe_initialize_decoder(codec, config_nal);
+                        }
+                    }
+                    ClientCoreEvent::CameraFrames(config) => {
+                        if let Some(stream) = &mut stream_context {
+                            stream.set_camera_frames(config);
                         }
                     }
                     ClientCoreEvent::RealTimeConfig(config) => {

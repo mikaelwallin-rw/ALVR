@@ -1,5 +1,6 @@
 mod bitrate;
 mod c_api;
+mod camera_frames;
 mod connection;
 mod hand_gestures;
 mod haptics;
