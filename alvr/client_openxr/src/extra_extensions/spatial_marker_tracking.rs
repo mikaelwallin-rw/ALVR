@@ -16,6 +16,69 @@ const QR_CODE_CAPABILITY: sys::SpatialCapabilityEXT =
 const MAX_MARKERS_COUNT: usize = 32;
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(1);
 
+const MAX_DIAG_CAPABILITIES: usize = 32;
+const MAX_DIAG_COMPONENT_TYPES: usize = 32;
+
+// Diagnostic: log which spatial capabilities (QR, ArUco, AprilTag, ...) the runtime supports and
+// their component types, so marker-tracking support can be checked without a test marker.
+pub fn log_spatial_capabilities(instance: &xr::Instance, system: xr::SystemId) {
+    let Some(fns) = instance.exts().ext_spatial_entity else {
+        alvr_common::info!("XR_DIAG spatial: XR_EXT_spatial_entity not enabled");
+        return;
+    };
+    alvr_common::info!(
+        "XR_DIAG spatial: XR_EXT_spatial_entity enabled, XR_EXT_spatial_marker_tracking {}",
+        if instance.exts().ext_spatial_marker_tracking.is_some() {
+            "enabled"
+        } else {
+            "NOT enabled"
+        }
+    );
+
+    let mut capabilities = [sys::SpatialCapabilityEXT::from_raw(0); MAX_DIAG_CAPABILITIES];
+    let mut count = 0;
+    let result = unsafe {
+        (fns.enumerate_spatial_capabilities)(
+            instance.as_raw(),
+            system,
+            capabilities.len() as u32,
+            &raw mut count,
+            capabilities.as_mut_ptr(),
+        )
+    };
+    if result != sys::Result::SUCCESS {
+        alvr_common::info!("XR_DIAG spatial: xrEnumerateSpatialCapabilitiesEXT failed: {result:?}");
+        return;
+    }
+
+    for capability in capabilities.iter().take(count as usize) {
+        let mut component_types =
+            [sys::SpatialComponentTypeEXT::from_raw(0); MAX_DIAG_COMPONENT_TYPES];
+        let mut components_info = sys::SpatialCapabilityComponentTypesEXT {
+            ty: sys::SpatialCapabilityComponentTypesEXT::TYPE,
+            next: ptr::null_mut(),
+            component_type_capacity_input: component_types.len() as u32,
+            component_type_count_output: 0,
+            component_types: component_types.as_mut_ptr(),
+        };
+        let result = unsafe {
+            (fns.enumerate_spatial_capability_component_types)(
+                instance.as_raw(),
+                system,
+                *capability,
+                &raw mut components_info,
+            )
+        };
+        let components = component_types
+            .iter()
+            .take(components_info.component_type_count_output as usize)
+            .collect::<Vec<_>>();
+        alvr_common::info!(
+            "XR_DIAG spatial capability: {capability:?} components: {components:?} ({result:?})"
+        );
+    }
+}
+
 struct SpatialContextReadyData {
     handle: sys::SpatialContextEXT,
     discovery_snapshot_future: Option<sys::FutureEXT>,
@@ -52,6 +115,7 @@ pub struct QRCodesSpatialContext {
     codes_to_track: HashSet<String>,
     context_state: SpatialContextState,
     discovery_timeout_deadline: Instant,
+    last_status: String,
 }
 
 impl QRCodesSpatialContext {
@@ -111,7 +175,16 @@ impl QRCodesSpatialContext {
             codes_to_track: strings_to_track,
             context_state: SpatialContextState::Creating(create_context_future),
             discovery_timeout_deadline: Instant::now(),
+            last_status: String::new(),
         })
+    }
+
+    // Logs the poll outcome only when it changes, so per-frame polling does not flood logcat
+    pub fn log_status_change(&mut self, status: String) {
+        if status != self.last_status {
+            alvr_common::info!("XR_DIAG marker context: {status}");
+            self.last_status = status;
+        }
     }
 
     pub fn poll(

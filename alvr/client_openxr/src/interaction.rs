@@ -1307,14 +1307,21 @@ pub fn get_marker_poses(
 ) -> Option<Vec<(String, Pose)>> {
     let xr_time = crate::to_xr_time(time);
 
-    context
-        .poll(reference_space, xr_time)
-        .ok()
-        .flatten()
-        .map(|markers| {
-            markers
-                .into_iter()
-                .map(|(id, pose)| (id, crate::from_xr_pose(pose)))
-                .collect()
-        })
+    let result = context.poll(reference_space, xr_time);
+    context.log_status_change(match &result {
+        Ok(None) => "pending".to_owned(),
+        Ok(Some(markers)) => format!(
+            "{} marker(s): {:?}",
+            markers.len(),
+            markers.iter().map(|(id, _)| id).collect::<Vec<_>>()
+        ),
+        Err(e) => format!("error {e:?}"),
+    });
+
+    result.ok().flatten().map(|markers| {
+        markers
+            .into_iter()
+            .map(|(id, pose)| (id, crate::from_xr_pose(pose)))
+            .collect()
+    })
 }

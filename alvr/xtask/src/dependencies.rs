@@ -349,6 +349,21 @@ fn get_android_openxr_loaders(selection: OpenXRLoadersSelection) {
         "libs/android.arm64-v8a",
     );
 
+    // PICO's own loader: unlike the loaders above it exposes the XR_PICO_* extensions (SecureMR,
+    // readback tensor). Pinned to the SecureMR-Samples commit it was validated with.
+    {
+        let sh = Shell::new().unwrap();
+        let destination_dir = afs::deps_dir().join("android_openxr/arm64-v8a");
+        fs::create_dir_all(&destination_dir).unwrap();
+        command::download(
+            &sh,
+            "https://raw.githubusercontent.com/Pico-Developer/SecureMR-Samples/\
+            02f7172b2cbddf0c31a9bda2b23df0f06b7b5a0b/external/openxr/lib/libopenxr_loader.so",
+            &destination_dir.join("libopenxr_loader_pico_sdk.so"),
+        )
+        .unwrap();
+    }
+
     if matches!(selection, OpenXRLoadersSelection::OnlyPico) {
         return;
     }

@@ -14,6 +14,7 @@ use alvr_common::{
     glam::{Quat, UVec2, Vec3},
     info,
     parking_lot::RwLock,
+    warn,
 };
 use alvr_graphics::GraphicsContext;
 use alvr_session::{BodyTrackingBDConfig, BodyTrackingSourcesConfig, PerformanceLevel};
@@ -168,13 +169,22 @@ pub fn entry_point() {
     let provisional_platform = alvr_system_info::platform(None, None);
     let (loader_suffix, openxr_version) = match provisional_platform {
         Platform::Quest1 => ("_quest1", LEGACY_OPENXR_VERSION),
-        p if p.is_pico() => ("_pico_old", LEGACY_OPENXR_VERSION),
+        // PICO's own loader exposes the XR_PICO_* extensions (SecureMR camera frames)
+        p if p.is_pico() => ("_pico_sdk", LEGACY_OPENXR_VERSION),
         p if p.is_vive() => ("", LEGACY_OPENXR_VERSION),
         p if p.is_yvr() => ("_yvr", LEGACY_OPENXR_VERSION),
         _ => ("", CURRENT_OPENXR_VERSION),
     };
-    let xr_entry = unsafe {
-        xr::Entry::load_from(Path::new(&format!("libopenxr_loader{loader_suffix}.so"))).unwrap()
+    let load_loader = |suffix: &str| unsafe {
+        xr::Entry::load_from(Path::new(&format!("libopenxr_loader{suffix}.so")))
+    };
+    let xr_entry = match load_loader(loader_suffix) {
+        Ok(entry) => entry,
+        Err(e) if provisional_platform.is_pico() => {
+            warn!("PICO OpenXR loader failed ({e}), falling back to the legacy loader");
+            load_loader("_pico_old").unwrap()
+        }
+        Err(e) => panic!("Cannot load the OpenXR loader: {e}"),
     };
 
     #[cfg(target_os = "android")]
@@ -296,6 +306,18 @@ pub fn entry_point() {
 
         let (xr_session, mut xr_frame_waiter, mut xr_frame_stream) =
             create_session(&xr_instance, xr_system, &graphics_context);
+
+        // Logged here rather than at startup: on Pico, log lines emitted before the session
+        // exists do not reach logcat. One line per entry keeps each record small.
+        for name in available_exts.names() {
+            if let Ok(name) = CStr::from_bytes_with_nul(name).map(CStr::to_string_lossy) {
+                info!("XR_DIAG extension available: {name}");
+            }
+        }
+        extra_extensions::log_spatial_capabilities(&xr_instance, xr_system);
+        for name in &other_exts {
+            info!("XR_DIAG extension enabled (other): {name}");
+        }
 
         let views_config = xr_instance
             .enumerate_view_configuration_views(
