@@ -11,6 +11,7 @@ use crate::{
     connection::STREAMING_RECV_TIMEOUT,
     hand_gestures::{self, HAND_GESTURE_BUTTON_SET, HandGestureManager},
     input_mapping::ButtonMappingManager,
+    tracking_extras,
 };
 use alvr_common::{
     AngleSlidingWindowAverage, ConnectionError, DEVICE_ID_TO_PATH, DeviceMotion, Pose,
@@ -35,6 +36,8 @@ use std::{
 };
 
 const DEG_TO_RAD: f32 = PI / 180.0;
+// XR_HAND_JOINT_INDEX_TIP_EXT
+const INDEX_TIP_JOINT: usize = 10;
 
 #[derive(Debug)]
 pub enum HandType {
@@ -177,6 +180,11 @@ impl TrackingManager {
         };
 
         self.inverse_recentering_origin = recentering_origin.inverse();
+    }
+
+    // Client STAGE space to OpenVR driver space
+    pub fn driver_from_stage(&self) -> Pose {
+        self.inverse_recentering_origin
     }
 
     pub fn recenter_pose(&self, pose: Pose) -> Pose {
@@ -470,6 +478,33 @@ pub fn tracking_loop(
             if let Some(skeleton) = tracking.hand_skeletons[1] {
                 tracking_manager_lock.report_hand_skeleton(HandType::Right, timestamp, skeleton);
             }
+
+            // Index fingertips for overlay apps: only while the hand drives a hand tracker, i.e.
+            // the hand is tracked and no controller motion is reported for it (same arbitration
+            // as the hand gestures below and the driver with separate hand trackers), and the tip
+            // joint itself is tracked
+            let fingertip =
+                |skeleton: Option<[Pose; 26]>, tip_tracked: bool, controller_id: u64| {
+                    skeleton
+                        .filter(|_| tip_tracked && !device_motion_keys.contains(&controller_id))
+                        // # Safety: constant index below the fixed joint count (26)
+                        .map(|joints| tracking_manager_lock.recenter_pose(joints[INDEX_TIP_JOINT]))
+                };
+            tracking_extras::report_tracking(
+                tracking_manager_lock.driver_from_stage(),
+                [
+                    fingertip(
+                        tracking.hand_skeletons[0],
+                        tracking.index_tips_tracked[0],
+                        *inp::HAND_LEFT_ID,
+                    ),
+                    fingertip(
+                        tracking.hand_skeletons[1],
+                        tracking.index_tips_tracked[1],
+                        *inp::HAND_RIGHT_ID,
+                    ),
+                ],
+            );
 
             if let Some(sink) = &mut face_tracking_sink {
                 sink.send_tracking(&tracking.face);

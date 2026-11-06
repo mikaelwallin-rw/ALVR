@@ -9,6 +9,7 @@ mod opaque_regions;
 mod sockets;
 mod statistics;
 mod tracking;
+mod tracking_extras;
 mod web_server;
 
 pub use c_api::*;
@@ -18,8 +19,9 @@ pub use tracking::HandType;
 use crate::connection::VideoPacket;
 use alvr_common::{
     ConnectionState, DEVICE_ID_TO_PATH, DeviceMotion, LifecycleState, Pose, RelaxedAtomic,
-    ViewParams, dbg_server_core, error, info,
+    ViewParams, dbg_server_core, error,
     glam::Vec2,
+    info,
     parking_lot::{Mutex, RwLock},
     settings_schema::Switch,
     warn,
@@ -189,6 +191,7 @@ pub struct ServerCoreContext {
     connection_context: Arc<ConnectionContext>,
     connection_thread: Arc<RwLock<Option<JoinHandle<()>>>>,
     webserver_runtime: Option<Runtime>,
+    _tracking_extras_heartbeat: tracking_extras::TrackingExtrasHeartbeat,
 }
 
 impl ServerCoreContext {
@@ -252,6 +255,7 @@ impl ServerCoreContext {
 
                 connection_thread: Arc::new(RwLock::new(None)),
                 webserver_runtime: Some(webserver_runtime),
+                _tracking_extras_heartbeat: tracking_extras::TrackingExtrasHeartbeat::start(),
             },
             events_receiver,
         )

@@ -763,6 +763,10 @@ fn stream_input_loop(
             face,
             body,
             markers,
+            index_tips_tracked: [
+                left_hand_data.skeleton_joints.is_some() && left_hand_data.index_tip_tracked,
+                right_hand_data.skeleton_joints.is_some() && right_hand_data.index_tip_tracked,
+            ],
         });
 
         let button_entries = {

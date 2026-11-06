@@ -177,6 +177,7 @@ fn tracking_thread(
             face: FaceData::default(),
             body: None,
             markers: vec![],
+            index_tips_tracked: [false; 2],
         });
 
         drop(input_lock);

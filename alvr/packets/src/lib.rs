@@ -231,6 +231,8 @@ pub struct TrackingData {
     pub face: FaceData,
     pub body: Option<BodySkeleton>,
     pub markers: Vec<(String, Pose)>,
+    // Per hand: the index tip joint in `hand_skeletons` has a valid and tracked position
+    pub index_tips_tracked: [bool; 2],
 }
 
 /// A region of the frame that must stay opaque when chroma keying, reported by an overlay app

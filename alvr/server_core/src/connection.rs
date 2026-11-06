@@ -6,6 +6,7 @@ use crate::{
     sockets::WelcomeSocket,
     statistics::StatisticsManager,
     tracking::{self, TrackingManager},
+    tracking_extras,
 };
 use alvr_adb::{WiredConnection, WiredConnectionStatus};
 use alvr_common::{
@@ -513,9 +514,7 @@ fn try_connect(
     // (stuck, reset). Removal is handled by a Drop guard inside the spawned
     // closure so it fires on panic unwind too -- panics are exactly the case
     // where the post-cleanup below would otherwise be skipped.
-    ctx.active_pipelines
-        .lock()
-        .insert(client_hostname.clone());
+    ctx.active_pipelines.lock().insert(client_hostname.clone());
 
     struct PipelineGuard {
         ctx: Arc<ConnectionContext>,
@@ -1256,6 +1255,9 @@ fn connection_pipeline(
 
                 match packet {
                     ClientControlPacket::PlayspaceSync(packet) => {
+                        // Sent on connection and whenever the client's STAGE is re-established
+                        tracking_extras::bump_stage_epoch();
+
                         if !initial_settings.headset.tracking_ref_only {
                             let session_manager_lock = SESSION_MANAGER.read();
                             let config = &session_manager_lock.settings().headset;

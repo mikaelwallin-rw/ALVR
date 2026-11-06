@@ -978,12 +978,19 @@ pub fn get_hand_data(
         None
     };
 
+    let mut index_tip_tracked = false;
     let skeleton_joints = if let Some(tracker) = &hand_source.skeleton_tracker
         && let Some(joint_locations) = reference_space
             .locate_hand_joints(tracker, xr_now)
             .ok()
             .flatten()
     {
+        index_tip_tracked = joint_locations[xr::HandJoint::INDEX_TIP]
+            .location_flags
+            .contains(
+                xr::SpaceLocationFlags::POSITION_VALID | xr::SpaceLocationFlags::POSITION_TRACKED,
+            );
+
         if joint_locations[0]
             .location_flags
             .contains(xr::SpaceLocationFlags::ORIENTATION_VALID)
@@ -1016,6 +1023,7 @@ pub fn get_hand_data(
         grip_motion,
         detached_grip_motion,
         skeleton_joints,
+        index_tip_tracked,
     }
 }
 
@@ -1059,6 +1067,7 @@ pub fn resolve_hand_sources(
 
     if controller_selected {
         hand_data.skeleton_joints = None;
+        hand_data.index_tip_tracked = false;
     }
 
     HandSourceSelection {

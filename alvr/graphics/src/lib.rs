@@ -38,6 +38,8 @@ pub struct HandData {
     pub grip_motion: Option<DeviceMotion>,
     pub detached_grip_motion: Option<DeviceMotion>,
     pub skeleton_joints: Option<[Pose; 26]>,
+    // The index tip joint is located with a valid and tracked position (not inferred or stale)
+    pub index_tip_tracked: bool,
 }
 
 pub fn check_error(gl: &gl::Context, message_context: &str) {

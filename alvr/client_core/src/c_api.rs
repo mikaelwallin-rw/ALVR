@@ -499,6 +499,8 @@ pub extern "C" fn alvr_send_tracking(
             },
             body: None,
             markers: Vec::new(),
+            // The C API carries no per-joint validity
+            index_tips_tracked: [false; 2],
         });
     }
 }
@@ -743,11 +745,13 @@ pub extern "C" fn alvr_render_lobby_opengl(
                         grip_motion: None,
                         detached_grip_motion: None,
                         skeleton_joints: None,
+                        index_tip_tracked: false,
                     },
                     HandData {
                         grip_motion: None,
                         detached_grip_motion: None,
                         skeleton_joints: None,
+                        index_tip_tracked: false,
                     },
                 ],
                 None,
