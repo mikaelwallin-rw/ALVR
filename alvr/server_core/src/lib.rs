@@ -8,6 +8,7 @@ mod input_mapping;
 mod logging_backend;
 mod native_quads;
 mod opaque_regions;
+mod screen_video;
 mod sockets;
 mod statistics;
 mod tracking;

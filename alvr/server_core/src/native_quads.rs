@@ -12,6 +12,8 @@
 //   quads.
 // - Poses are in the client STAGE space of `stage_epoch` (see tracking_extras.rs). Quads of
 //   another epoch are not drawn.
+// - Version 1: 80-byte quads. Version 2: 96-byte quads (+ videoStreamId, reserved[3]) and the
+//   block's reserved field becomes `flags` (scene mode). Both are accepted, by the version field.
 
 #[cfg(windows)]
 pub use windows_impl::NativeQuadsReader;
@@ -61,13 +63,17 @@ mod windows_impl {
     };
 
     const MAGIC: u32 = 0x4441_514E; // 'NQAD' little-endian
-    const VERSION: u32 = 1;
+    const VERSION_1: u32 = 1;
+    const VERSION_2: u32 = 2;
     const MAX_QUADS: usize = 16;
     const MAX_SQUARES: u32 = 256;
     const STALE_MS: u64 = 1000;
     const OPEN_RETRY_INTERVAL: Duration = Duration::from_secs(1);
     const MAX_READ_ATTEMPTS: usize = 4;
     const SEQUENCE_OFFSET: usize = 8;
+    const VERSION_OFFSET: usize = 4;
+    // v2 block flag: a scene app (V3, full VR) is presenting
+    const FLAG_SCENE_MODE: u32 = 1;
 
     #[repr(C, packed(4))]
     #[derive(Clone, Copy)]
@@ -85,28 +91,69 @@ mod windows_impl {
 
     #[repr(C, packed(4))]
     #[derive(Clone, Copy)]
-    struct RawBlock {
+    struct RawQuadV2 {
+        v1: RawQuad,
+        video_stream_id: u32,
+        reserved: [u32; 3],
+    }
+
+    #[repr(C, packed(4))]
+    #[derive(Clone, Copy)]
+    struct RawHeader {
         magic: u32,
         version: u32,
         sequence: u32,
         count: u32,
         heartbeat_ms: u64,
         stage_epoch: u32,
-        reserved: u32,
+        // v1: reserved
+        flags: u32,
+    }
+
+    #[repr(C, packed(4))]
+    #[derive(Clone, Copy)]
+    struct RawBlockV1 {
+        header: RawHeader,
         quads: [RawQuad; MAX_QUADS],
     }
 
+    #[repr(C, packed(4))]
+    #[derive(Clone, Copy)]
+    struct RawBlockV2 {
+        header: RawHeader,
+        quads: [RawQuadV2; MAX_QUADS],
+    }
+
     const _: () = assert!(mem::size_of::<RawQuad>() == 80);
-    const _: () = assert!(mem::size_of::<RawBlock>() == 32 + 80 * MAX_QUADS);
+    const _: () = assert!(mem::size_of::<RawQuadV2>() == 96);
+    const _: () = assert!(mem::size_of::<RawHeader>() == 32);
+    const _: () = assert!(mem::size_of::<RawBlockV1>() == 32 + 80 * MAX_QUADS);
+    const _: () = assert!(mem::size_of::<RawBlockV2>() == 32 + 96 * MAX_QUADS);
+
+    // A block of either version, with the quads as (v1 fields, video stream id)
+    struct Block {
+        header: RawHeader,
+        quads: Vec<(RawQuad, u32)>,
+    }
 
     // Reader state, logged on change
     #[derive(Clone, Copy, PartialEq, Debug)]
     enum Status {
         NotOpen,
-        InvalidHeader { magic: u32, version: u32 },
+        InvalidHeader {
+            magic: u32,
+            version: u32,
+        },
         Stale,
-        OtherStageEpoch { block: u32, current: u32 },
-        Active { count: usize },
+        OtherStageEpoch {
+            block: u32,
+            current: u32,
+        },
+        Active {
+            version: u32,
+            count: usize,
+            scene_mode: bool,
+        },
     }
 
     struct Mapping {
@@ -131,7 +178,7 @@ mod windows_impl {
         rgba.to_le_bytes()
     }
 
-    fn parse_quad(raw: &RawQuad) -> Option<NativeQuad> {
+    fn parse_quad(raw: &RawQuad, video_stream_id: u32) -> Option<NativeQuad> {
         let m = raw.stage_from_quad;
         let (width, height, columns, rows) =
             (raw.width_meters, raw.height_meters, raw.columns, raw.rows);
@@ -169,6 +216,7 @@ mod windows_impl {
             light_color: color(raw.light_rgba),
             outline_color: color(raw.outline_rgba),
             outline_pixels: raw.outline_pixels,
+            video_stream_id,
         })
     }
 
@@ -210,8 +258,8 @@ mod windows_impl {
                 return;
             };
 
-            let view =
-                unsafe { MapViewOfFile(handle, FILE_MAP_READ, 0, 0, mem::size_of::<RawBlock>()) };
+            // The whole section: its size depends on the writer's version
+            let view = unsafe { MapViewOfFile(handle, FILE_MAP_READ, 0, 0, 0) };
             if view.Value.is_null() {
                 warn!("Native quads: MapViewOfFile failed");
                 unsafe { CloseHandle(handle).ok() };
@@ -224,12 +272,15 @@ mod windows_impl {
             self.mapping = Some(Mapping { handle, view });
         }
 
-        // Seqlock read. Returns None if the writer kept writing during all attempts.
-        fn read_block(mapping: &Mapping) -> Option<RawBlock> {
+        // Seqlock read. Returns None if the writer kept writing during all attempts. For an
+        // unknown version, only the header is read (for the status).
+        fn read_block(mapping: &Mapping) -> Option<Block> {
             let base = mapping.view.Value.cast::<u8>();
-            // # Safety: the view is at least size_of::<RawBlock>() bytes and `sequence` is 4-byte
-            // aligned (pack(4), offset 8, page-aligned view)
+            // # Safety: the view covers the writer's whole section, which the writer creates with
+            // the size of its version, and `sequence`/`version` are 4-byte aligned (pack(4),
+            // page-aligned view)
             let sequence = unsafe { &*base.add(SEQUENCE_OFFSET).cast::<AtomicU32>() };
+            let version = unsafe { &*base.add(VERSION_OFFSET).cast::<AtomicU32>() };
 
             for _ in 0..MAX_READ_ATTEMPTS {
                 let before = sequence.load(Ordering::Acquire);
@@ -238,7 +289,30 @@ mod windows_impl {
                     continue;
                 }
 
-                let block = unsafe { ptr::read_volatile(base.cast::<RawBlock>()) };
+                let block = match version.load(Ordering::Acquire) {
+                    VERSION_1 => {
+                        let raw = unsafe { ptr::read_volatile(base.cast::<RawBlockV1>()) };
+                        Block {
+                            header: raw.header,
+                            quads: raw.quads.iter().map(|quad| (*quad, 0)).collect(),
+                        }
+                    }
+                    VERSION_2 => {
+                        let raw = unsafe { ptr::read_volatile(base.cast::<RawBlockV2>()) };
+                        Block {
+                            header: raw.header,
+                            quads: raw
+                                .quads
+                                .iter()
+                                .map(|quad| (quad.v1, quad.video_stream_id))
+                                .collect(),
+                        }
+                    }
+                    _ => Block {
+                        header: unsafe { ptr::read_volatile(base.cast::<RawHeader>()) },
+                        quads: Vec::new(),
+                    },
+                };
 
                 atomic::fence(Ordering::Acquire);
                 if sequence.load(Ordering::Relaxed) == before {
@@ -262,14 +336,16 @@ mod windows_impl {
                 return Vec::new();
             };
 
-            let (magic, version, count, heartbeat_ms, stage_epoch) = (
-                block.magic,
-                block.version,
-                block.count,
-                block.heartbeat_ms,
-                block.stage_epoch,
+            let header = block.header;
+            let (magic, version, count, heartbeat_ms, stage_epoch, flags) = (
+                header.magic,
+                header.version,
+                header.count,
+                header.heartbeat_ms,
+                header.stage_epoch,
+                header.flags,
             );
-            if magic != MAGIC || version != VERSION {
+            if magic != MAGIC || !matches!(version, VERSION_1 | VERSION_2) {
                 self.set_status(Status::InvalidHeader { magic, version });
                 return Vec::new();
             }
@@ -285,13 +361,17 @@ mod windows_impl {
                 return Vec::new();
             }
 
-            let raw_quads = block.quads;
-            let quads = raw_quads
+            let quads = block
+                .quads
                 .iter()
                 .take((count as usize).min(MAX_QUADS))
-                .filter_map(parse_quad)
+                .filter_map(|(quad, video_stream_id)| parse_quad(quad, *video_stream_id))
                 .collect::<Vec<_>>();
-            self.set_status(Status::Active { count: quads.len() });
+            self.set_status(Status::Active {
+                version,
+                count: quads.len(),
+                scene_mode: version >= VERSION_2 && flags & FLAG_SCENE_MODE != 0,
+            });
 
             quads
         }
@@ -318,17 +398,21 @@ mod windows_impl {
                 outline_rgba: 0xFF00_FF00,
                 outline_pixels: 2,
             };
-            let quad = parse_quad(&raw).unwrap();
+            let quad = parse_quad(&raw, 7).unwrap();
             assert_eq!(quad.pose.position, Vec3::new(0.5, 1.2, -0.8));
             assert_eq!(quad.dark_color, [0, 0, 0, 255]);
             assert_eq!(quad.outline_color, [0, 255, 0, 255]);
+            assert_eq!(quad.video_stream_id, 7);
 
-            assert!(parse_quad(&RawQuad { columns: 0, ..raw }).is_none());
+            assert!(parse_quad(&RawQuad { columns: 0, ..raw }, 0).is_none());
             assert!(
-                parse_quad(&RawQuad {
-                    width_meters: f32::NAN,
-                    ..raw
-                })
+                parse_quad(
+                    &RawQuad {
+                        width_meters: f32::NAN,
+                        ..raw
+                    },
+                    0
+                )
                 .is_none()
             );
         }

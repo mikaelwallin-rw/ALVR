@@ -2,8 +2,10 @@
 // the headset runtime composites itself, without the streaming path. Each quad shows a
 // procedural chessboard with a border, at a pose in the STAGE space, so that it can be compared
 // with the real object seen in passthrough (e.g. the same chessboard shown on a monitor).
+// A quad with a video stream id shows that screen video stream instead (screen_video.rs), once
+// the stream has decoded a frame.
 
-use crate::graphics;
+use crate::{graphics, screen_video::ScreenVideoStreams};
 use alvr_common::{glam::UVec2, info, warn};
 use alvr_graphics::GraphicsContext;
 use alvr_packets::NativeQuad;
@@ -35,14 +37,35 @@ pub struct NativeQuadLayers {
     layers: Vec<QuadLayer>,
 }
 
+// Same chessboard texture: only the pose, size or video stream changed
+fn same_texture(a: &NativeQuad, b: &NativeQuad) -> bool {
+    (a.columns, a.rows, a.outline_pixels) == (b.columns, b.rows, b.outline_pixels)
+        && (a.dark_color, a.light_color, a.outline_color)
+            == (b.dark_color, b.light_color, b.outline_color)
+}
+
 impl NativeQuadLayers {
-    // Replaces all quads. Textures are drawn once here; the layers are static afterwards.
+    // Replaces all quads. A quad whose texture is unchanged (pose, size or video stream changes)
+    // keeps its swapchain; other textures are drawn once here.
     pub fn set(
         &mut self,
         xr_session: &xr::Session<xr::OpenGlEs>,
         gfx_ctx: &GraphicsContext,
         quads: Vec<NativeQuad>,
     ) {
+        let reusable = self.layers.len() == quads.len()
+            && self
+                .layers
+                .iter()
+                .zip(&quads)
+                .all(|(layer, quad)| same_texture(&layer.quad, quad));
+        if reusable {
+            for (layer, quad) in self.layers.iter_mut().zip(quads) {
+                layer.quad = quad;
+            }
+            return;
+        }
+
         self.layers.clear();
 
         gfx_ctx.make_current();
@@ -70,7 +93,12 @@ impl NativeQuadLayers {
             self.layers.len(),
             self.layers
                 .iter()
-                .map(|layer| (layer.quad.width, layer.quad.height, layer.size))
+                .map(|layer| (
+                    layer.quad.width,
+                    layer.quad.height,
+                    layer.size,
+                    layer.quad.video_stream_id
+                ))
                 .collect::<Vec<_>>()
         );
     }
@@ -85,26 +113,38 @@ impl NativeQuadLayers {
     pub fn build<'a>(
         &'a self,
         stage_space: &'a xr::Space,
+        screen_video: &'a ScreenVideoStreams,
     ) -> Vec<xr::CompositionLayerQuad<'a, xr::OpenGlEs>> {
         self.layers
             .iter()
             .map(|layer| {
-                xr::CompositionLayerQuad::new()
-                    .layer_flags(
+                // Video (opaque) once the stream has a decoded frame, else the chessboard
+                let video = (layer.quad.video_stream_id != 0)
+                    .then(|| screen_video.ready_swapchain(layer.quad.video_stream_id))
+                    .flatten();
+                let (swapchain, size, flags) = match video {
+                    Some((swapchain, size)) => (swapchain, size, xr::CompositionLayerFlags::EMPTY),
+                    None => (
+                        &layer.swapchain,
+                        layer.size,
                         xr::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA
                             | xr::CompositionLayerFlags::UNPREMULTIPLIED_ALPHA,
-                    )
+                    ),
+                };
+
+                xr::CompositionLayerQuad::new()
+                    .layer_flags(flags)
                     .space(stage_space)
                     .eye_visibility(xr::EyeVisibility::BOTH)
                     .sub_image(
                         xr::SwapchainSubImage::new()
-                            .swapchain(&layer.swapchain)
+                            .swapchain(swapchain)
                             .image_array_index(0)
                             .image_rect(xr::Rect2Di {
                                 offset: xr::Offset2Di { x: 0, y: 0 },
                                 extent: xr::Extent2Di {
-                                    width: layer.size.x as _,
-                                    height: layer.size.y as _,
+                                    width: size.x as _,
+                                    height: size.y as _,
                                 },
                             }),
                     )
@@ -420,7 +460,24 @@ mod tests {
             light_color: [255, 255, 255, 0],
             outline_color: [0, 255, 0, 255],
             outline_pixels: 2,
+            video_stream_id: 0,
         }
+    }
+
+    #[test]
+    fn pose_and_video_changes_keep_the_texture() {
+        let a = quad(16, 10);
+        let moved = NativeQuad {
+            pose: Pose {
+                position: alvr_common::glam::Vec3::X,
+                ..Pose::IDENTITY
+            },
+            width: 0.3,
+            video_stream_id: 4,
+            ..a
+        };
+        assert!(same_texture(&a, &moved));
+        assert!(!same_texture(&a, &quad(16, 11)));
     }
 
     #[test]

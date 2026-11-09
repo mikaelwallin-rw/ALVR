@@ -5,6 +5,7 @@ use crate::{
     hand_gestures::HandGestureManager,
     input_mapping::ButtonMappingManager,
     native_quads::NativeQuadsReader,
+    screen_video::ScreenVideoReader,
     sockets::WelcomeSocket,
     statistics::StatisticsManager,
     tracking::{self, TrackingManager},
@@ -24,8 +25,9 @@ use alvr_events::{AdbEvent, ButtonEvent, EventType};
 use alvr_packets::{
     AUDIO, CameraEye, CameraFramesConfig, ClientConnectionResult, ClientConnectionsAction,
     ClientControlPacket, ClientStatistics, HAPTICS, NativeQuad, NegotiatedStreamingConfig,
-    NegotiatedStreamingConfigExt, RealTimeConfig, STATISTICS, ServerControlPacket,
-    StreamConfigPacket, TRACKING, TrackingData, VIDEO, VideoPacketHeader,
+    NegotiatedStreamingConfigExt, RealTimeConfig, SCREEN_VIDEO, STATISTICS,
+    ScreenVideoPacketHeader, ServerControlPacket, StreamConfigPacket, TRACKING, TrackingData,
+    VIDEO, VideoPacketHeader,
 };
 use alvr_session::{
     BodyTrackingSinkConfig, CodecType, ControllersEmulationMode, FrameSize, H264Profile,
@@ -39,7 +41,10 @@ use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr},
     process::Command,
-    sync::{Arc, mpsc::RecvTimeoutError},
+    sync::{
+        Arc,
+        mpsc::{self, RecvTimeoutError},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -52,6 +57,10 @@ const REAL_TIME_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 // a few frames per second
 const CAMERA_FRAME_SIZE: u32 = 2048;
 const CAMERA_FRAME_INTERVAL: Duration = Duration::from_millis(250);
+// Screen thread: wait for a new screen video frame at most this long, poll the native quads at
+// this interval (pose trims must reach the headset quickly)
+const SCREEN_VIDEO_WAIT: Duration = Duration::from_millis(5);
+const NATIVE_QUADS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 const MAX_UNREAD_PACKETS: usize = 10; // Applies per stream
 
@@ -914,6 +923,8 @@ fn connection_pipeline(
     )?;
 
     let mut video_sender = stream_socket.request_stream(VIDEO);
+    let mut screen_video_sender =
+        stream_socket.request_stream::<ScreenVideoPacketHeader>(SCREEN_VIDEO);
     let game_audio_sender: alvr_sockets::StreamSender<()> = stream_socket.request_stream(AUDIO);
     let mut microphone_receiver: alvr_sockets::StreamReceiver<()> =
         stream_socket.subscribe_to_stream(AUDIO, MAX_UNREAD_PACKETS);
@@ -1201,11 +1212,6 @@ fn connection_pipeline(
         move || {
             // Last camera frames request sent to the client (the client starts without one)
             let mut sent_camera_frames = None;
-            let mut native_quads_reader = NativeQuadsReader::new();
-            // Last native quads sent to the client, as Debug text for comparison (Pose has no
-            // PartialEq). The client starts without any.
-            let mut sent_native_quads = format!("{:?}", Vec::<NativeQuad>::new());
-
             while is_streaming(&client_hostname) {
                 let camera_frames = tracking_extras::camera_frames_request().map(|right_camera| {
                     CameraFramesConfig {
@@ -1228,19 +1234,6 @@ fn connection_pipeline(
                     sent_camera_frames = camera_frames;
                 }
 
-                let native_quads = native_quads_reader.read(tracking_extras::stage_epoch());
-                let native_quads_text = format!("{native_quads:?}");
-                let count = native_quads.len();
-                if native_quads_text != sent_native_quads
-                    && control_sender
-                        .lock()
-                        .send(&ServerControlPacket::NativeQuads(native_quads))
-                        .is_ok()
-                {
-                    info!("Native quads sent to the client: {count}");
-                    sent_native_quads = native_quads_text;
-                }
-
                 if let Err(e) = control_sender.lock().send(&ServerControlPacket::KeepAlive) {
                     info!("Client disconnected. Cause: {e:?}");
 
@@ -1250,6 +1243,67 @@ fn connection_pipeline(
                 }
 
                 thread::sleep(KEEPALIVE_INTERVAL);
+            }
+        }
+    });
+
+    // Keyframe requests for screen video streams, from the control thread to the screen thread
+    let (screen_idr_sender, screen_idr_receiver) = mpsc::channel::<u32>();
+
+    // Native quads and screen video from the overlay app (ScreenVR)
+    let screen_thread = thread::spawn({
+        let control_sender = Arc::clone(&control_sender);
+        let client_hostname = client_hostname.clone();
+        move || {
+            let mut screen_video_reader = ScreenVideoReader::new();
+            let mut native_quads_reader = NativeQuadsReader::new();
+            // Last native quads sent to the client, as Debug text for comparison (Pose has no
+            // PartialEq). The client starts without any.
+            let mut sent_native_quads = format!("{:?}", Vec::<NativeQuad>::new());
+            let mut last_native_quads_poll = None::<Instant>;
+            let mut sent_frames = 0_u64;
+
+            while is_streaming(&client_hostname) {
+                for frame in screen_video_reader.read(SCREEN_VIDEO_WAIT) {
+                    if sent_frames == 0
+                        || frame.header.is_keyframe && sent_frames.is_multiple_of(1000)
+                    {
+                        info!(
+                            "Screen video: forwarding stream {} frame {} ({} bytes, keyframe {})",
+                            frame.header.stream_id,
+                            frame.header.frame_index,
+                            frame.data.len(),
+                            frame.header.is_keyframe
+                        );
+                    }
+                    sent_frames += 1;
+                    screen_video_sender
+                        .send_header_with_payload(&frame.header, &frame.data)
+                        .ok();
+                }
+
+                while let Ok(stream_id) = screen_idr_receiver.try_recv() {
+                    screen_video_reader.request_idr(stream_id);
+                }
+
+                if last_native_quads_poll
+                    .is_none_or(|instant| instant.elapsed() >= NATIVE_QUADS_POLL_INTERVAL)
+                {
+                    last_native_quads_poll = Some(Instant::now());
+
+                    let native_quads = native_quads_reader.read(tracking_extras::stage_epoch());
+                    let native_quads_text = format!("{native_quads:?}");
+                    let count = native_quads.len();
+                    if native_quads_text != sent_native_quads
+                        && control_sender
+                            .lock()
+                            .send(&ServerControlPacket::NativeQuads(native_quads))
+                            .is_ok()
+                    {
+                        debug!("Native quads sent to the client: {count}");
+                        sent_native_quads = native_quads_text;
+                    }
+                }
             }
         }
     });
@@ -1327,6 +1381,9 @@ fn connection_pipeline(
                                     .ok();
                             }
                         }
+                    }
+                    ClientControlPacket::RequestScreenIdr { stream_id } => {
+                        screen_idr_sender.send(stream_id).ok();
                     }
                     ClientControlPacket::RequestIdr => {
                         if let Some(config) = ctx.decoder_config.lock().clone() {
@@ -1569,6 +1626,7 @@ fn connection_pipeline(
     join_logged("control_receive_thread", control_receive_thread);
     join_logged("stream_receive_thread", stream_receive_thread);
     join_logged("keepalive_thread", keepalive_thread);
+    join_logged("screen_thread", screen_thread);
     join_logged("lifecycle_check_thread", lifecycle_check_thread);
 
     info!(

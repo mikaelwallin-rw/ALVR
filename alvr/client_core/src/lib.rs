@@ -26,7 +26,7 @@ use alvr_common::{
 };
 use alvr_packets::{
     BatteryInfo, ButtonEntry, CameraFrame, CameraFramesConfig, ClientControlPacket, NativeQuad,
-    OpaqueRegion, RealTimeConfig, StreamConfig, TrackingData,
+    OpaqueRegion, RealTimeConfig, ScreenVideoPacketHeader, StreamConfig, TrackingData,
 };
 use alvr_session::CodecType;
 use alvr_system_info::Platform;
@@ -287,6 +287,23 @@ impl ClientCoreContext {
         if let Some(sender) = &mut *self.connection_context.control_sender.lock() {
             sender
                 .send(&ClientControlPacket::CameraFrame(Box::new(frame)))
+                .ok();
+        }
+    }
+
+    /// Next screen video access unit (Annex B) received from the server, in arrival order
+    pub fn poll_screen_video_frame(&self) -> Option<(ScreenVideoPacketHeader, Vec<u8>)> {
+        self.connection_context
+            .screen_video_queue
+            .lock()
+            .pop_front()
+    }
+
+    /// Asks the server for a keyframe of a screen video stream (e.g. after a decoder error)
+    pub fn request_screen_idr(&self, stream_id: u32) {
+        if let Some(sender) = &mut *self.connection_context.control_sender.lock() {
+            sender
+                .send(&ClientControlPacket::RequestScreenIdr { stream_id })
                 .ok();
         }
     }

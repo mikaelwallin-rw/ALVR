@@ -8,6 +8,7 @@ mod lobby;
 mod native_hands;
 mod native_quads;
 mod passthrough;
+mod screen_video;
 mod stream;
 
 use crate::stream::ParsedStreamConfig;
@@ -32,6 +33,7 @@ use native_hands::NativeHands;
 use native_quads::NativeQuadLayers;
 use openxr as xr;
 use passthrough::PassthroughLayer;
+use screen_video::ScreenVideoStreams;
 use std::{collections::HashSet, ffi::CStr, path::Path, rc::Rc, sync::Arc, thread, time::Duration};
 use stream::StreamContext;
 
@@ -238,6 +240,8 @@ pub fn entry_point() {
     #[cfg(target_os = "android")]
     {
         selected_exts.khr_android_create_instance = true;
+        // Screen video streams decoded straight into quad layers (screen_video.rs)
+        selected_exts.khr_android_surface_swapchain = true;
     }
     selected_exts.khr_convert_timespec_time = true;
     selected_exts.khr_opengl_es_enable = true;
@@ -423,6 +427,7 @@ pub fn entry_point() {
         let mut passthrough_layer = None;
         let mut native_quads = NativeQuadLayers::default();
         let mut native_hands = None::<NativeHands>;
+        let mut screen_video = ScreenVideoStreams::default();
 
         let mut event_storage = xr::EventDataBuffer::new();
         let mut headset_is_worn = true;
@@ -542,6 +547,7 @@ pub fn entry_point() {
 
                         native_quads.clear();
                         native_hands = None;
+                        screen_video = ScreenVideoStreams::default();
                         stream_context = None;
                     }
                     ClientCoreEvent::Haptics {
@@ -641,6 +647,9 @@ pub fn entry_point() {
                 .as_ref()
                 .map(StreamContext::stage_reference_space);
             let hands_selected = stream_context.as_ref().map(StreamContext::hands_selected);
+            if stream_context.is_some() {
+                screen_video.update(&xr_session, &core_context);
+            }
 
             // todo: allow rendering lobby and stream layers at the same time and add cross fade
             let (layer, display_time) = if let Some(stream) = &mut stream_context {
@@ -660,7 +669,7 @@ pub fn entry_point() {
             let projection_layer = layer.build();
             let quad_layers = native_quads_space
                 .as_deref()
-                .map(|space| native_quads.build(space))
+                .map(|space| native_quads.build(space, &screen_video))
                 .unwrap_or_default();
             let hands_layer_builder = native_hands
                 .as_ref()

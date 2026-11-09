@@ -22,6 +22,8 @@ pub const HAPTICS: u16 = 1;
 pub const AUDIO: u16 = 2;
 pub const VIDEO: u16 = 3;
 pub const STATISTICS: u16 = 4;
+/// Screen video streams encoded by an overlay app (ScreenVR), forwarded as is
+pub const SCREEN_VIDEO: u16 = 5;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct VideoStreamingCapabilitiesExt {
@@ -207,6 +209,9 @@ pub struct NativeQuad {
     pub outline_color: [u8; 4],
     /// Border width in texture pixels
     pub outline_pixels: u32,
+    /// Screen video stream shown instead of the chessboard (0 = none). The chessboard stays until
+    /// the stream's first keyframe is decoded.
+    pub video_stream_id: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -247,6 +252,10 @@ pub struct ButtonEntry {
 pub enum ClientControlPacket {
     PlayspaceSync(Option<Vec2>),
     RequestIdr,
+    // Keyframe request for a screen video stream (after loss or a decoder error)
+    RequestScreenIdr {
+        stream_id: u32,
+    },
     KeepAlive,
     StreamReady, // This flag notifies the server the client streaming socket is ready listening
     LocalViewParams([ViewParams; 2]), // In relation to head
@@ -313,6 +322,27 @@ pub struct OpaqueRegion {
     pub curvature: f32,
     /// Inward margin applied to every edge before forcing the region opaque, in meters
     pub inset: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScreenVideoCodec {
+    H264,
+    Hevc,
+}
+
+/// One encoded access unit (Annex B) of a screen video stream (SCREEN_VIDEO)
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct ScreenVideoPacketHeader {
+    /// Changes when the encoder is recreated (size or codec change): restart the decoder at the
+    /// next keyframe
+    pub stream_id: u32,
+    pub codec: ScreenVideoCodec,
+    pub width: u32,
+    pub height: u32,
+    /// 1, 2, 3 ... per stream_id
+    pub frame_index: u64,
+    /// IDR carrying its parameter sets
+    pub is_keyframe: bool,
 }
 
 #[derive(Serialize, Deserialize)]

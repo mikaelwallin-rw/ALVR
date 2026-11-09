@@ -27,7 +27,9 @@ png = "0.17"
 # Pinning android-activity to 0.6.0. v0.6.1 changed ndk-context initialization from Activity to
 # Application Context. Some unidentified dependency still assumes Activity context, causing freezes.
 android-activity = { version = "=0.6.0", features = ["native-activity"] }
+jni-sys = "0.3" # The version used by ndk (NativeWindow::from_surface)
 libc = "0.2"
+ndk = { version = "0.9", features = ["api-level-28", "media"] }
 ndk-context = "0.1"
 
 [package.metadata.android]

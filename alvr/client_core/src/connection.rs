@@ -15,9 +15,9 @@ use alvr_common::{
 };
 use alvr_packets::{
     AUDIO, ClientConnectionResult, ClientControlPacket, ClientStatistics, ConnectionAcceptedInfo,
-    HAPTICS, Haptics, OpaqueRegion, STATISTICS, ServerControlPacket, StreamConfigPacket, TRACKING,
-    TrackingData, VIDEO, VideoPacketHeader, VideoStreamingCapabilities,
-    VideoStreamingCapabilitiesExt,
+    HAPTICS, Haptics, OpaqueRegion, SCREEN_VIDEO, STATISTICS, ScreenVideoPacketHeader,
+    ServerControlPacket, StreamConfigPacket, TRACKING, TrackingData, VIDEO, VideoPacketHeader,
+    VideoStreamingCapabilities, VideoStreamingCapabilitiesExt,
 };
 use alvr_session::{SocketProtocol, settings_schema::Switch};
 use alvr_sockets::{
@@ -25,7 +25,7 @@ use alvr_sockets::{
     StreamSender, StreamSocketBuilder,
 };
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, mpsc},
     thread,
     time::{Duration, Instant},
@@ -53,6 +53,10 @@ const HANDSHAKE_ACTION_TIMEOUT: Duration = Duration::from_secs(2);
 const STREAMING_RECV_TIMEOUT: Duration = Duration::from_millis(500);
 
 const MAX_UNREAD_PACKETS: usize = 10; // Applies per stream
+// Screen video frames waiting for the render thread; beyond this the oldest are dropped
+pub const MAX_QUEUED_SCREEN_VIDEO_FRAMES: usize = 60;
+// Keyframe requests per screen video stream, at most one in this interval
+const SCREEN_IDR_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(200);
 
 pub type DecoderCallback = dyn FnMut(Duration, &[u8]) -> bool + Send;
 
@@ -73,6 +77,29 @@ pub struct ConnectionContext {
     pub decoder_callback: Mutex<Option<Box<DecoderCallback>>>,
     pub global_view_params_queue: Mutex<VecDeque<GlobalViewParamsEntry>>,
     pub max_prediction: RwLock<Duration>,
+    // Screen video access units for the client app, in arrival order
+    pub screen_video_queue: Mutex<VecDeque<(ScreenVideoPacketHeader, Vec<u8>)>>,
+}
+
+// Sends a keyframe request for a screen video stream, rate limited per stream
+pub fn request_screen_idr(
+    ctx: &ConnectionContext,
+    last_requests: &mut HashMap<u32, Instant>,
+    stream_id: u32,
+) {
+    if last_requests
+        .get(&stream_id)
+        .is_some_and(|instant| instant.elapsed() < SCREEN_IDR_REQUEST_MIN_INTERVAL)
+    {
+        return;
+    }
+    last_requests.insert(stream_id, Instant::now());
+
+    if let Some(sender) = &mut *ctx.control_sender.lock() {
+        sender
+            .send(&ClientControlPacket::RequestScreenIdr { stream_id })
+            .ok();
+    }
 }
 
 fn set_hud_message(event_queue: &Mutex<VecDeque<ClientCoreEvent>>, message: &str) {
@@ -297,6 +324,8 @@ fn connection_pipeline(
 
     let mut video_receiver =
         stream_socket.subscribe_to_stream::<VideoPacketHeader>(VIDEO, MAX_UNREAD_PACKETS);
+    let mut screen_video_receiver = stream_socket
+        .subscribe_to_stream::<ScreenVideoPacketHeader>(SCREEN_VIDEO, MAX_UNREAD_PACKETS);
     let mut game_audio_receiver = stream_socket.subscribe_to_stream(AUDIO, MAX_UNREAD_PACKETS);
     let tracking_sender = stream_socket.request_stream(TRACKING);
     let mut haptics_receiver =
@@ -367,6 +396,56 @@ fn connection_pipeline(
                         sender.send(&ClientControlPacket::RequestIdr).ok();
                     }
                     warn!("Dropped video packet. Reason: Waiting for IDR frame")
+                }
+            }
+        }
+    });
+
+    // Screen video: forwarded to the client app as is. After a loss, the stream's frames are
+    // dropped until its next keyframe, which is requested.
+    let screen_video_receive_thread = thread::spawn({
+        let ctx = Arc::clone(&ctx);
+        move || {
+            let mut corrupted_streams = HashSet::<u32>::new();
+            let mut last_idr_requests = HashMap::new();
+            let mut received_frames = 0_u64;
+            ctx.screen_video_queue.lock().clear();
+
+            while is_streaming(&ctx) {
+                let data = match screen_video_receiver.recv(STREAMING_RECV_TIMEOUT) {
+                    Ok(data) => data,
+                    Err(ConnectionError::TryAgain(_)) => continue,
+                    Err(ConnectionError::Other(_)) => return,
+                };
+                let Ok((header, payload)) = data.get() else {
+                    return;
+                };
+                let stream_id = header.stream_id;
+                if received_frames == 0 {
+                    info!("Screen video: first frame received: {header:?}");
+                }
+                received_frames += 1;
+
+                if header.is_keyframe {
+                    corrupted_streams.remove(&stream_id);
+                } else if data.had_packet_loss() {
+                    corrupted_streams.insert(stream_id);
+                    warn!("Screen video: network dropped a packet of stream {stream_id}");
+                }
+                if corrupted_streams.contains(&stream_id) {
+                    request_screen_idr(&ctx, &mut last_idr_requests, stream_id);
+                    continue;
+                }
+
+                let mut queue = ctx.screen_video_queue.lock();
+                queue.push_back((header, payload.to_vec()));
+                if queue.len() > MAX_QUEUED_SCREEN_VIDEO_FRAMES {
+                    // The render thread is not consuming: start over at a keyframe
+                    queue.clear();
+                    drop(queue);
+                    corrupted_streams.insert(stream_id);
+                    request_screen_idr(&ctx, &mut last_idr_requests, stream_id);
+                    warn!("Screen video: queue full, waiting for a keyframe");
                 }
             }
         }
@@ -621,6 +700,7 @@ fn connection_pipeline(
     dbg_connection!("connection_pipeline: Destroying streams");
 
     video_receive_thread.join().ok();
+    screen_video_receive_thread.join().ok();
     game_audio_thread.join().ok();
     microphone_thread.join().ok();
     haptics_receive_thread.join().ok();
