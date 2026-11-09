@@ -186,6 +186,12 @@ fn create_layer(
         unsafe {
             gl_context.bind_texture(gl::TEXTURE_2D, Some(gl::NativeTexture(texture)));
             gl_context.pixel_store_i32(gl::UNPACK_ALIGNMENT, 1);
+            // wgpu's GLES backend leaves UNPACK_ROW_LENGTH set after its own texture uploads (e.g.
+            // 1024 from the lobby HUD), which would make this upload read rows with that pitch
+            gl_context.pixel_store_i32(gl::UNPACK_ROW_LENGTH, 0);
+            gl_context.pixel_store_i32(gl::UNPACK_SKIP_ROWS, 0);
+            gl_context.pixel_store_i32(gl::UNPACK_SKIP_PIXELS, 0);
+            gl_context.bind_buffer(gl::PIXEL_UNPACK_BUFFER, None);
             gl_context.tex_sub_image_2d(
                 gl::TEXTURE_2D,
                 0,
