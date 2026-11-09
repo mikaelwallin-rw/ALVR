@@ -1,0 +1,89 @@
+{
+  "components": {
+    "body": {
+      "filename": "alvr_hidden_hand_left.obj",
+      "component_local": {
+        "origin": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "rotate_xyz": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      }
+    },
+    "base": {
+      "component_local": {
+        "origin": [
+          0.0,
+          -0.014,
+          0.174
+        ],
+        "rotate_xyz": [
+          -0.821,
+          -180.0,
+          0.0
+        ]
+      }
+    },
+    "gdc2015": {
+      "component_local": {
+        "origin": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "rotate_xyz": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      }
+    },
+    "tip": {
+      "component_local": {
+        "origin": [
+          -0.0,
+          -0.04,
+          0.02
+        ],
+        "rotate_xyz": [
+          -30.382,
+          -8.0,
+          0.0
+        ]
+      }
+    },
+    "front": {
+      "component_local": {
+        "origin": [
+          0.0,
+          -0.01,
+          -0.007
+        ],
+        "rotate_xyz": [
+          -55,
+          0.0,
+          0.0
+        ]
+      }
+    },
+    "handgrip": {
+      "component_local": {
+        "origin": [
+          0.0,
+          0.003,
+          0.097
+        ],
+        "rotate_xyz": [
+          5.037,
+          0.0,
+          0.0
+        ]
+      }
+    }
+  }
+}

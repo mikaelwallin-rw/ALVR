@@ -621,20 +621,20 @@ pub extern "C" fn set_device_openvr_props(instance_ptr: *mut c_void, device_id: 
                 // Ensure SteamVR resolves {alvr_server} token to this driver's resources
                 set_prop(ResourceRootString, "alvr_server");
 
-                // Hand-tracker devices show Pico's hand mesh (SM_Hand_L/R from the PICO OpenXR
-                // Unreal plugin), converted to a static OBJ in the hand-tracker device frame
-                // (palm joint * hand tracking offsets, see tracking.rs). SteamVR only draws
-                // static rendermodels, so the hand follows the tracked pose but the fingers do
-                // not bend. Input profile and controller type stay those of the Pico controller.
+                // The ALVR client draws animated hands natively (client_openxr native_hands.rs),
+                // so hand-tracker devices get an invisible body. Its manifest keeps the
+                // components (tip, base, handgrip, ...) of the static Pico hand rendermodels
+                // (pico_hand_left/right, kept for rollback), so pointers anchored on them do not
+                // move. Input profile and controller type stay those of the Pico controller.
                 if left_hand {
                     set_prop(
                         RenderModelNameString,
-                        "{alvr_server}/rendermodels/pico_hand_left",
+                        "{alvr_server}/rendermodels/alvr_hidden_hand_left",
                     );
                 } else if right_hand {
                     set_prop(
                         RenderModelNameString,
-                        "{alvr_server}/rendermodels/pico_hand_right",
+                        "{alvr_server}/rendermodels/alvr_hidden_hand_right",
                     );
                 }
                 set_prop(ControllerTypeString, "pico_controller");
