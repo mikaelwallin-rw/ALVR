@@ -1,8 +1,10 @@
+mod hands;
 mod lobby;
 mod opaque_regions;
 mod staging;
 mod stream;
 
+pub use hands::*;
 pub use lobby::*;
 pub use stream::*;
 

@@ -5,6 +5,7 @@ mod graphics;
 mod input_diagnostics;
 mod interaction;
 mod lobby;
+mod native_hands;
 mod native_quads;
 mod passthrough;
 mod stream;
@@ -27,6 +28,7 @@ use extra_extensions::{
 };
 use interaction::{InteractionContext, InteractionSourcesConfig};
 use lobby::Lobby;
+use native_hands::NativeHands;
 use native_quads::NativeQuadLayers;
 use openxr as xr;
 use passthrough::PassthroughLayer;
@@ -420,6 +422,7 @@ pub fn entry_point() {
         let mut stream_context = None::<StreamContext>;
         let mut passthrough_layer = None;
         let mut native_quads = NativeQuadLayers::default();
+        let mut native_hands = None::<NativeHands>;
 
         let mut event_storage = xr::EventDataBuffer::new();
         let mut headset_is_worn = true;
@@ -519,6 +522,11 @@ pub fn entry_point() {
                             passthrough_layer = None;
                         }
 
+                        native_hands = NativeHands::new(
+                            &xr_session,
+                            &graphics_context,
+                            context.target_view_resolution(),
+                        );
                         stream_context = Some(context);
 
                         core_context.send_proximity_state(headset_is_worn);
@@ -533,6 +541,7 @@ pub fn entry_point() {
                             .select_sources(&lobby_interaction_sources);
 
                         native_quads.clear();
+                        native_hands = None;
                         stream_context = None;
                     }
                     ClientCoreEvent::Haptics {
@@ -631,6 +640,7 @@ pub fn entry_point() {
             let native_quads_space = stream_context
                 .as_ref()
                 .map(StreamContext::stage_reference_space);
+            let hands_selected = stream_context.as_ref().map(StreamContext::hands_selected);
 
             // todo: allow rendering lobby and stream layers at the same time and add cross fade
             let (layer, display_time) = if let Some(stream) = &mut stream_context {
@@ -639,19 +649,36 @@ pub fn entry_point() {
                 (lobby.render(vsync_time), vsync_time)
             };
 
+            // After the stream (which may wait for a decoded frame), with the joints and views
+            // predicted for this frame's display time
+            if let (Some(hands), Some(space), Some(selected)) =
+                (&mut native_hands, &native_quads_space, &hands_selected)
+            {
+                hands.render(space, &interaction_context, selected, vsync_time);
+            }
+
             let projection_layer = layer.build();
             let quad_layers = native_quads_space
                 .as_deref()
                 .map(|space| native_quads.build(space))
                 .unwrap_or_default();
+            let hands_layer_builder = native_hands
+                .as_ref()
+                .zip(native_quads_space.as_deref())
+                .and_then(|(hands, space)| hands.build(space));
+            let hands_layer = hands_layer_builder.as_ref().map(|builder| builder.build());
             let mut layers: Vec<&xr::CompositionLayerBase<_>> =
-                Vec::with_capacity(2 + quad_layers.len());
+                Vec::with_capacity(3 + quad_layers.len());
             if let Some(passthrough_layer) = &passthrough_layer {
                 layers.push(passthrough_layer);
             }
             layers.push(&projection_layer);
             // On top of the stream: debug reference, always visible
             layers.extend(quad_layers.iter().map(|layer| &**layer));
+            // Hands on top of everything
+            if let Some(hands_layer) = &hands_layer {
+                layers.push(hands_layer);
+            }
 
             graphics_context.make_current();
             let res = xr_frame_stream.end(

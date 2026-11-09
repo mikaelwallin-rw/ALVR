@@ -106,6 +106,9 @@ pub struct StreamContext {
     input_thread: Option<JoinHandle<()>>,
     input_thread_running: Arc<RelaxedAtomic>,
     input_diagnostics_enabled: Arc<RelaxedAtomic>,
+    // Per hand (left, right): the hand skeleton is the selected input source (not a controller),
+    // updated by the input thread
+    hands_selected: Arc<[RelaxedAtomic; 2]>,
     config: ParsedStreamConfig,
     target_view_resolution: UVec2,
     renderer: StreamRenderer,
@@ -257,6 +260,7 @@ impl StreamContext {
             input_thread: None,
             input_thread_running,
             input_diagnostics_enabled: Arc::new(RelaxedAtomic::new(config.log_input_diagnostics)),
+            hands_selected: Arc::new([RelaxedAtomic::new(false), RelaxedAtomic::new(false)]),
             config,
             target_view_resolution,
             renderer,
@@ -306,6 +310,7 @@ impl StreamContext {
             let refresh_rate = self.config.refresh_rate_hint;
             let running = Arc::clone(&self.input_thread_running);
             let input_diagnostics_enabled = Arc::clone(&self.input_diagnostics_enabled);
+            let hands_selected = Arc::clone(&self.hands_selected);
             move || {
                 stream_input_loop(
                     &core_ctx,
@@ -316,6 +321,7 @@ impl StreamContext {
                     refresh_rate,
                     running,
                     input_diagnostics_enabled,
+                    &hands_selected,
                 )
             }
         }));
@@ -382,6 +388,14 @@ impl StreamContext {
 
     pub fn stage_reference_space(&self) -> Arc<xr::Space> {
         Arc::clone(&self.stage_reference_space)
+    }
+
+    pub fn hands_selected(&self) -> Arc<[RelaxedAtomic; 2]> {
+        Arc::clone(&self.hands_selected)
+    }
+
+    pub fn target_view_resolution(&self) -> UVec2 {
+        self.target_view_resolution
     }
 
     pub fn update_real_time_config(&mut self, config: &RealTimeConfig) {
@@ -628,6 +642,7 @@ fn stream_input_loop(
     refresh_rate: f32,
     running: Arc<RelaxedAtomic>,
     input_diagnostics_enabled: Arc<RelaxedAtomic>,
+    hands_selected: &[RelaxedAtomic; 2],
 ) {
     let mut last_controller_poses = [Pose::IDENTITY; 2];
     let mut last_palm_poses = [Pose::IDENTITY; 2];
@@ -714,6 +729,8 @@ fn stream_input_loop(
         ];
         let left_hand_data = left_selection.hand_data;
         let right_hand_data = right_selection.hand_data;
+        hands_selected[0].set(left_hand_data.skeleton_joints.is_some());
+        hands_selected[1].set(right_hand_data.skeleton_joints.is_some());
 
         // Note: When multimodal input is enabled, we are sure that when free hands are used
         // (not holding controllers) the controller data is None.
