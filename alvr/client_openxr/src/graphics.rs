@@ -29,6 +29,19 @@ pub fn swapchain_format(
     alvr_graphics::choose_swapchain_format(&formats, enable_hdr)
 }
 
+// GL_SRGB8_ALPHA8 when the runtime offers it, else GL_RGBA8. OpenXR compositors treat UNORM
+// swapchains as linear, so sRGB-encoded content needs the sRGB format (or linearizing).
+pub fn srgb_swapchain_format(session: &xr::Session<xr::OpenGlEs>) -> (u32, bool) {
+    let formats = session.enumerate_swapchain_formats().unwrap_or_default();
+    if formats.contains(&glow::SRGB8_ALPHA8) {
+        (glow::SRGB8_ALPHA8, true)
+    } else {
+        alvr_common::warn!("No GL_SRGB8_ALPHA8 swapchain format, offered: {formats:#x?}");
+
+        (glow::RGBA8, false)
+    }
+}
+
 #[allow(unused_variables)]
 pub fn create_swapchain(
     session: &xr::Session<xr::OpenGlEs>,

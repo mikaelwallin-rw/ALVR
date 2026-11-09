@@ -269,6 +269,7 @@ dependencies = [
  "libc",
  "ndk-context",
  "openxr",
+ "png 0.17.16",
 ]
 
 [[package]]

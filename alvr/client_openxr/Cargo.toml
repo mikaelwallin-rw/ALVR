@@ -21,6 +21,7 @@ jni = "0.22"
 glow = "0.16"
 jpeg-encoder = "0.7"
 openxr = "0.21"
+png = "0.17"
 
 [target.'cfg(target_os = "android")'.dependencies]
 # Pinning android-activity to 0.6.0. v0.6.1 changed ndk-context initialization from Activity to
@@ -76,6 +77,9 @@ name = "android.permission.WAKE_LOCK"
 # Pico: headset camera frames through SecureMR (overlay calibration)
 [[package.metadata.android.uses_permission]]
 name = "android.permission.CAMERA"
+# TEST HOOK: desktop-fidelity test images in /sdcard/Download (native_quads.rs)
+[[package.metadata.android.uses_permission]]
+name = "android.permission.READ_MEDIA_IMAGES"
 [[package.metadata.android.uses_permission]]
 name = "org.khronos.openxr.permission.OPENXR"
 [[package.metadata.android.uses_permission]]
