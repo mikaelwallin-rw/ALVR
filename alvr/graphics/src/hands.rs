@@ -6,6 +6,12 @@
 // Skinning runs on the CPU (about 1600 vertices per hand): GPU skinning through a uniform array
 // of joint matrices indexed by an integer vertex attribute dropped every finger vertex on the PICO
 // 4 Ultra (only the wrist, palm base and thumb were drawn).
+//
+// Shape (HandShape): girth = each vertex's offset from its joints' bone axes (joint-local X and Y;
+// -Z runs along the bone) scaled per joint, so fingertip and joint POSITIONS stay exactly where
+// tracking puts them; scale = uniform about the wrist (moves the fingertips, off by default).
+// The mesh's own girth per joint (median distance of the vertices it dominates from the bone
+// axis) is measured at load, so the tracked XR_EXT_hand_tracking joint radii can drive it.
 
 use super::{GraphicsContext, MAX_PUSH_CONSTANTS_SIZE};
 use alvr_common::{
@@ -42,7 +48,10 @@ const GPU_VERTEX_SIZE: usize = 24;
 const LEFT_HAND_MESH: &[u8] = include_bytes!("../resources/hands/pico_hand_left.bin");
 const RIGHT_HAND_MESH: &[u8] = include_bytes!("../resources/hands/pico_hand_right.bin");
 
-const SAMPLE_COUNT: u32 = 4;
+// Skinned vertex buffers in flight
+const VERTEX_BUFFER_RING: usize = 3;
+// Supported MSAA sample counts (1 = render straight into the swapchain image, no resolve)
+pub const HANDS_SAMPLE_COUNTS: [u32; 3] = [1, 2, 4];
 const DEPTH_FORMAT: TextureFormat = TextureFormat::Depth24Plus;
 
 const VIEW_PROJ_CONST_SIZE: u32 = mem::size_of::<Mat4>() as u32;
@@ -73,12 +82,76 @@ struct MeshVertex {
     weights: [f32; INFLUENCES],
 }
 
+/// Hand shape adjustments, per hand
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HandShape {
+    /// Girth factor per joint (1 = the mesh as modelled), applied perpendicular to the bones
+    pub girth: [f32; HAND_JOINT_COUNT],
+    /// Length factor per joint along its bone (joint-local Z): match it to how far the joints were
+    /// moved apart (finger lengthening, see lengthen_fingers()) so the segments stretch with them
+    pub length: [f32; HAND_JOINT_COUNT],
+    /// Uniform scale about the wrist (1 = the tracked joint positions)
+    pub scale: f32,
+}
+
+impl Default for HandShape {
+    fn default() -> Self {
+        Self {
+            girth: [1.0; HAND_JOINT_COUNT],
+            length: [1.0; HAND_JOINT_COUNT],
+            scale: 1.0,
+        }
+    }
+}
+
+/// XR_EXT_hand_tracking finger chains, each from its knuckle (the base, which stays) to the tip:
+/// thumb, index, middle, ring, little
+pub const HAND_FINGER_CHAINS: [&[usize]; 5] = [
+    &[3, 4, 5],
+    &[7, 8, 9, 10],
+    &[12, 13, 14, 15],
+    &[17, 18, 19, 20],
+    &[22, 23, 24, 25],
+];
+
+/// Lengthens every finger bone by `factor` (palm, wrist, metacarpals and knuckles stay): each joint
+/// after a finger's knuckle moves outward along its finger, orientations unchanged
+pub fn lengthen_fingers(
+    joints: &[Pose; HAND_JOINT_COUNT],
+    factor: f32,
+) -> [Pose; HAND_JOINT_COUNT] {
+    let mut out = *joints;
+    for chain in HAND_FINGER_CHAINS {
+        let base = joints[chain[0]].position;
+        for &joint in &chain[1..] {
+            out[joint].position = base + (joints[joint].position - base) * factor;
+        }
+    }
+    out
+}
+
+/// HandShape::length for lengthen_fingers(factor): the finger joints (knuckle to tip) stretch
+pub fn finger_length_factors(factor: f32) -> [f32; HAND_JOINT_COUNT] {
+    let mut length = [1.0; HAND_JOINT_COUNT];
+    for chain in HAND_FINGER_CHAINS {
+        for &joint in chain {
+            length[joint] = factor;
+        }
+    }
+    length
+}
+
 struct HandMesh {
     joint_from_mesh: [Mat4; HAND_JOINT_COUNT],
+    // Median perpendicular distance from the bone axis of the vertices each joint dominates
+    // (meters; 0 when a joint dominates too few vertices, e.g. the tips)
+    joint_radii: [f32; HAND_JOINT_COUNT],
     vertices: Vec<MeshVertex>,
     // Per tip joint (HAND_TIP_JOINTS), the vertex nearest to it in the bind pose
     tip_vertices: [usize; 5],
-    vertex_buffer: Buffer,
+    // Ring of skinned vertex buffers: a frame never overwrites the buffer an earlier frame's draw
+    // may still read (the GL driver would stall on that implicit sync)
+    vertex_buffers: Vec<Buffer>,
     index_buffer: Buffer,
     index_count: u32,
 }
@@ -87,9 +160,11 @@ pub struct HandsRenderer {
     context: Rc<GraphicsContext>,
     pipeline: RenderPipeline,
     meshes: [HandMesh; 2],
-    color_view: TextureView,
+    // Multisampled color target, resolved into the swapchain image; None without MSAA
+    color_view: Option<TextureView>,
     depth_view: TextureView,
     render_targets: [Vec<TextureView>; 2],
+    frame_index: std::cell::Cell<usize>,
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, String> {
@@ -132,6 +207,7 @@ fn create_target(
     device: &Device,
     resolution: UVec2,
     format: TextureFormat,
+    sample_count: u32,
     label: &str,
 ) -> TextureView {
     device
@@ -143,7 +219,7 @@ fn create_target(
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
-            sample_count: SAMPLE_COUNT,
+            sample_count,
             dimension: TextureDimension::D2,
             format,
             usage: TextureUsages::RENDER_ATTACHMENT,
@@ -194,6 +270,27 @@ fn load_mesh(context: &GraphicsContext, label: &str, bytes: &[u8]) -> Result<Han
         .get(indices_start..indices_start + index_count * INDEX_SIZE)
         .ok_or_else(|| format!("{label} hand mesh truncated"))?;
 
+    let joint_radii = std::array::from_fn(|joint| {
+        let mut distances = vertices
+            .iter()
+            .filter(|vertex| {
+                let dominant = (0..INFLUENCES)
+                    .max_by(|&a, &b| vertex.weights[a].total_cmp(&vertex.weights[b]))
+                    .unwrap_or(0);
+                vertex.joints[dominant] == joint
+            })
+            .map(|vertex| {
+                let local = joint_from_mesh[joint].transform_point3(vertex.position);
+                local.x.hypot(local.y)
+            })
+            .collect::<Vec<_>>();
+        if distances.len() < 5 {
+            return 0.0;
+        }
+        distances.sort_by(f32::total_cmp);
+        distances[distances.len() / 2]
+    });
+
     let rest_positions = joint_from_mesh.map(|matrix| matrix.inverse().w_axis.truncate());
     let tip_vertices = HAND_TIP_JOINTS.map(|joint| {
         let target = rest_positions[joint];
@@ -210,12 +307,16 @@ fn load_mesh(context: &GraphicsContext, label: &str, bytes: &[u8]) -> Result<Han
     });
 
     let device = &context.device;
-    let vertex_buffer = device.create_buffer(&BufferDescriptor {
-        label: Some("hand_vertices"),
-        size: (vertex_count * GPU_VERTEX_SIZE) as u64,
-        usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    let vertex_buffers = (0..VERTEX_BUFFER_RING)
+        .map(|_| {
+            device.create_buffer(&BufferDescriptor {
+                label: Some("hand_vertices"),
+                size: (vertex_count * GPU_VERTEX_SIZE) as u64,
+                usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        })
+        .collect();
     let index_data = padded(index_bytes);
     let index_buffer = device.create_buffer(&BufferDescriptor {
         label: Some("hand_indices"),
@@ -227,35 +328,55 @@ fn load_mesh(context: &GraphicsContext, label: &str, bytes: &[u8]) -> Result<Han
 
     Ok(HandMesh {
         joint_from_mesh,
+        joint_radii,
         vertices,
         tip_vertices,
-        vertex_buffer,
+        vertex_buffers,
         index_buffer,
         index_count: index_count as u32,
     })
 }
 
-// stage_from_joint * joint_from_mesh, per joint
-fn skin_matrices(mesh: &HandMesh, joints: &[Pose; HAND_JOINT_COUNT]) -> [Mat4; HAND_JOINT_COUNT] {
-    std::array::from_fn(|idx| {
-        Mat4::from_rotation_translation(joints[idx].orientation, joints[idx].position)
-            * mesh.joint_from_mesh[idx]
-    })
+// Per joint: stage_from_joint * girth (joint-local X and Y) * joint_from_mesh, and its inverse
+// transpose for the normals (the girth scale is non-uniform)
+struct Skin {
+    points: [Mat4; HAND_JOINT_COUNT],
+    normals: [Mat4; HAND_JOINT_COUNT],
 }
 
-fn skin_vertex(vertex: &MeshVertex, skin: &[Mat4; HAND_JOINT_COUNT]) -> (Vec3, Vec3) {
+fn skin_matrices(
+    joint_from_mesh: &[Mat4; HAND_JOINT_COUNT],
+    joints: &[Pose; HAND_JOINT_COUNT],
+    shape: &HandShape,
+) -> Skin {
+    // The scale about the wrist applies to the joint positions (the tips move with it) and to the
+    // whole mesh
+    let wrist = joints[1].position;
+    let points: [Mat4; HAND_JOINT_COUNT] = std::array::from_fn(|idx| {
+        let position = wrist + (joints[idx].position - wrist) * shape.scale;
+        let girth = shape.girth[idx];
+        Mat4::from_rotation_translation(joints[idx].orientation, position)
+            * Mat4::from_scale(Vec3::new(girth, girth, shape.length[idx]) * shape.scale)
+            * joint_from_mesh[idx]
+    });
+    let normals = points.map(|matrix| matrix.inverse().transpose());
+
+    Skin { points, normals }
+}
+
+fn skin_vertex(vertex: &MeshVertex, skin: &Skin) -> (Vec3, Vec3) {
     let mut position = Vec3::ZERO;
     let mut normal = Vec3::ZERO;
     for slot in 0..INFLUENCES {
         let weight = vertex.weights[slot];
         if weight > 0.0 {
-            let matrix = &skin[vertex.joints[slot]];
-            position += matrix.transform_point3(vertex.position) * weight;
-            normal += matrix.transform_vector3(vertex.normal) * weight;
+            let joint = vertex.joints[slot];
+            position += skin.points[joint].transform_point3(vertex.position) * weight;
+            normal += skin.normals[joint].transform_vector3(vertex.normal) * weight;
         }
     }
 
-    (position, normal)
+    (position, normal.normalize_or_zero())
 }
 
 impl HandsRenderer {
@@ -265,7 +386,12 @@ impl HandsRenderer {
         swapchain_textures: [Vec<u32>; 2],
         // Format of the swapchain textures (Rgba8UnormSrgb preferred)
         format: TextureFormat,
+        // One of HANDS_SAMPLE_COUNTS
+        sample_count: u32,
     ) -> Result<Self, String> {
+        if !HANDS_SAMPLE_COUNTS.contains(&sample_count) {
+            return Err(format!("unsupported hands sample count {sample_count}"));
+        }
         let device = &context.device;
 
         let shader_module = device.create_shader_module(include_wgsl!("../resources/hands.wgsl"));
@@ -303,7 +429,7 @@ impl HandsRenderer {
                 bias: Default::default(),
             }),
             multisample: MultisampleState {
-                count: SAMPLE_COUNT,
+                count: sample_count,
                 ..Default::default()
             },
             fragment: Some(FragmentState {
@@ -325,8 +451,15 @@ impl HandsRenderer {
             load_mesh(&context, "right", RIGHT_HAND_MESH)?,
         ];
 
-        let color_view = create_target(device, view_resolution, format, "hands_color");
-        let depth_view = create_target(device, view_resolution, DEPTH_FORMAT, "hands_depth");
+        let color_view = (sample_count > 1)
+            .then(|| create_target(device, view_resolution, format, sample_count, "hands_color"));
+        let depth_view = create_target(
+            device,
+            view_resolution,
+            DEPTH_FORMAT,
+            sample_count,
+            "hands_depth",
+        );
 
         let render_targets = [
             super::create_gl_swapchain(device, &swapchain_textures[0], view_resolution, format),
@@ -340,7 +473,13 @@ impl HandsRenderer {
             color_view,
             depth_view,
             render_targets,
+            frame_index: std::cell::Cell::new(0),
         })
+    }
+
+    /// The mesh's own girth per joint (meters, 0 = not measured), see HandMesh::joint_radii
+    pub fn mesh_joint_radii(&self, hand_idx: usize) -> [f32; HAND_JOINT_COUNT] {
+        self.meshes[hand_idx].joint_radii
     }
 
     /// Bind pose joint positions of a hand mesh (0 = left, 1 = right), in mesh space
@@ -357,7 +496,7 @@ impl HandsRenderer {
         joints: &[Pose; HAND_JOINT_COUNT],
     ) -> HandSkinningCheck {
         let mesh = &self.meshes[hand_idx];
-        let skin = skin_matrices(mesh, joints);
+        let skin = skin_matrices(&mesh.joint_from_mesh, joints, &HandShape::default());
 
         let max_tip_error = HAND_TIP_JOINTS
             .iter()
@@ -381,15 +520,18 @@ impl HandsRenderer {
     }
 
     /// `hands`: the 26 joints of each hand (left, right) in the same space as the view poses, or
-    /// None to hide that hand.
+    /// None to hide that hand. `shapes`: girth and scale per hand.
     pub fn render(
         &self,
         view_params: [HandsViewParams; 2],
         hands: [Option<[Pose; HAND_JOINT_COUNT]>; 2],
+        shapes: [HandShape; 2],
     ) {
-        for (mesh, joints) in self.meshes.iter().zip(&hands) {
+        let ring_index = self.frame_index.get() % VERTEX_BUFFER_RING;
+        self.frame_index.set(self.frame_index.get().wrapping_add(1));
+        for ((mesh, joints), shape) in self.meshes.iter().zip(&hands).zip(&shapes) {
             if let Some(joints) = joints {
-                let skin = skin_matrices(mesh, joints);
+                let skin = skin_matrices(&mesh.joint_from_mesh, joints, shape);
                 let mut data = Vec::with_capacity(mesh.vertices.len() * GPU_VERTEX_SIZE);
                 for vertex in &mesh.vertices {
                     let (position, normal) = skin_vertex(vertex, &skin);
@@ -399,7 +541,7 @@ impl HandsRenderer {
                 }
                 self.context
                     .queue
-                    .write_buffer(&mesh.vertex_buffer, 0, &data);
+                    .write_buffer(&mesh.vertex_buffers[ring_index], 0, &data);
             }
         }
 
@@ -415,16 +557,22 @@ impl HandsRenderer {
             let view = Mat4::from_rotation_translation(pose.orientation, pose.position).inverse();
             let view_proj = super::projection_from_fov(view_input.view_params.fov) * view;
 
+            let swapchain_view =
+                &self.render_targets[view_idx][view_input.swapchain_index as usize];
+            // With MSAA: draw into the multisampled target and resolve into the swapchain image;
+            // without: draw straight into the swapchain image
+            let (view, resolve_target, store) = match &self.color_view {
+                Some(color_view) => (color_view, Some(swapchain_view), StoreOp::Discard),
+                None => (swapchain_view, None, StoreOp::Store),
+            };
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some(&format!("hands_view_{view_idx}")),
                 color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &self.color_view,
-                    resolve_target: Some(
-                        &self.render_targets[view_idx][view_input.swapchain_index as usize],
-                    ),
+                    view,
+                    resolve_target,
                     ops: Operations {
                         load: LoadOp::Clear(Color::TRANSPARENT),
-                        store: StoreOp::Discard,
+                        store,
                     },
                 })],
                 depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
@@ -449,7 +597,7 @@ impl HandsRenderer {
             pass.set_push_constants(ShaderStages::VERTEX_FRAGMENT, 0, &push_constants);
             for (mesh, joints) in self.meshes.iter().zip(&hands) {
                 if joints.is_some() {
-                    pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    pass.set_vertex_buffer(0, mesh.vertex_buffers[ring_index].slice(..));
                     pass.set_index_buffer(mesh.index_buffer.slice(..), IndexFormat::Uint16);
                     pass.draw_indexed(0..mesh.index_count, 0, 0..1);
                 }
@@ -457,5 +605,106 @@ impl HandsRenderer {
         }
 
         self.context.queue.submit(Some(encoder.finish()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alvr_common::glam::Quat;
+
+    #[test]
+    fn girth_keeps_joint_positions_and_scales_only_across_the_bone() {
+        // Bind pose: every joint at the origin of mesh space, identity frames
+        let joint_from_mesh = [Mat4::IDENTITY; HAND_JOINT_COUNT];
+        let joints = std::array::from_fn(|idx| Pose {
+            orientation: Quat::from_rotation_y(0.3),
+            position: Vec3::new(0.1, 1.0, -0.4) + Vec3::Z * -(idx as f32) * 0.01,
+        });
+        let shape = HandShape {
+            girth: [1.5; HAND_JOINT_COUNT],
+            ..Default::default()
+        };
+        let skin = skin_matrices(&joint_from_mesh, &joints, &shape);
+        let vertex = |position: Vec3, joint: usize| MeshVertex {
+            position,
+            normal: Vec3::X,
+            joints: [joint, 0, 0, 0],
+            weights: [1.0, 0.0, 0.0, 0.0],
+        };
+        // A vertex on the bone axis (joint-local Z) stays where tracking puts it
+        let (on_axis, _) = skin_vertex(&vertex(Vec3::new(0.0, 0.0, -0.01), 10), &skin);
+        let expected = joints[10].position + joints[10].orientation * Vec3::new(0.0, 0.0, -0.01);
+        assert!(on_axis.distance(expected) < 1e-6);
+        // A vertex beside the bone moves 1.5 times as far from the axis
+        let (beside, normal) = skin_vertex(&vertex(Vec3::new(0.004, 0.0, 0.0), 10), &skin);
+        assert!((beside.distance(joints[10].position) - 0.006).abs() < 1e-6);
+        assert!((normal.length() - 1.0).abs() < 1e-5);
+
+        // Scale about the wrist moves the joints
+        let shape = HandShape {
+            scale: 1.1,
+            ..Default::default()
+        };
+        let skin = skin_matrices(&joint_from_mesh, &joints, &shape);
+        let (tip, _) = skin_vertex(&vertex(Vec3::ZERO, 10), &skin);
+        let wrist = joints[1].position;
+        assert!(tip.distance(wrist + (joints[10].position - wrist) * 1.1) < 1e-6);
+    }
+
+    // A straight hand along -Z (each joint's -Z towards the next), 2 cm bones
+    fn straight_hand() -> [Pose; HAND_JOINT_COUNT] {
+        std::array::from_fn(|idx| Pose {
+            orientation: Quat::IDENTITY,
+            position: Vec3::new(idx as f32 * 0.001, 0.0, -0.02 * idx as f32),
+        })
+    }
+
+    #[test]
+    fn lengthened_fingers_stay_connected_and_the_palm_stays() {
+        let joints = straight_hand();
+        let longer = lengthen_fingers(&joints, 1.2);
+        // Palm, wrist, metacarpals and knuckles unchanged
+        for joint in [0, 1, 2, 3, 6, 7, 11, 12, 16, 17, 21, 22] {
+            assert_eq!(
+                longer[joint].position, joints[joint].position,
+                "joint {joint}"
+            );
+        }
+        for chain in HAND_FINGER_CHAINS {
+            for pair in chain.windows(2) {
+                let before = joints[pair[1]].position - joints[pair[0]].position;
+                let after = longer[pair[1]].position - longer[pair[0]].position;
+                // Each bone 1.2 times as long, same direction: the chain stays connected
+                assert!((after - before * 1.2).length() < 1e-6, "{pair:?}");
+            }
+        }
+
+        // The mesh stretches with the joints: a vertex at the next joint in a joint's bind frame
+        // lands on the moved next joint
+        let joint_from_mesh: [Mat4; HAND_JOINT_COUNT] =
+            std::array::from_fn(|idx| Mat4::from_translation(-joints[idx].position));
+        let shape = HandShape {
+            length: finger_length_factors(1.2),
+            ..Default::default()
+        };
+        let skin = skin_matrices(&joint_from_mesh, &longer, &shape);
+        for chain in HAND_FINGER_CHAINS {
+            for pair in chain.windows(2) {
+                let vertex = MeshVertex {
+                    position: joints[pair[1]].position,
+                    normal: Vec3::Y,
+                    joints: [pair[0], 0, 0, 0],
+                    weights: [1.0, 0.0, 0.0, 0.0],
+                };
+                let (position, _) = skin_vertex(&vertex, &skin);
+                // Bone direction of the straight hand is not exactly -Z (x offset): compare along
+                // the bone only within the girth-free axis
+                let expected = longer[pair[0]].position
+                    + (joints[pair[1]].position - joints[pair[0]].position)
+                        * Vec3::new(1.0, 1.0, 1.2);
+                assert!(position.distance(expected) < 1e-6, "{pair:?}");
+            }
+        }
     }
 }

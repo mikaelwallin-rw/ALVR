@@ -462,7 +462,9 @@ impl StreamRenderer {
         view_params: [StreamViewParams; 2],
         passthrough: Option<&PassthroughMode>,
         opaque_regions: &OpaqueRegionsParams,
-    ) {
+        // Key chroma direction: probe the new frame for the key colour (see key_colour_fraction())
+        key_probe: Option<Vec3>,
+    ) -> Option<f32> {
         let (opaque_regions_count, upload) =
             self.update_opaque_regions(&view_params, passthrough, opaque_regions);
         if upload {
@@ -508,6 +510,11 @@ impl StreamRenderer {
         if !hardware_buffer.is_null() {
             self.staging_renderer.render(hardware_buffer);
         }
+        // Right after the staging copy, before the stream pass is queued: the synchronous readback
+        // then only waits for the copy
+        let key_fraction = key_probe
+            .filter(|_| !hardware_buffer.is_null())
+            .map(|key_dir| self.key_colour_fraction(key_dir));
 
         let mut encoder = self
             .context
@@ -616,12 +623,61 @@ impl StreamRenderer {
         }
 
         self.context.queue.submit(iter::once(encoder.finish()));
+
+        key_fraction
     }
+
+    /// Fraction (0..1) of a sparse sample grid of the last staged frame (left view) whose colour is
+    /// the key colour or a darkened/faded version of it (same chroma direction, clearly saturated).
+    /// Synchronous GPU readback of a tiny grid: call after render(), only while it matters (e.g.
+    /// passthrough off, where a key colour frame would be shown as is).
+    pub fn key_colour_fraction(&mut self, key_dir: Vec3) -> f32 {
+        if key_dir == Vec3::ZERO {
+            return 0.0;
+        }
+        let samples = self.staging_renderer.probe_left_view();
+        key_fraction(&samples, key_dir)
+    }
+}
+
+/// key_chroma_direction() of magenta (SteamVR's default chroma key background)
+pub fn magenta_chroma_direction() -> Vec3 {
+    const LUMA: Vec3 = Vec3::new(0.2126, 0.7152, 0.0722);
+    let key = Vec3::new(1.0, 0.0, 1.0);
+    (key - Vec3::splat(key.dot(LUMA))).normalize()
+}
+
+/// Minimum chroma magnitude (0..1 colour units) of a key-like sample: excludes greys and blacks
+const KEY_PROBE_MIN_CHROMA: f32 = 0.06;
+/// Minimum cosine between a sample's chroma and the key chroma
+const KEY_PROBE_MIN_COSINE: f32 = 0.85;
+
+pub fn key_fraction(samples: &[[u8; 4]], key_dir: Vec3) -> f32 {
+    const LUMA: Vec3 = Vec3::new(0.2126, 0.7152, 0.0722);
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let key_like = samples
+        .iter()
+        .filter(|sample| {
+            let colour = Vec3::new(
+                f32::from(sample[0]),
+                f32::from(sample[1]),
+                f32::from(sample[2]),
+            ) / 255.0;
+            let chroma = colour - Vec3::splat(colour.dot(LUMA));
+            let magnitude = chroma.length();
+            magnitude >= KEY_PROBE_MIN_CHROMA
+                && chroma.dot(key_dir) >= KEY_PROBE_MIN_COSINE * magnitude
+        })
+        .count();
+
+    key_like as f32 / samples.len() as f32
 }
 
 // Normalized chroma (colour minus luma) of the key colour, in the decoded stream colour space.
 // Must match key_color() in stream.wgsl.
-fn key_chroma_direction(config: &PassthroughMode) -> Vec3 {
+pub fn key_chroma_direction(config: &PassthroughMode) -> Vec3 {
     const LUMA: Vec3 = Vec3::new(0.2126, 0.7152, 0.0722);
 
     let key = match config {
@@ -859,4 +915,35 @@ pub fn compute_target_view_resolution(
         target_resolution *= upscaling.upscale_factor;
     }
     target_resolution.as_uvec2()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn magenta_dir() -> Vec3 {
+        let key = Vec3::new(1.0, 0.0, 1.0);
+        (key - Vec3::splat(key.dot(Vec3::new(0.2126, 0.7152, 0.0722)))).normalize()
+    }
+
+    #[test]
+    fn key_fraction_counts_full_and_faded_key_but_not_content() {
+        let dir = magenta_dir();
+        // Measured in the 2026-11-10 13:31 recording: SteamVR magenta, its fade to black, V3's
+        // dark dialog, V3's sunny scene, black
+        assert_eq!(key_fraction(&[[246, 4, 246, 255]], dir), 1.0);
+        assert_eq!(key_fraction(&[[143, 5, 145, 255]], dir), 1.0);
+        assert_eq!(key_fraction(&[[40, 4, 40, 255]], dir), 1.0);
+        assert_eq!(key_fraction(&[[20, 20, 24, 255]], dir), 0.0);
+        assert_eq!(key_fraction(&[[187, 180, 160, 255]], dir), 0.0);
+        assert_eq!(key_fraction(&[[3, 3, 4, 255]], dir), 0.0);
+        // Content colours that are not magenta: red, blue, Tenstar green
+        assert_eq!(key_fraction(&[[200, 30, 30, 255]], dir), 0.0);
+        assert_eq!(key_fraction(&[[30, 30, 200, 255]], dir), 0.0);
+        assert_eq!(key_fraction(&[[147, 203, 77, 255]], dir), 0.0);
+        assert_eq!(
+            key_fraction(&[[246, 4, 246, 255], [20, 20, 24, 255]], dir),
+            0.5
+        );
+    }
 }
