@@ -4,14 +4,28 @@
 // with the real object seen in passthrough (e.g. the same chessboard shown on a monitor).
 // A quad with a video stream id shows that screen video stream instead (screen_video.rs), once
 // the stream has decoded a frame.
+// A kept quad (same index, or same video stream) that moves a lot at once (scene mode switching the
+// touchscreen between its passthrough-compensated and true pose, a recalibration) glides there over
+// MOVE_DURATION (ease in/out) instead of jumping; small updates (trim, live tracking) are immediate.
 
-use crate::{graphics, screen_video::ScreenVideoStreams};
-use alvr_common::{glam::UVec2, info, warn};
+use crate::{
+    graphics,
+    screen_video::{ScreenVideoStreams, VideoQuadGeometry},
+};
+use alvr_common::{Pose, glam::UVec2, info, warn};
 use alvr_graphics::GraphicsContext;
 use alvr_packets::NativeQuad;
 use glow::{self as gl, HasContext};
 use openxr as xr;
-use std::{fs::File, io::BufReader, num::NonZeroU32, path::Path, time::Instant};
+use std::{
+    fs::File,
+    io::BufReader,
+    mem,
+    num::NonZeroU32,
+    path::Path,
+    ptr,
+    time::{Duration, Instant},
+};
 
 // Approximate texture side, along the longer chessboard axis
 const TEXTURE_TARGET_SIZE: u32 = 1024;
@@ -27,14 +41,112 @@ const IMAGE_DIRS: [&str; 2] = [
 ];
 
 struct QuadLayer {
+    // Index of the quad in the overlay app's block (the PNG test hook is keyed by it)
+    index: usize,
     quad: NativeQuad,
     swapchain: xr::Swapchain<xr::OpenGlEs>,
     size: UVec2,
+    // Gliding from this pose/size to `quad`'s (see MOVE_DURATION)
+    moving: Option<Move>,
 }
+
+#[derive(Clone, Copy)]
+struct Move {
+    start: Instant,
+    pose: Pose,
+    width: f32,
+    height: f32,
+}
+
+// A move this large is animated (anything smaller is applied at once)
+const MOVE_MIN_METERS: f32 = 0.010;
+const MOVE_MIN_DEGREES: f32 = 0.5;
+const MOVE_MIN_SCALE: f32 = 0.01;
+// Same as the loading screen's fades
+const MOVE_DURATION: Duration = Duration::from_millis(500);
+
+fn ease_in_out(x: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    0.5 - 0.5 * (std::f32::consts::PI * x).cos()
+}
+
+impl QuadLayer {
+    /// Pose, width and height to draw now
+    fn displayed(&self, now: Instant) -> (Pose, f32, f32) {
+        let target = (self.quad.pose, self.quad.width, self.quad.height);
+        let Some(from) = self.moving else {
+            return target;
+        };
+        let k = ease_in_out(
+            now.saturating_duration_since(from.start).as_secs_f32() / MOVE_DURATION.as_secs_f32(),
+        );
+        (
+            Pose {
+                orientation: from.pose.orientation.slerp(target.0.orientation, k),
+                position: from.pose.position.lerp(target.0.position, k),
+            },
+            from.width + (target.1 - from.width) * k,
+            from.height + (target.2 - from.height) * k,
+        )
+    }
+
+    /// The quad's target changes to `quad`: glide if it is a large move
+    fn retarget(&mut self, quad: NativeQuad, now: Instant) {
+        let (pose, width, height) = self.displayed(now);
+        let meters = pose.position.distance(quad.pose.position);
+        let degrees = pose
+            .orientation
+            .angle_between(quad.pose.orientation)
+            .to_degrees();
+        let scale = quad.width / width.max(1e-6);
+        let large = meters >= MOVE_MIN_METERS
+            || degrees >= MOVE_MIN_DEGREES
+            || (scale - 1.0).abs() >= MOVE_MIN_SCALE;
+        let animating = self
+            .moving
+            .is_some_and(|from| now.saturating_duration_since(from.start) < MOVE_DURATION);
+        if large {
+            info!(
+                "Native quads: quad {} (stream {}) glides {:.0} mm, {degrees:.1} deg, scale {scale:.3} \
+                 over {} ms",
+                self.index,
+                quad.video_stream_id,
+                meters * 1000.0,
+                MOVE_DURATION.as_millis()
+            );
+            self.moving = Some(Move {
+                start: now,
+                pose,
+                width,
+                height,
+            });
+        } else if !animating {
+            self.moving = None;
+        }
+        // A small update during a glide moves its target; the glide continues
+        self.quad = quad;
+    }
+}
+
+// Pose/size-only updates are frequent (trim, live driverFromStage): logged as a count
+const IN_PLACE_LOG_INTERVAL: Duration = Duration::from_secs(5);
+
+// Debug switches (debug_switches.rs): display time mode and the video quads' layer settings
+const DEBUG_SWITCHES_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
 pub struct NativeQuadLayers {
     layers: Vec<QuadLayer>,
+    in_place_updates: u32,
+    last_in_place_log: Option<Instant>,
+    // Chained to the video quad layers; None = not offered by the runtime or disabled
+    video_layer_settings: Option<xr::sys::CompositionLayerSettingsFB>,
+    layer_settings_flags: Option<u64>,
+    predicted_display_time: bool,
+    last_debug_switches_poll: Option<Instant>,
+    // Stream frame timestamp minus predicted display time, ms, since the last log
+    display_time_gaps: Vec<f32>,
+    last_display_time_log: Option<Instant>,
 }
 
 // Same chessboard texture: only the pose, size or video stream changed
@@ -45,55 +157,88 @@ fn same_texture(a: &NativeQuad, b: &NativeQuad) -> bool {
 }
 
 impl NativeQuadLayers {
-    // Replaces all quads. A quad whose texture is unchanged (pose, size or video stream changes)
-    // keeps its swapchain; other textures are drawn once here.
+    // Replaces all quads. A quad whose texture is unchanged at the same index, or with the same
+    // video stream, keeps its swapchain (pose, size or video stream changes), also when other quads
+    // appear or disappear (scene mode).
+    // Other textures are drawn once here. Screen video decoders are independent of the quads
+    // (screen_video.rs), so no change here restarts a decoder.
     pub fn set(
         &mut self,
         xr_session: &xr::Session<xr::OpenGlEs>,
         gfx_ctx: &GraphicsContext,
         quads: Vec<NativeQuad>,
     ) {
-        let reusable = self.layers.len() == quads.len()
-            && self
-                .layers
-                .iter()
-                .zip(&quads)
-                .all(|(layer, quad)| same_texture(&layer.quad, quad));
-        if reusable {
-            for (layer, quad) in self.layers.iter_mut().zip(quads) {
-                layer.quad = quad;
+        let mut old_layers = mem::take(&mut self.layers);
+        let mut new_quads = Vec::new();
+        for (index, quad) in quads.into_iter().enumerate() {
+            // A video quad keeps its layer by stream id: its index changes when scene mode hides
+            // the other screens
+            if let Some(position) = old_layers.iter().position(|layer| {
+                same_texture(&layer.quad, &quad)
+                    && (layer.index == index
+                        || quad.video_stream_id != 0
+                            && layer.quad.video_stream_id == quad.video_stream_id)
+            }) {
+                let mut layer = old_layers.swap_remove(position);
+                layer.index = index;
+                layer.retarget(quad, Instant::now());
+                self.layers.push(layer);
+            } else {
+                new_quads.push((index, quad));
+            }
+        }
+        let reused = self.layers.len();
+        let removed = old_layers.len();
+        drop(old_layers);
+        // Layers are submitted in the block's order
+        self.layers.sort_by_key(|layer| layer.index);
+
+        if new_quads.is_empty() && removed == 0 {
+            self.in_place_updates += 1;
+            if self
+                .last_in_place_log
+                .is_none_or(|instant| instant.elapsed() >= IN_PLACE_LOG_INTERVAL)
+            {
+                info!(
+                    "Native quads: {} pose/size update(s) applied in place to {reused} layer(s), no \
+                     swapchain recreated",
+                    self.in_place_updates
+                );
+                self.in_place_updates = 0;
+                self.last_in_place_log = Some(Instant::now());
             }
             return;
         }
 
-        self.layers.clear();
+        if !new_quads.is_empty() {
+            gfx_ctx.make_current();
+            // Chessboard colors and desktop images are sRGB-encoded
+            let (format, srgb) = graphics::srgb_swapchain_format(xr_session);
+            info!(
+                "Native quads: swapchain formats offered {:#x?}, using {format:#x}{}",
+                xr_session.enumerate_swapchain_formats().unwrap_or_default(),
+                if srgb {
+                    " (sRGB)"
+                } else {
+                    " (UNORM, linearizing on upload)"
+                }
+            );
 
-        gfx_ctx.make_current();
-        // Chessboard colors and desktop images are sRGB-encoded
-        let (format, srgb) = graphics::srgb_swapchain_format(xr_session);
-        info!(
-            "Native quads: swapchain formats offered {:#x?}, using {format:#x}{}",
-            xr_session.enumerate_swapchain_formats().unwrap_or_default(),
-            if srgb {
-                " (sRGB)"
-            } else {
-                " (UNORM, linearizing on upload)"
+            for (index, quad) in new_quads {
+                match create_layer(xr_session, gfx_ctx, quad, index, format, srgb) {
+                    Ok(layer) => self.layers.push(layer),
+                    Err(e) => warn!("Native quads: cannot create a quad layer: {e}"),
+                }
             }
-        );
-
-        for (index, quad) in quads.into_iter().enumerate() {
-            match create_layer(xr_session, gfx_ctx, quad, index, format, srgb) {
-                Ok(layer) => self.layers.push(layer),
-                Err(e) => warn!("Native quads: cannot create a quad layer: {e}"),
-            }
+            self.layers.sort_by_key(|layer| layer.index);
         }
-
         info!(
-            "Native quads: {} quad layer(s): {:?}",
+            "Native quads: {} quad layer(s) ({reused} kept, {removed} removed): {:?}",
             self.layers.len(),
             self.layers
                 .iter()
                 .map(|layer| (
+                    layer.index,
                     layer.quad.width,
                     layer.quad.height,
                     layer.size,
@@ -101,6 +246,84 @@ impl NativeQuadLayers {
                 ))
                 .collect::<Vec<_>>()
         );
+    }
+
+    // Once per frame, before build(): polls the debug switch files
+    pub fn poll_debug_switches(&mut self, xr_session: &xr::Session<xr::OpenGlEs>) {
+        if self
+            .last_debug_switches_poll
+            .is_some_and(|instant| instant.elapsed() < DEBUG_SWITCHES_POLL_INTERVAL)
+        {
+            return;
+        }
+        self.last_debug_switches_poll = Some(Instant::now());
+
+        let switches = crate::debug_switches::get();
+        let predicted = switches.predicted_display_time;
+        if predicted != self.predicted_display_time {
+            self.predicted_display_time = predicted;
+            info!(
+                "Native quads: display time mode {}",
+                if predicted {
+                    "PREDICTED (xrEndFrame with the runtime's predicted display time)"
+                } else {
+                    "STREAM (xrEndFrame with the stream frame's timestamp, upstream)"
+                }
+            );
+        }
+
+        let flags = switches.quad_settings_flags;
+        if self.layer_settings_flags == Some(flags) {
+            return;
+        }
+        self.layer_settings_flags = Some(flags);
+
+        let offered = xr_session
+            .instance()
+            .exts()
+            .fb_composition_layer_settings
+            .is_some();
+        self.video_layer_settings =
+            (offered && flags != 0).then(|| xr::sys::CompositionLayerSettingsFB {
+                ty: xr::StructureType::COMPOSITION_LAYER_SETTINGS_FB,
+                next: std::ptr::null(),
+                layer_flags: xr::CompositionLayerSettingsFlagsFB::from_raw(flags),
+            });
+        info!(
+            "Native quads: video layer settings flags {flags:#x} ({})",
+            if !offered {
+                "XR_FB_composition_layer_settings not enabled, ignored"
+            } else if flags == 0 {
+                "off"
+            } else {
+                "chained to the video quads"
+            }
+        );
+    }
+
+    /// Position and width of the quads that show a video stream (for the decode path choice)
+    pub fn video_quad_geometry(&self) -> Vec<VideoQuadGeometry> {
+        self.layers
+            .iter()
+            .filter(|layer| layer.quad.video_stream_id != 0)
+            .map(|layer| VideoQuadGeometry {
+                stream_id: layer.quad.video_stream_id,
+                position: layer.quad.pose.position,
+                width: layer.quad.width,
+            })
+            .collect()
+    }
+
+    /// The quads' rectangles (target poses), each grown by `margin` metres on every side
+    pub fn rects(&self, margin: f32) -> Vec<crate::extra_extensions::ProjectionRect> {
+        self.layers
+            .iter()
+            .map(|layer| crate::extra_extensions::ProjectionRect {
+                pose: layer.quad.pose,
+                width: layer.quad.width + 2.0 * margin,
+                height: layer.quad.height + 2.0 * margin,
+            })
+            .collect()
     }
 
     pub fn clear(&mut self) {
@@ -115,9 +338,11 @@ impl NativeQuadLayers {
         stage_space: &'a xr::Space,
         screen_video: &'a ScreenVideoStreams,
     ) -> Vec<xr::CompositionLayerQuad<'a, xr::OpenGlEs>> {
+        let now = Instant::now();
         self.layers
             .iter()
             .map(|layer| {
+                let (pose, width, height) = layer.displayed(now);
                 // Video (opaque) once the stream has a decoded frame, else the chessboard
                 let video = (layer.quad.video_stream_id != 0)
                     .then(|| screen_video.ready_swapchain(layer.quad.video_stream_id))
@@ -132,7 +357,7 @@ impl NativeQuadLayers {
                     ),
                 };
 
-                xr::CompositionLayerQuad::new()
+                let layer = xr::CompositionLayerQuad::new()
                     .layer_flags(flags)
                     .space(stage_space)
                     .eye_visibility(xr::EyeVisibility::BOTH)
@@ -148,13 +373,65 @@ impl NativeQuadLayers {
                                 },
                             }),
                     )
-                    .pose(crate::to_xr_pose(layer.quad.pose))
-                    .size(xr::Extent2Df {
-                        width: layer.quad.width,
-                        height: layer.quad.height,
-                    })
+                    .pose(crate::to_xr_pose(pose))
+                    .size(xr::Extent2Df { width, height });
+
+                match (&video, &self.video_layer_settings) {
+                    (Some(_), Some(settings)) => unsafe {
+                        // # Safety: the settings live in self, which outlives the layer ('a)
+                        xr::CompositionLayerQuad::from_raw(xr::sys::CompositionLayerQuad {
+                            next: ptr::from_ref(settings).cast(),
+                            ..layer.into_raw()
+                        })
+                    },
+                    _ => layer,
+                }
             })
             .collect()
+    }
+
+    /// The display time for xrEndFrame. DEBUG SWITCH (A/B for "screens swim"): the runtime's
+    /// predicted display time instead of the stream frame's timestamp while native quads are
+    /// shown. Also logs, once a second while quads are shown, how far the stream frame's timestamp
+    /// is from the predicted display time.
+    pub fn frame_display_time(&mut self, stream_time: Duration, predicted: Duration) -> Duration {
+        if self.layers.is_empty() {
+            self.display_time_gaps.clear();
+            return stream_time;
+        }
+
+        // Positive: the stream frame's timestamp is later than the predicted display time
+        let gap_ms = (stream_time.as_secs_f64() - predicted.as_secs_f64()) * 1000.0;
+        self.display_time_gaps.push(gap_ms as f32);
+        if self
+            .last_display_time_log
+            .is_none_or(|instant| instant.elapsed() >= Duration::from_secs(1))
+        {
+            let gaps = &self.display_time_gaps;
+            let min = gaps.iter().copied().fold(f32::INFINITY, f32::min);
+            let max = gaps.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mean = gaps.iter().sum::<f32>() / gaps.len() as f32;
+            let repeated = gaps.iter().filter(|&&gap| gap == 0.0).count();
+            info!(
+                "Native quads: stream timestamp - predicted display time: min {min:.1} mean \
+                 {mean:.1} max {max:.1} ms over {} frames ({repeated} without a new stream \
+                 frame), xrEndFrame uses {}",
+                gaps.len(),
+                if self.predicted_display_time {
+                    "PREDICTED"
+                } else {
+                    "STREAM"
+                }
+            );
+            self.display_time_gaps.clear();
+            self.last_display_time_log = Some(Instant::now());
+        }
+
+        if self.predicted_display_time {
+            predicted
+        } else {
+            stream_time
+        }
     }
 }
 
@@ -379,6 +656,8 @@ fn create_layer(
     texture.pixels = Vec::new();
 
     let start = Instant::now();
+    // Leave the GL state as wgpu expects it (gl_state.rs)
+    let guard = crate::gl_state::GlStateGuard::save(gl_context);
     // Fill every image, so that whichever one the runtime keeps showing is correct
     for _ in 0..images.len() {
         let image_index = swapchain
@@ -425,6 +704,7 @@ fn create_layer(
             .map_err(|e| format!("release_image: {e}"))?;
     }
 
+    drop(guard);
     let gl_error = unsafe { gl_context.get_error() };
     info!(
         "Native quads: quad {index}: {} {}x{}, {} mip level(s), {} swapchain images filled in {} \
@@ -438,9 +718,11 @@ fn create_layer(
     );
 
     Ok(QuadLayer {
+        index,
         quad,
         swapchain,
         size,
+        moving: None,
     })
 }
 

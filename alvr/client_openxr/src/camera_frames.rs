@@ -24,8 +24,11 @@ const WARMUP: Duration = Duration::from_millis(500);
 const MAX_CAPTURE_AGE: Duration = Duration::from_secs(1);
 const JPEG_QUALITY: u8 = 95;
 const ERROR_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+// Start-up frames with a timestamp on another clock are retried at once within this time
+const STARTUP_CLOCK_GRACE: Duration = Duration::from_secs(2);
 // Frames per run whose raw poses are logged (CAMPOSE_DIAG) to validate the camera extrinsics
 const POSE_DIAG_FRAMES: u64 = 10;
+const TIMING_LOG_FRAMES: u32 = 20;
 
 // Rectified camera poses relative to the head (VIEW space), OpenCV camera axes, per headset
 // model (Android product name). The camera pose reported by SecureMR is relative to SecureMR's
@@ -202,10 +205,16 @@ fn capture_loop(
     let started = Instant::now();
     let mut last_error = None;
     let mut sent_count = 0_u64;
+    // Timing per stage, logged every TIMING_LOG_FRAMES frames: (capture, encode, send) seconds
+    let mut timing = (0.0_f32, 0.0_f32, 0.0_f32);
+    let mut timing_frames = 0_u32;
+    let mut timing_window = Instant::now();
     while running.value() {
         let deadline = Instant::now() + config.interval;
 
+        let capture_start = Instant::now();
         let result = camera.capture().map_err(|e| format!("capture failed: {e}"));
+        let encode_start = Instant::now();
         let frame = result.and_then(|capture| {
             make_frame(
                 xr_session.instance(),
@@ -225,22 +234,53 @@ fn capture_loop(
             )
         });
 
+        let send_start = Instant::now();
         match frame {
             Ok(frame) if started.elapsed() > WARMUP => {
                 core_context.send_camera_frame(frame);
                 sent_count += 1;
                 if sent_count == 1 {
-                    info!("Camera frames: first frame sent");
+                    info!(
+                        "Camera frames: first frame sent {} ms after the start",
+                        started.elapsed().as_millis()
+                    );
                 }
                 last_error = None;
+
+                let done = Instant::now();
+                timing.0 += (encode_start - capture_start).as_secs_f32();
+                timing.1 += (send_start - encode_start).as_secs_f32();
+                timing.2 += (done - send_start).as_secs_f32();
+                timing_frames += 1;
+                if timing_frames == TIMING_LOG_FRAMES {
+                    let n = timing_frames as f32;
+                    info!(
+                        "Camera frames: {} frames at {:.1} fps; per frame capture {:.0} ms, pose+JPEG {:.0}                          ms, send {:.0} ms (interval {:?})",
+                        timing_frames,
+                        n / timing_window.elapsed().as_secs_f32(),
+                        timing.0 / n * 1000.0,
+                        timing.1 / n * 1000.0,
+                        timing.2 / n * 1000.0,
+                        config.interval
+                    );
+                    timing = (0.0, 0.0, 0.0);
+                    timing_frames = 0;
+                    timing_window = Instant::now();
+                }
             }
             Ok(_) => (),
             Err(e) => {
+                // The first capture after a start is stamped with another clock: not an error
+                // worth backing off for (it cost a whole second before the first frame)
+                let startup_frame = e.contains("not on the runtime clock")
+                    && started.elapsed() < STARTUP_CLOCK_GRACE;
                 if last_error.as_ref() != Some(&e) {
                     warn!("Camera frames: frame dropped: {e}");
                     last_error = Some(e);
                 }
-                thread::sleep(ERROR_RETRY_INTERVAL);
+                if !startup_frame {
+                    thread::sleep(ERROR_RETRY_INTERVAL);
+                }
             }
         }
 

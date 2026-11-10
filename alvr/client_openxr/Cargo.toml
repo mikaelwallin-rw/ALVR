@@ -189,6 +189,9 @@ value = "3,6DoF"
 name = "com.picovr.permission.EYE_TRACKING"
 [[package.metadata.android.uses_permission]]
 name = "com.picovr.permission.FACE_TRACKING"
+# Spatial anchors (persistent anchor at the touchscreen, stage_identity.rs)
+[[package.metadata.android.uses_permission]]
+name = "com.picovr.permission.SPATIAL_DATA"
 [[package.metadata.android.application.meta_data]]
 name = "eyetracking_calibration"
 value = "true"

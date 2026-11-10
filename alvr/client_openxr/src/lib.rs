@@ -1,14 +1,20 @@
 mod c_api;
 mod camera_frames;
+mod debug_switches;
 mod extra_extensions;
+mod gl_state;
 mod graphics;
+mod hand_display;
 mod input_diagnostics;
 mod interaction;
+mod loading_screen;
 mod lobby;
 mod native_hands;
 mod native_quads;
 mod passthrough;
+mod ref_markers;
 mod screen_video;
+mod stage_identity;
 mod stream;
 
 use crate::stream::ParsedStreamConfig;
@@ -34,7 +40,15 @@ use native_quads::NativeQuadLayers;
 use openxr as xr;
 use passthrough::PassthroughLayer;
 use screen_video::ScreenVideoStreams;
-use std::{collections::HashSet, ffi::CStr, path::Path, rc::Rc, sync::Arc, thread, time::Duration};
+use std::{
+    collections::HashSet,
+    ffi::CStr,
+    path::Path,
+    rc::Rc,
+    sync::Arc,
+    thread,
+    time::{Duration, Instant},
+};
 use stream::StreamContext;
 
 fn from_xr_vec3(v: xr::Vector3f) -> Vec3 {
@@ -221,8 +235,11 @@ pub fn entry_point() {
     selected_exts.ext_hand_tracking = true;
     selected_exts.ext_local_floor = true;
     selected_exts.ext_performance_settings = true;
+    selected_exts.ext_spatial_anchor = true;
     selected_exts.ext_spatial_entity = true;
     selected_exts.ext_spatial_marker_tracking = true;
+    selected_exts.ext_spatial_persistence = true;
+    selected_exts.ext_spatial_persistence_operations = true;
     selected_exts.ext_user_presence = true;
     selected_exts.fb_body_tracking = true;
     selected_exts.fb_color_space = true;
@@ -233,6 +250,8 @@ pub fn entry_point() {
     selected_exts.fb_foveation = true;
     selected_exts.fb_foveation_configuration = true;
     selected_exts.fb_passthrough = true;
+    // Projected passthrough prototype (screenvr_projected_passthrough.txt)
+    selected_exts.fb_triangle_mesh = true;
     selected_exts.fb_swapchain_update_state = true;
     selected_exts.htc_facial_tracking = true;
     selected_exts.htc_passthrough = true;
@@ -332,6 +351,12 @@ pub fn entry_point() {
             }
         }
         extra_extensions::log_spatial_capabilities(&xr_instance, xr_system);
+        if let Ok(properties) = xr_instance.system_properties(xr_system) {
+            info!(
+                "XR_DIAG max composition layers: {}",
+                properties.graphics_properties.max_layer_count
+            );
+        }
         for name in &other_exts {
             info!("XR_DIAG extension enabled (other): {name}");
         }
@@ -427,7 +452,25 @@ pub fn entry_point() {
         let mut passthrough_layer = None;
         let mut native_quads = NativeQuadLayers::default();
         let mut native_hands = None::<NativeHands>;
-        let mut screen_video = ScreenVideoStreams::default();
+        let mut screen_video = ScreenVideoStreams::new(default_view_resolution.x);
+        let mut last_debug_stall = None::<Instant>;
+        // Overlay app's flag (RealTimeConfig.ext_str): nothing of its own is in the stream
+        let mut stream_unused_flag = false;
+        let mut stream_skipped = false;
+        // Overlay app's flags (RealTimeConfig.ext_str): a scene app owns the view / is starting or
+        // shutting down; and whether the server configures passthrough (scene mode: no)
+        let mut scene_mode_flag = false;
+        let mut scene_loading_flag = false;
+        let mut passthrough_configured = false;
+        let mut loading_guard = loading_screen::LoadingGuard::default();
+        let mut loading_screen = None::<loading_screen::LoadingScreen>;
+        let mut loading_output = None::<loading_screen::GuardOutput>;
+        // Overlay app's hand correction (kept across stream restarts) and the last reported shape
+        let mut hand_correction = None::<alvr_packets::HandCorrection>;
+        let mut hand_display = None::<alvr_packets::HandDisplay>;
+        let mut last_hand_shape_sent = None::<(String, Instant)>;
+        let mut ref_markers = ref_markers::RefMarkers::new(&graphics_context);
+        let mut stage_identity = stage_identity::StageIdentity::new(&xr_session);
 
         let mut event_storage = xr::EventDataBuffer::new();
         let mut headset_is_worn = true;
@@ -469,6 +512,8 @@ pub fn entry_point() {
                             "ReferenceSpaceChangePending type: {:?}",
                             event.reference_space_type()
                         );
+
+                        stage_identity.on_reference_space_change(&event);
 
                         lobby.update_reference_space();
 
@@ -526,12 +571,29 @@ pub fn entry_point() {
                         if !context.uses_passthrough() {
                             passthrough_layer = None;
                         }
+                        passthrough_configured = context.uses_passthrough();
+                        scene_mode_flag = false;
+                        scene_loading_flag = false;
+                        loading_guard = loading_screen::LoadingGuard::default();
+                        loading_output = None;
+                        loading_screen = Some(loading_screen::LoadingScreen::new(
+                            &xr_session,
+                            &graphics_context,
+                        ));
 
                         native_hands = NativeHands::new(
                             &xr_session,
                             &graphics_context,
                             context.target_view_resolution(),
                         );
+                        if let (Some(hands), Some(correction)) =
+                            (&mut native_hands, hand_correction)
+                        {
+                            hands.set_correction(correction);
+                        }
+                        if let (Some(hands), Some(display)) = (&mut native_hands, hand_display) {
+                            hands.set_display(display);
+                        }
                         stream_context = Some(context);
 
                         core_context.send_proximity_state(headset_is_worn);
@@ -547,8 +609,12 @@ pub fn entry_point() {
 
                         native_quads.clear();
                         native_hands = None;
-                        screen_video = ScreenVideoStreams::default();
+                        screen_video = ScreenVideoStreams::new(default_view_resolution.x);
                         stream_context = None;
+                        loading_screen = None;
+                        loading_output = None;
+                        scene_mode_flag = false;
+                        scene_loading_flag = false;
                     }
                     ClientCoreEvent::Haptics {
                         device_id,
@@ -584,10 +650,36 @@ pub fn entry_point() {
                     ClientCoreEvent::NativeQuads(quads) => {
                         native_quads.set(&xr_session, &graphics_context, quads);
                     }
+                    ClientCoreEvent::AnchorRequest(request) => {
+                        stage_identity.on_anchor_request(request);
+                    }
+                    ClientCoreEvent::HandDisplay(display) => {
+                        hand_display = Some(display);
+                        if let Some(hands) = &mut native_hands {
+                            hands.set_display(display);
+                        }
+                    }
+                    ClientCoreEvent::HandCorrection(correction) => {
+                        hand_correction = Some(correction);
+                        if let Some(hands) = &mut native_hands {
+                            hands.set_correction(correction);
+                        }
+                    }
                     ClientCoreEvent::RealTimeConfig(config) => {
+                        let has_token =
+                            |name: &str| config.ext_str.split(',').any(|token| token == name);
+                        stream_unused_flag = has_token(alvr_packets::EXT_STREAM_UNUSED);
+                        scene_mode_flag = has_token(alvr_packets::EXT_SCENE_MODE);
+                        scene_loading_flag = has_token(alvr_packets::EXT_SCENE_LOADING);
+                        passthrough_configured = config.passthrough.is_some();
+
                         if config.passthrough.is_some() && passthrough_layer.is_none() {
                             passthrough_layer = PassthroughLayer::new(&xr_session, platform).ok();
-                        } else if config.passthrough.is_none() && passthrough_layer.is_some() {
+                        } else if config.passthrough.is_none()
+                            && passthrough_layer.is_some()
+                            && stream_context.is_none()
+                        {
+                            // While streaming, the loading screen decides when (loading_screen.rs)
                             passthrough_layer = None;
                         }
 
@@ -647,16 +739,109 @@ pub fn entry_point() {
                 .as_ref()
                 .map(StreamContext::stage_reference_space);
             let hands_selected = stream_context.as_ref().map(StreamContext::hands_selected);
+            if let Some(space) = &native_quads_space {
+                stage_identity.update(&core_context, space, frame_state.predicted_display_time);
+            }
             if stream_context.is_some() {
-                screen_video.update(&xr_session, &core_context);
+                screen_video.update(
+                    &xr_session,
+                    &graphics_context,
+                    &core_context,
+                    native_quads_space.as_deref(),
+                    to_xr_time(vsync_time),
+                    &native_quads.video_quad_geometry(),
+                );
             }
 
             // todo: allow rendering lobby and stream layers at the same time and add cross fade
-            let (layer, display_time) = if let Some(stream) = &mut stream_context {
-                stream.render(frame_interval, vsync_time)
+            // Stream unused (overlay app's flag, unless the debug switch says to ignore it): no stream
+            // pass and no stream layer; the loop paces on xrWaitFrame alone
+            // Never skipped while a scene app owns the view or is loading: its frames must be probed
+            let skip_stream = stream_unused_flag
+                && !scene_mode_flag
+                && !scene_loading_flag
+                && stream_context.is_some()
+                && !crate::debug_switches::get().ignore_stream_unused;
+            if skip_stream != stream_skipped {
+                info!(
+                    "Stream unused: {} the stream",
+                    if skip_stream { "skipping" } else { "rendering" }
+                );
+                stream_skipped = skip_stream;
+            }
+            let loading_view_space = stream_context
+                .as_ref()
+                .map(StreamContext::view_reference_space);
+            let streaming = stream_context.is_some();
+            let (layer, display_time, key_probe) = if let Some(stream) = &mut stream_context {
+                stream.set_key_probe(
+                    loading_output.is_some_and(|output| output.probe),
+                    !crate::debug_switches::get().key_probe_off,
+                );
+                if skip_stream {
+                    stream.skip_frame(vsync_time);
+                    (None, vsync_time, None)
+                } else {
+                    let (layer, display_time, key_probe) =
+                        stream.render(frame_interval, vsync_time);
+                    // DEBUG SWITCH screenvr_key_probe.txt "off": every frame counts as content
+                    let key_probe = if crate::debug_switches::get().key_probe_off {
+                        Some(0.0)
+                    } else {
+                        key_probe
+                    };
+                    (Some(layer), display_time, key_probe)
+                }
             } else {
-                (lobby.render(vsync_time), vsync_time)
+                (Some(lobby.render(vsync_time)), vsync_time, None)
             };
+
+            // Loading screen instead of key colour frames while passthrough is off
+            let loading = streaming.then(|| {
+                let output = loading_guard.update(
+                    Instant::now(),
+                    loading_screen::GuardInputs {
+                        scene_mode: scene_mode_flag,
+                        scene_loading: scene_loading_flag,
+                        stream_rendered: !skip_stream,
+                        key_probe,
+                        preview: match crate::debug_switches::get().loading_preview.as_str() {
+                            "1" | "normal" => Some(loading_screen::Variant::Normal),
+                            "longer" => Some(loading_screen::Variant::TakingLonger),
+                            "back" => Some(loading_screen::Variant::GoingBack),
+                            _ => None,
+                        },
+                    },
+                );
+                loading_output = Some(output);
+
+                let wants_passthrough = passthrough_configured || output.keep_passthrough;
+                if wants_passthrough && passthrough_layer.is_none() {
+                    passthrough_layer = PassthroughLayer::new(&xr_session, platform).ok();
+                } else if !wants_passthrough && passthrough_layer.is_some() {
+                    passthrough_layer = None;
+                }
+
+                if let (Some(screen), Some(view_space), Some(stage_space)) = (
+                    &mut loading_screen,
+                    &loading_view_space,
+                    &native_quads_space,
+                ) {
+                    let head = view_space
+                        .locate(stage_space, to_xr_time(vsync_time))
+                        .ok()
+                        .filter(|location| {
+                            location.location_flags.contains(
+                                xr::SpaceLocationFlags::POSITION_VALID
+                                    | xr::SpaceLocationFlags::ORIENTATION_VALID,
+                            )
+                        })
+                        .map(|location| from_xr_pose(location.pose));
+                    screen.update(&output, head);
+                }
+                output
+            });
+            let layer = layer.filter(|_| loading.is_none_or(|output| output.show_stream));
 
             // After the stream (which may wait for a decoded frame), with the joints and views
             // predicted for this frame's display time
@@ -664,9 +849,55 @@ pub fn entry_point() {
                 (&mut native_hands, &native_quads_space, &hands_selected)
             {
                 hands.render(space, &interaction_context, selected, vsync_time);
+
+                // What the hands are drawn with, for the overlay app (on change, at most 10 Hz,
+                // and every 2 s)
+                let info = hands.shape_info();
+                let key = format!("{info:.3?}");
+                if last_hand_shape_sent
+                    .as_ref()
+                    .is_none_or(|(sent_key, at): &(String, Instant)| {
+                        (*sent_key != key && at.elapsed() >= Duration::from_millis(100))
+                            || at.elapsed() >= Duration::from_secs(2)
+                    })
+                {
+                    core_context.send_hand_shape(info);
+                    last_hand_shape_sent = Some((key, Instant::now()));
+                }
             }
 
-            let projection_layer = layer.build();
+            native_quads.poll_debug_switches(&xr_session);
+            // PROTOTYPE: passthrough projected onto the native quads' rectangles (debug switch)
+            let mut passthrough_recreate = false;
+            if let (Some(passthrough), Some(space)) = (&mut passthrough_layer, &native_quads_space)
+            {
+                let rects = crate::debug_switches::get()
+                    .projected_passthrough_margin
+                    .map(|margin| native_quads.rects(margin));
+                if passthrough.set_projection(
+                    &xr_instance,
+                    space,
+                    to_xr_time(vsync_time),
+                    rects.as_deref(),
+                ) {
+                    // Destroying only the projected layer breaks PICO's passthrough: the whole
+                    // passthrough is dropped here and created again below
+                    passthrough_recreate = true;
+                }
+            }
+            if passthrough_recreate {
+                // The old passthrough object must be gone before a new one is created
+                drop(passthrough_layer.take());
+                passthrough_layer = PassthroughLayer::new(&xr_session, platform).ok();
+            }
+            // Upstream: the stream frame's timestamp. Debug switch: the predicted display time.
+            let display_time = if native_quads_space.is_some() {
+                native_quads.frame_display_time(display_time, vsync_time)
+            } else {
+                display_time
+            };
+
+            let projection_layer = layer.as_ref().map(|layer| layer.build());
             let quad_layers = native_quads_space
                 .as_deref()
                 .map(|space| native_quads.build(space, &screen_video))
@@ -677,16 +908,48 @@ pub fn entry_point() {
                 .and_then(|(hands, space)| hands.build(space));
             let hands_layer = hands_layer_builder.as_ref().map(|builder| builder.build());
             let mut layers: Vec<&xr::CompositionLayerBase<_>> =
-                Vec::with_capacity(3 + quad_layers.len());
+                Vec::with_capacity(5 + quad_layers.len());
             if let Some(passthrough_layer) = &passthrough_layer {
                 layers.push(passthrough_layer);
+                if let Some(projected) = passthrough_layer.projected_layer() {
+                    layers.push(projected);
+                }
             }
-            layers.push(&projection_layer);
+            if let Some(projection_layer) = &projection_layer {
+                layers.push(projection_layer);
+            }
+            // Above the stream, below the touchscreen quad and the hands
+            let loading_layers = loading_screen
+                .as_ref()
+                .zip(loading_view_space.as_deref())
+                .zip(native_quads_space.as_deref())
+                .map(|((screen, view_space), stage_space)| screen.build(view_space, stage_space))
+                .unwrap_or_default();
+            layers.extend(loading_layers.iter().map(|layer| &**layer));
             // On top of the stream: debug reference, always visible
             layers.extend(quad_layers.iter().map(|layer| &**layer));
+            // DEBUG SWITCH screenvr_refmarkers.txt: world-locked reference markers
+            ref_markers.update(&xr_session);
+            let ref_marker_layers = native_quads_space
+                .as_deref()
+                .map(|space| ref_markers.build(space))
+                .unwrap_or_default();
+            layers.extend(ref_marker_layers.iter().map(|layer| &**layer));
             // Hands on top of everything
             if let Some(hands_layer) = &hands_layer {
                 layers.push(hands_layer);
+            }
+
+            // DEBUG SWITCH screenvr_stall.txt: a late frame on purpose (debug_switches.rs)
+            if let Some((stall, period)) = crate::debug_switches::get().stall
+                && last_debug_stall.is_none_or(|instant: Instant| instant.elapsed() >= period)
+            {
+                info!(
+                    "Debug stall: render thread sleeps {} ms before xrEndFrame",
+                    stall.as_millis()
+                );
+                thread::sleep(stall);
+                last_debug_stall = Some(Instant::now());
             }
 
             graphics_context.make_current();

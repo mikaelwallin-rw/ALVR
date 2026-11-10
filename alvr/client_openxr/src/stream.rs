@@ -18,6 +18,7 @@ use alvr_common::{
 };
 use alvr_graphics::{
     GraphicsContext, OpaqueRegionGeometry, OpaqueRegionsParams, StreamRenderer, StreamViewParams,
+    key_chroma_direction, magenta_chroma_direction,
 };
 use alvr_packets::{CameraFramesConfig, OpaqueRegion, RealTimeConfig, StreamConfig, TrackingData};
 use alvr_session::{
@@ -112,6 +113,16 @@ pub struct StreamContext {
     config: ParsedStreamConfig,
     target_view_resolution: UVec2,
     renderer: StreamRenderer,
+    // The last chroma key configured (scene mode sends no passthrough): what key colour frames look
+    // like. None until one is configured: magenta is assumed.
+    last_key_config: Option<PassthroughMode>,
+    // Key colour probing of each new frame (loading_screen.rs), and its result for the last render()
+    key_probe_enabled: bool,
+    // The loading screen wants the probe (render() timing is logged, probe on or off by switch)
+    key_probe_wanted: bool,
+    key_probe: Option<f32>,
+    // (window start, probes, total, max) for the cost log
+    key_probe_timing: (Instant, u32, Duration, Duration),
     decoder: Option<(VideoDecoderConfig, VideoDecoderSource)>,
     use_custom_reprojection: bool,
     // Running while the server requests headset camera frames
@@ -261,6 +272,16 @@ impl StreamContext {
             input_thread_running,
             input_diagnostics_enabled: Arc::new(RelaxedAtomic::new(config.log_input_diagnostics)),
             hands_selected: Arc::new([RelaxedAtomic::new(false), RelaxedAtomic::new(false)]),
+            last_key_config: match &config.passthrough {
+                Some(
+                    mode @ (PassthroughMode::RgbChromaKey(_) | PassthroughMode::HsvChromaKey(_)),
+                ) => Some(mode.clone()),
+                _ => None,
+            },
+            key_probe_enabled: false,
+            key_probe_wanted: false,
+            key_probe: None,
+            key_probe_timing: (Instant::now(), 0, Duration::ZERO, Duration::ZERO),
             config,
             target_view_resolution,
             renderer,
@@ -394,11 +415,54 @@ impl StreamContext {
         Arc::clone(&self.hands_selected)
     }
 
+    /// Probe each new frame for the key colour during render() (synchronous tiny readback); the
+    /// result is render()'s third value
+    /// `wanted`: the loading screen needs it; `enabled`: not switched off (screenvr_key_probe.txt)
+    pub fn set_key_probe(&mut self, wanted: bool, enabled: bool) {
+        self.key_probe_wanted = wanted;
+        self.key_probe_enabled = wanted && enabled;
+        if !enabled {
+            self.key_probe = None;
+        }
+    }
+
+    pub fn view_reference_space(&self) -> Arc<xr::Space> {
+        Arc::clone(&self.view_reference_space)
+    }
+
     pub fn target_view_resolution(&self) -> UVec2 {
         self.target_view_resolution
     }
 
+    /// Instead of render() while nothing of the overlay app's is in the stream (stream unused flag):
+    /// no stream pass, no layer. The decoder keeps running and its newest frame is consumed and
+    /// reported as presented, so that the server's statistics and pacing stay as when rendering,
+    /// and the stream is back on the very next frame once the flag clears. Never waits.
+    pub fn skip_frame(&mut self, vsync_time: Duration) {
+        let Some((_, source)) = &mut self.decoder else {
+            return;
+        };
+        // Every decoded frame available now, each reported as presented: nothing waits in this
+        // loop, so taking one per loop could let the decoder's output back up (queue overflow, then
+        // input saturation and keyframe requests)
+        while let Some((timestamp, _)) = source.get_frame() {
+            self.last_good_view_params = self.core_context.report_compositor_start(timestamp);
+            self.last_good_opaque_regions = self.core_context.last_frame_opaque_regions();
+            if let Some(xr_now) = crate::xr_runtime_now(self.xr_session.instance()) {
+                self.core_context.report_submit(
+                    timestamp,
+                    vsync_time.saturating_sub(Duration::from_nanos(xr_now.as_nanos() as u64)),
+                );
+            }
+        }
+    }
+
     pub fn update_real_time_config(&mut self, config: &RealTimeConfig) {
+        if let Some(mode @ (PassthroughMode::RgbChromaKey(_) | PassthroughMode::HsvChromaKey(_))) =
+            &config.passthrough
+        {
+            self.last_key_config = Some(mode.clone());
+        }
         self.config.passthrough = config.passthrough.clone();
         self.config.clientside_post_processing = config.clientside_post_processing.clone();
         self.input_diagnostics_enabled
@@ -409,11 +473,14 @@ impl StreamContext {
         &mut self,
         frame_interval: Duration,
         vsync_time: Duration,
-    ) -> (ProjectionLayerBuilder<'_>, Duration) {
+    ) -> (ProjectionLayerBuilder<'_>, Duration, Option<f32>) {
         let xr_vsync_time = xr::Time::from_nanos(vsync_time.as_nanos() as _);
         let frame_poll_deadline = Instant::now()
             + Duration::from_secs_f32(
-                frame_interval.as_secs_f32() * DECODER_MAX_TIMEOUT_MULTIPLIER,
+                frame_interval.as_secs_f32()
+                    * crate::debug_switches::get()
+                        .stream_wait
+                        .unwrap_or(DECODER_MAX_TIMEOUT_MULTIPLIER),
             );
         let mut frame_result = None;
         if let Some((_, source)) = &mut self.decoder {
@@ -532,7 +599,8 @@ impl StreamContext {
                 );
         }
 
-        self.renderer.render(
+        let probe_start = Instant::now();
+        let key_fraction = self.renderer.render(
             buffer_ptr,
             [
                 StreamViewParams {
@@ -554,7 +622,35 @@ impl StreamContext {
                 edge_despill_px,
                 debug_tint,
             },
+            // A new frame: how much of it is the key colour (e.g. SteamVR's magenta while a scene
+            // app has not presented yet)
+            (self.key_probe_enabled && !buffer_ptr.is_null()).then(|| {
+                self.last_key_config
+                    .as_ref()
+                    .map_or_else(magenta_chroma_direction, key_chroma_direction)
+            }),
         );
+        // render() time with a new frame, probe on vs off (A/B by screenvr_key_probe.txt): the
+        // difference is the synchronous readback's render-thread cost
+        let probe_elapsed = probe_start.elapsed();
+        self.key_probe = key_fraction;
+        if self.key_probe_wanted && !buffer_ptr.is_null() {
+            // Cost log (stand measurement): the readback is synchronous, render-thread time
+            let (window_start, count, total, max) = &mut self.key_probe_timing;
+            *count += 1;
+            *total += probe_elapsed;
+            *max = (*max).max(probe_elapsed);
+            if window_start.elapsed() >= Duration::from_secs(5) {
+                info!(
+                    "Key probe {}: {count} frames in {:.1} s, stream render() mean {} us, max {}                      us per frame (16x16 RGBA readback, synchronous)",
+                    if self.key_probe_enabled { "on" } else { "off" },
+                    window_start.elapsed().as_secs_f32(),
+                    total.as_micros() / u128::from(*count),
+                    max.as_micros()
+                );
+                self.key_probe_timing = (Instant::now(), 0, Duration::ZERO, Duration::ZERO);
+            }
+        }
 
         self.swapchains[0].release_image().unwrap();
         self.swapchains[1].release_image().unwrap();
@@ -621,7 +717,7 @@ impl StreamContext {
             clientside_post_processing,
         );
 
-        (layer, openxr_display_time)
+        (layer, openxr_display_time, self.key_probe)
     }
 }
 
