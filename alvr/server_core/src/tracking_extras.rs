@@ -10,8 +10,17 @@
 //   and unchanged before and after the copy.
 // - `heartbeat_ms` (GetTickCount64) is refreshed at least every 100 ms. Older than 1000 ms = absent.
 // - Driver space = TrackingUniverseRawAndUncalibrated = recenter(client STAGE).
+// - Version 4: hands[2] (raw tracked joints, driver space) and how the client draws them; request
+//   version 3: automatic hand correction, forwarded to the client as HandCorrection; request
+//   version 4: hand display transform, forwarded as HandDisplay (inactive while the request block
+//   is stale or older).
+// - Version 3: STAGE identity (changes only when the physical STAGE moves), the persistent anchor
+//   and the headset model, from the client's StageInfo reports. Request version 2: anchor commands,
+//   forwarded to the client as AnchorRequest.
 
 use alvr_common::{Pose, glam::Mat3};
+#[cfg(not(windows))]
+use alvr_packets::{AnchorRequest, HandCorrection, HandDisplay, HandShapeInfo, StageInfo};
 use std::{
     sync::{
         Arc,
@@ -41,12 +50,45 @@ pub(crate) fn to_matrix(pose: Pose) -> [[f32; 4]; 3] {
 
 #[cfg(windows)]
 pub use windows_impl::{
-    TRACKING_EXTRAS_WRITER, bump_stage_epoch, camera_frames_request, recenter_counter,
+    TRACKING_EXTRAS_WRITER, anchor_request, bump_stage_epoch, camera_frames_request,
+    hand_correction, hand_display, recenter_counter, report_hand_shape, report_stage_info,
     report_tracking, stage_epoch,
 };
 
+/// Joints of a hand skeleton (XR_EXT_hand_tracking order, 26), driver space
+pub type HandJoints = [Pose; 26];
+
 #[cfg(not(windows))]
-pub fn report_tracking(_driver_from_stage: Pose, _fingertips: [Option<Pose>; 2]) {}
+pub fn report_stage_info(_info: StageInfo) {}
+
+// The overlay's latest anchor command (sequence != 0)
+#[cfg(not(windows))]
+pub fn anchor_request() -> Option<AnchorRequest> {
+    None
+}
+
+#[cfg(not(windows))]
+pub fn report_tracking(
+    _driver_from_stage: Pose,
+    _fingertips: [Option<Pose>; 2],
+    _hands: [Option<HandJoints>; 2],
+) {
+}
+
+#[cfg(not(windows))]
+pub fn report_hand_shape(_info: HandShapeInfo) {}
+
+// The overlay's latest hand correction (sequence != 0)
+#[cfg(not(windows))]
+pub fn hand_correction() -> Option<HandCorrection> {
+    None
+}
+
+// The overlay's hand display transform (inactive when stale)
+#[cfg(not(windows))]
+pub fn hand_display() -> Option<HandDisplay> {
+    None
+}
 
 // Camera frames requested by the overlay: Some(use the right camera)
 #[cfg(not(windows))]
@@ -109,8 +151,17 @@ impl Drop for TrackingExtrasHeartbeat {
 
 #[cfg(windows)]
 mod windows_impl {
-    use super::to_matrix;
-    use alvr_common::{Pose, info, parking_lot::Mutex, warn};
+    use super::{HandJoints, to_matrix};
+    use alvr_common::{
+        Pose,
+        glam::{Mat3, Quat, Vec3},
+        info,
+        parking_lot::Mutex,
+        warn,
+    };
+    use alvr_packets::{
+        AnchorRequest, AnchorRequestKind, HandCorrection, HandDisplay, HandShapeInfo, StageInfo,
+    };
     use std::{
         mem, ptr,
         sync::atomic::{self, AtomicU32, Ordering},
@@ -132,10 +183,25 @@ mod windows_impl {
 
     const EXTRAS_MAGIC: u32 = 0x584B_5254; // 'TRKX' little-endian
     const REQUEST_MAGIC: u32 = 0x514B_5254; // 'TRKQ' little-endian
-    // Version 2 appends stage_epoch: version 1 readers only read the first 2256 bytes
-    const VERSION: u32 = 2;
-    // The request block layout is unchanged
+    // Version 2 appends stage_epoch, version 3 the stage identity, the anchor and the product
+    // name: older readers only read the first 2256 / 2264 bytes
+    const VERSION: u32 = 3;
+    // Oldest request block accepted; version 2 appends the anchor request
     const REQUEST_VERSION: u32 = 1;
+    const REQUEST_VERSION_ANCHOR: u32 = 2;
+    const REQUEST_VERSION_HAND_CORRECTION: u32 = 3;
+    const REQUEST_VERSION_HAND_DISPLAY: u32 = 4;
+    const HAND_DISPLAY_ACTIVE_BIT: u32 = 1;
+    // XR_EXT_hand_tracking joints published per hand: wrist, palm, index proximal..tip, thumb tip,
+    // middle tip (RawHand order)
+    const PUBLISHED_HAND_JOINTS: [usize; 8] = [1, 0, 7, 8, 9, 10, 5, 15];
+    const ANCHOR_REQUEST_CREATE: u32 = 1;
+    const ANCHOR_REQUEST_FORGET: u32 = 2;
+    const ANCHOR_STATE_LOCATED: u32 = 2;
+    const ANCHOR_STATE_LOST: u32 = 3;
+    // The client reports every 500 ms
+    const ANCHOR_LOCATED_STALE_MS: u64 = 1000;
+    const PRODUCT_NAME_BYTES: usize = 32;
     const MAX_MARKERS: usize = 32;
     const STALE_MS: u64 = 1000;
     // Fingertips not refreshed by a tracking packet for this long are published as invalid
@@ -188,6 +254,55 @@ mod windows_impl {
         markers: [RawMarker; MAX_MARKERS],
         stage_epoch: u32,
         reserved: u32,
+        // Version 3
+        stage_identity: u64,
+        previous_stage_identity: u64,
+        stage_change_sequence: u32,
+        stage_from_previous_valid: u32,
+        stage_from_previous: [[f32; 4]; 3],
+        anchor_state: u32,
+        anchor_request_served: u32,
+        anchor_uuid: [u8; 16],
+        anchor_pose: [[f32; 4]; 3],
+        anchor_located_ms: u64,
+        anchor_generation: u32,
+        reserved_v3: u32,
+        product_name: [u8; PRODUCT_NAME_BYTES],
+        // Version 4
+        hands: [RawHand; 2],
+    }
+
+    #[repr(C, packed(4))]
+    #[derive(Clone, Copy)]
+    struct RawHand {
+        valid: u32,
+        reserved: u32,
+        sample_ms: u64,
+        // PUBLISHED_HAND_JOINTS
+        joints: [[[f32; 4]; 3]; 8],
+        draw_thickness: f32,
+        draw_scale: f32,
+        draw_fingers: f32,
+        draw_finger_correction: f32,
+        draw_correction_sequence: u32,
+        reserved2: u32,
+    }
+
+    impl Default for RawHand {
+        fn default() -> Self {
+            Self {
+                valid: 0,
+                reserved: 0,
+                sample_ms: 0,
+                joints: [to_matrix(Pose::IDENTITY); 8],
+                draw_thickness: 0.0,
+                draw_scale: 0.0,
+                draw_fingers: 0.0,
+                draw_finger_correction: 0.0,
+                draw_correction_sequence: 0,
+                reserved2: 0,
+            }
+        }
     }
 
     #[repr(C, packed(4))]
@@ -200,13 +315,40 @@ mod windows_impl {
         heartbeat_ms: u64,
         dictionary: u32,
         marker_side_meters: f32,
+        // Request version 2 (zeroed for a version 1 block, see read_request())
+        anchor_request: u32,
+        anchor_request_sequence: u32,
+        anchor_request_pose: [[f32; 4]; 3],
+        // Request version 3 (zeroed for older blocks, see read_request())
+        hand_finger_scale: [f32; 2],
+        hand_correction_sequence: u32,
+        hand_near_meters: f32,
+        hand_correction_plane: [[f32; 4]; 3],
+        // Request version 4 (zeroed for older blocks, see read_request())
+        hand_display_sequence: u32,
+        hand_display_flags: u32,
+        hand_display_transform: [[f32; 4]; 3],
+        hand_display_scale: f32,
+        hand_display_quad_pose: [[f32; 4]; 3],
+        hand_display_quad_size: [f32; 2],
+        hand_display_full_meters: f32,
+        hand_display_falloff_meters: f32,
     }
 
     const _: () = assert!(mem::size_of::<RawFingertip>() == 64);
     const _: () = assert!(mem::size_of::<RawMarker>() == 64);
-    const _: () =
-        assert!(mem::size_of::<RawExtrasBlock>() == 24 + 48 + 2 * 64 + 8 + 64 * MAX_MARKERS + 8);
-    const _: () = assert!(mem::size_of::<RawRequestBlock>() == 32);
+    const _: () = assert!(
+        mem::size_of::<RawExtrasBlock>()
+            == 24 + 48 + 2 * 64 + 8 + 64 * MAX_MARKERS + 8 + 192 + 2 * 424
+    );
+    const _: () = assert!(mem::size_of::<RawHand>() == 424);
+    const _: () = assert!(mem::offset_of!(RawExtrasBlock, hands) == 2456);
+    const _: () = assert!(mem::size_of::<RawExtrasBlock>() == 3304);
+    const _: () = assert!(mem::offset_of!(RawExtrasBlock, stage_identity) == 2264);
+    const _: () = assert!(mem::offset_of!(RawRequestBlock, anchor_request) == 32);
+    const _: () = assert!(mem::offset_of!(RawRequestBlock, hand_finger_scale) == 88);
+    const _: () = assert!(mem::offset_of!(RawRequestBlock, hand_display_sequence) == 152);
+    const _: () = assert!(mem::size_of::<RawRequestBlock>() == 276);
 
     pub static TRACKING_EXTRAS_WRITER: Mutex<TrackingExtrasWriter> =
         Mutex::new(TrackingExtrasWriter::new());
@@ -237,11 +379,68 @@ mod windows_impl {
         info!("Tracking extras: stage epoch {}", writer.stage_epoch);
     }
 
-    // Called for every tracking packet, with poses already in driver space
-    pub fn report_tracking(driver_from_stage: Pose, fingertips: [Option<Pose>; 2]) {
+    // The client's STAGE identity and anchor report (sent on change and every 2 s)
+    pub fn report_stage_info(info: StageInfo) {
+        TRACKING_EXTRAS_WRITER.lock().report_stage_info(info);
+    }
+
+    // The overlay's latest anchor command (sequence != 0)
+    pub fn anchor_request() -> Option<AnchorRequest> {
+        TRACKING_EXTRAS_WRITER.lock().anchor_request
+    }
+
+    // Inverse of to_matrix()
+    fn from_matrix(m: [[f32; 4]; 3]) -> Pose {
+        let rotation = Mat3::from_cols(
+            Vec3::new(m[0][0], m[1][0], m[2][0]),
+            Vec3::new(m[0][1], m[1][1], m[2][1]),
+            Vec3::new(m[0][2], m[1][2], m[2][2]),
+        );
+        Pose {
+            orientation: Quat::from_mat3(&rotation).normalize(),
+            position: Vec3::new(m[0][3], m[1][3], m[2][3]),
+        }
+    }
+
+    // Called for every tracking packet, with poses already in driver space. `hands`: the raw
+    // tracked skeletons, under the same validity rule as the fingertips.
+    pub fn report_tracking(
+        driver_from_stage: Pose,
+        fingertips: [Option<Pose>; 2],
+        hands: [Option<HandJoints>; 2],
+    ) {
         TRACKING_EXTRAS_WRITER
             .lock()
-            .report_tracking(driver_from_stage, fingertips);
+            .report_tracking(driver_from_stage, fingertips, hands);
+    }
+
+    // What the client applies when drawing the hands
+    pub fn report_hand_shape(info: HandShapeInfo) {
+        let mut writer = TRACKING_EXTRAS_WRITER.lock();
+        writer.hand_shape = Some(info);
+        writer.publish();
+    }
+
+    // The overlay's latest hand correction (sequence != 0)
+    pub fn hand_correction() -> Option<HandCorrection> {
+        TRACKING_EXTRAS_WRITER.lock().hand_correction
+    }
+
+    // The overlay's hand display transform: Some once a version 4 request block was seen; inactive
+    // while the block is stale or missing
+    pub fn hand_display() -> Option<HandDisplay> {
+        TRACKING_EXTRAS_WRITER.lock().hand_display
+    }
+
+    // NUL-terminated UTF-8: at most 31 bytes, cut at a character boundary
+    fn product_name_bytes(name: &str) -> [u8; PRODUCT_NAME_BYTES] {
+        let mut bytes = [0; PRODUCT_NAME_BYTES];
+        let mut length = name.len().min(PRODUCT_NAME_BYTES - 1);
+        while !name.is_char_boundary(length) {
+            length -= 1;
+        }
+        bytes[..length].copy_from_slice(&name.as_bytes()[..length]);
+        bytes
     }
 
     fn now_ms() -> u64 {
@@ -319,6 +518,14 @@ mod windows_impl {
         frames_requested: bool,
         frames_right_camera: bool,
         stage_epoch: u32,
+        stage_info: Option<StageInfo>,
+        anchor_located_ms: u64,
+        anchor_request: Option<AnchorRequest>,
+        // Per hand: receive time and the raw skeleton (driver space)
+        hands: [Option<(u64, HandJoints)>; 2],
+        hand_shape: Option<HandShapeInfo>,
+        hand_correction: Option<HandCorrection>,
+        hand_display: Option<HandDisplay>,
     }
 
     impl TrackingExtrasWriter {
@@ -340,10 +547,49 @@ mod windows_impl {
                 frames_requested: false,
                 frames_right_camera: false,
                 stage_epoch: 0,
+                stage_info: None,
+                anchor_located_ms: 0,
+                anchor_request: None,
+                hands: [None, None],
+                hand_shape: None,
+                hand_correction: None,
+                hand_display: None,
             }
         }
 
-        fn report_tracking(&mut self, driver_from_stage: Pose, fingertips: [Option<Pose>; 2]) {
+        fn report_stage_info(&mut self, info: StageInfo) {
+            if info.anchor_state == ANCHOR_STATE_LOCATED && info.anchor_pose.is_some() {
+                self.anchor_located_ms = now_ms();
+            }
+            if self.stage_info.as_ref().is_none_or(|previous| {
+                previous.stage_identity != info.stage_identity
+                    || previous.anchor_state != info.anchor_state
+                    || previous.anchor_generation != info.anchor_generation
+                    || previous.anchor_request_served != info.anchor_request_served
+            }) {
+                info!(
+                    "Tracking extras: stage {:016x} (previous {:016x}, change {}, transform {}), \
+                     anchor state {} generation {} served {}, product {:?}",
+                    info.stage_identity,
+                    info.previous_stage_identity,
+                    info.stage_change_sequence,
+                    info.stage_from_previous.is_some(),
+                    info.anchor_state,
+                    info.anchor_generation,
+                    info.anchor_request_served,
+                    info.product_name
+                );
+            }
+            self.stage_info = Some(info);
+            self.publish();
+        }
+
+        fn report_tracking(
+            &mut self,
+            driver_from_stage: Pose,
+            fingertips: [Option<Pose>; 2],
+            hands: [Option<HandJoints>; 2],
+        ) {
             let changed = self.driver_from_stage.is_none_or(|last| {
                 last.position != driver_from_stage.position
                     || last.orientation != driver_from_stage.orientation
@@ -373,13 +619,89 @@ mod windows_impl {
                     state.tracked = false;
                 }
             }
+            for (state, hand) in self.hands.iter_mut().zip(hands) {
+                *state = hand.map(|joints| (now, joints));
+            }
 
             self.publish();
         }
 
         // Heartbeat: re-read the request and republish
         pub fn refresh(&mut self) {
-            let request_flags = self.read_request().map_or(0, |r| r.request_markers);
+            let request = self.read_request();
+            let request_flags = request.map_or(0, |r| r.request_markers);
+
+            if let Some(request) = request
+                && request.hand_correction_sequence != 0
+                && self
+                    .hand_correction
+                    .is_none_or(|last| last.sequence != request.hand_correction_sequence)
+            {
+                let correction = HandCorrection {
+                    sequence: request.hand_correction_sequence,
+                    finger_scale: request.hand_finger_scale,
+                    near_meters: request.hand_near_meters,
+                    plane: from_matrix(request.hand_correction_plane),
+                };
+                info!("Tracking extras: hand correction {correction:?}");
+                self.hand_correction = Some(correction);
+            }
+
+            // Hand display transform: as requested, or inactive while the block is stale/older
+            match request.filter(|r| r.version >= REQUEST_VERSION_HAND_DISPLAY) {
+                Some(request) => {
+                    let display = HandDisplay {
+                        sequence: request.hand_display_sequence,
+                        active: request.hand_display_flags & HAND_DISPLAY_ACTIVE_BIT != 0,
+                        transform: from_matrix(request.hand_display_transform),
+                        scale: request.hand_display_scale,
+                        quad_pose: from_matrix(request.hand_display_quad_pose),
+                        quad_size: request.hand_display_quad_size,
+                        full_meters: request.hand_display_full_meters,
+                        falloff_meters: request.hand_display_falloff_meters,
+                    };
+                    if self.hand_display.is_none_or(|last| {
+                        last.sequence != display.sequence || last.active != display.active
+                    }) {
+                        if self
+                            .hand_display
+                            .is_none_or(|last| last.active != display.active)
+                        {
+                            info!("Tracking extras: hand display transform {display:?}");
+                        }
+                        self.hand_display = Some(display);
+                    }
+                }
+                None => {
+                    if let Some(display) = &mut self.hand_display
+                        && display.active
+                    {
+                        info!("Tracking extras: hand display transform inactive (request stale)");
+                        display.active = false;
+                    }
+                }
+            }
+
+            // Kept until replaced: a stale request block does not cancel a pending anchor request
+            if let Some(request) = request
+                && request.anchor_request_sequence != 0
+                && self
+                    .anchor_request
+                    .is_none_or(|last| last.sequence != request.anchor_request_sequence)
+            {
+                let kind = match request.anchor_request {
+                    ANCHOR_REQUEST_CREATE => Some(AnchorRequestKind::Create(from_matrix(
+                        request.anchor_request_pose,
+                    ))),
+                    ANCHOR_REQUEST_FORGET => Some(AnchorRequestKind::Forget),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    let sequence = request.anchor_request_sequence;
+                    info!("Tracking extras: anchor request {sequence}: {kind:?}");
+                    self.anchor_request = Some(AnchorRequest { sequence, kind });
+                }
+            }
 
             let frames_requested = request_flags & REQUEST_FRAMES_BIT != 0;
             let frames_right_camera = request_flags & REQUEST_RIGHT_CAMERA_BIT != 0;
@@ -427,15 +749,9 @@ mod windows_impl {
                     )
                 } {
                     Ok(handle) => {
-                        let view = unsafe {
-                            MapViewOfFile(
-                                handle,
-                                FILE_MAP_WRITE,
-                                0,
-                                0,
-                                mem::size_of::<RawExtrasBlock>(),
-                            )
-                        };
+                        // The whole section: one left by an older peer may be smaller than this
+                        // block, but views are page-granular, so the block is always addressable
+                        let view = unsafe { MapViewOfFile(handle, FILE_MAP_WRITE, 0, 0, 0) };
                         if view.Value.is_null() {
                             warn!("Tracking extras: MapViewOfFile failed");
                             unsafe { CloseHandle(handle).ok() };
@@ -476,6 +792,66 @@ mod windows_impl {
                 markers: [RawMarker::default(); MAX_MARKERS],
                 stage_epoch: self.stage_epoch,
                 reserved: 0,
+                stage_identity: 0,
+                previous_stage_identity: 0,
+                stage_change_sequence: 0,
+                stage_from_previous_valid: 0,
+                stage_from_previous: to_matrix(Pose::IDENTITY),
+                anchor_state: 0,
+                anchor_request_served: 0,
+                anchor_uuid: [0; 16],
+                anchor_pose: to_matrix(Pose::IDENTITY),
+                anchor_located_ms: 0,
+                anchor_generation: 0,
+                reserved_v3: 0,
+                product_name: [0; PRODUCT_NAME_BYTES],
+                hands: [RawHand::default(); 2],
+            };
+            let shape = self.hand_shape;
+            let hands = std::array::from_fn(|idx| {
+                let mut hand = RawHand::default();
+                if let Some((sample_ms, joints)) = self.hands[idx] {
+                    hand.valid = u32::from(now.saturating_sub(sample_ms) <= FINGERTIP_STALE_MS);
+                    hand.sample_ms = sample_ms;
+                    hand.joints = PUBLISHED_HAND_JOINTS.map(|joint| to_matrix(joints[joint]));
+                }
+                if let Some(shape) = shape {
+                    hand.draw_thickness = shape.thickness;
+                    hand.draw_scale = shape.scale;
+                    hand.draw_fingers = shape.fingers;
+                    hand.draw_finger_correction = shape.finger_correction[idx];
+                    hand.draw_correction_sequence = shape.correction_sequence;
+                }
+                hand
+            });
+            let block = RawExtrasBlock { hands, ..block };
+            let block = match &self.stage_info {
+                Some(info) => RawExtrasBlock {
+                    stage_identity: info.stage_identity,
+                    previous_stage_identity: info.previous_stage_identity,
+                    stage_change_sequence: info.stage_change_sequence,
+                    stage_from_previous_valid: u32::from(info.stage_from_previous.is_some()),
+                    stage_from_previous: to_matrix(
+                        info.stage_from_previous.unwrap_or(Pose::IDENTITY),
+                    ),
+                    // No fresh report (client asleep or disconnected): the last pose is only the
+                    // last good one
+                    anchor_state: if info.anchor_state == ANCHOR_STATE_LOCATED
+                        && now.saturating_sub(self.anchor_located_ms) > ANCHOR_LOCATED_STALE_MS
+                    {
+                        ANCHOR_STATE_LOST
+                    } else {
+                        info.anchor_state
+                    },
+                    anchor_request_served: info.anchor_request_served,
+                    anchor_uuid: info.anchor_uuid,
+                    anchor_pose: to_matrix(info.anchor_pose.unwrap_or(Pose::IDENTITY)),
+                    anchor_located_ms: self.anchor_located_ms,
+                    anchor_generation: info.anchor_generation,
+                    product_name: product_name_bytes(&info.product_name),
+                    ..block
+                },
+                None => block,
             };
 
             let Some(mapping) = self.ensure_extras_mapping() else {
@@ -521,15 +897,8 @@ mod windows_impl {
                 if let Ok(handle) = unsafe {
                     OpenFileMappingW(FILE_MAP_READ.0, false, w!("Local\\VRTrackingRequest_v1"))
                 } {
-                    let view = unsafe {
-                        MapViewOfFile(
-                            handle,
-                            FILE_MAP_READ,
-                            0,
-                            0,
-                            mem::size_of::<RawRequestBlock>(),
-                        )
-                    };
+                    // The whole section: a version 1 overlay's is 32 bytes (page-granular view)
+                    let view = unsafe { MapViewOfFile(handle, FILE_MAP_READ, 0, 0, 0) };
                     if view.Value.is_null() {
                         unsafe { CloseHandle(handle).ok() };
                     } else {
@@ -561,7 +930,22 @@ mod windows_impl {
                     break;
                 }
             }
-            let block = block?;
+            let mut block = block?;
+            // A version 1 overlay's bytes after the first 32 are not part of its block
+            if block.version < REQUEST_VERSION_ANCHOR {
+                block.anchor_request = 0;
+                block.anchor_request_sequence = 0;
+            }
+            if block.version < REQUEST_VERSION_HAND_DISPLAY {
+                block.hand_display_sequence = 0;
+                block.hand_display_flags = 0;
+            }
+            if block.version < REQUEST_VERSION_HAND_CORRECTION {
+                block.hand_finger_scale = [1.0; 2];
+                block.hand_correction_sequence = 0;
+                block.hand_near_meters = 0.0;
+                block.hand_correction_plane = to_matrix(Pose::IDENTITY);
+            }
 
             // The mapping is kept open even while stale: as long as this handle exists, a restarted
             // overlay opens the same named section again
@@ -588,6 +972,23 @@ mod windows_impl {
             // +X rotated 90 degrees about Y points to -Z: first column is (0, 0, -1)
             assert!((m[0][0]).abs() < 1e-6 && (m[2][0] + 1.0).abs() < 1e-6);
             assert_eq!([m[0][3], m[1][3], m[2][3]], [1.0, 2.0, 3.0]);
+        }
+
+        #[test]
+        fn matrix_round_trip_and_product_name() {
+            let pose = Pose {
+                orientation: Quat::from_euler(alvr_common::glam::EulerRot::YXZ, 0.3, -0.2, 0.1),
+                position: Vec3::new(-1.0, 0.5, 2.0),
+            };
+            let back = from_matrix(to_matrix(pose));
+            assert!(back.position.distance(pose.position) < 1e-6);
+            assert!(back.orientation.angle_between(pose.orientation) < 1e-5);
+
+            assert_eq!(&product_name_bytes("A9210")[..6], b"A9210\0");
+            let long = "\u{e9}".repeat(20); // 40 bytes, 2 per character
+            let bytes = product_name_bytes(&long);
+            assert_eq!(bytes[30], 0); // 15 whole characters, then NUL
+            assert_eq!(bytes[31], 0);
         }
 
         #[test]

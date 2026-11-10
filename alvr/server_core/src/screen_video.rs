@@ -566,21 +566,28 @@ mod windows_impl {
                     if frames == 0 {
                         println!("first: {header:?}, {} bytes", frame.data.len());
                         assert!(header.is_keyframe);
-                        assert!(frame.data.starts_with(&[0, 0, 0, 1]) || frame.data.starts_with(&[0, 0, 1]));
+                        assert!(
+                            frame.data.starts_with(&[0, 0, 0, 1])
+                                || frame.data.starts_with(&[0, 0, 1])
+                        );
                     }
                     last_index = Some((header.stream_id, header.frame_index));
                     frames += 1;
                     keyframes += usize::from(header.is_keyframe);
                     bytes += frame.data.len();
                 }
-                if start.elapsed() > Duration::from_secs(4) && start.elapsed() < Duration::from_millis(4010) {
+                if start.elapsed() > Duration::from_secs(4)
+                    && start.elapsed() < Duration::from_millis(4010)
+                {
                     if let Some((stream_id, _)) = last_index {
                         reader.request_idr(stream_id);
                         println!("requested an IDR");
                     }
                 }
             }
-            println!("frames {frames}, keyframes {keyframes}, bytes {bytes}, gaps {gaps}, last {last_index:?}");
+            println!(
+                "frames {frames}, keyframes {keyframes}, bytes {bytes}, gaps {gaps}, last {last_index:?}"
+            );
             assert!(frames > 0);
         }
     }

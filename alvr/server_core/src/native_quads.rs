@@ -33,6 +33,18 @@ impl NativeQuadsReader {
     pub fn read(&mut self, _current_stage_epoch: u32) -> Vec<NativeQuad> {
         Vec::new()
     }
+
+    pub fn scene_mode(&self) -> bool {
+        false
+    }
+
+    pub fn stream_unused(&self) -> bool {
+        false
+    }
+
+    pub fn scene_loading(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(windows)]
@@ -74,6 +86,12 @@ mod windows_impl {
     const VERSION_OFFSET: usize = 4;
     // v2 block flag: a scene app (V3, full VR) is presenting
     const FLAG_SCENE_MODE: u32 = 1;
+    // v2 block flag: nothing of the overlay app's is in the stream (all screens are native quads, no
+    // overlay, dashboard or scene app): the client may skip rendering the stream
+    const FLAG_STREAM_UNUSED: u32 = 2;
+    // v2 block flag (kVrNativeQuadsFlagSceneLoading): a scene app is starting (until it presents) or
+    // shutting down (until the front end is restored): the client shows its loading screen
+    const FLAG_SCENE_LOADING: u32 = 4;
 
     #[repr(C, packed(4))]
     #[derive(Clone, Copy)]
@@ -224,6 +242,15 @@ mod windows_impl {
         mapping: Option<Mapping>,
         last_open_attempt: Option<Instant>,
         status: Status,
+        // Result of the last successful read, kept when the writer is busy during a read
+        last_quads: Vec<NativeQuad>,
+        // The writer's block is valid and fresh and has the scene mode flag (any STAGE epoch)
+        scene_mode: bool,
+        // The writer's block is valid, fresh, of the current STAGE epoch and has the stream unused
+        // flag
+        stream_unused: bool,
+        // The writer's block is valid and fresh and has the scene loading flag (any STAGE epoch)
+        scene_loading: bool,
     }
 
     impl NativeQuadsReader {
@@ -232,7 +259,26 @@ mod windows_impl {
                 mapping: None,
                 last_open_attempt: None,
                 status: Status::NotOpen,
+                last_quads: Vec::new(),
+                scene_mode: false,
+                stream_unused: false,
+                scene_loading: false,
             }
+        }
+
+        /// A scene app is starting or shutting down: the client shows its loading screen
+        pub fn scene_loading(&self) -> bool {
+            self.scene_loading
+        }
+
+        /// Nothing of the overlay app's is in the stream: the client may skip rendering it
+        pub fn stream_unused(&self) -> bool {
+            self.stream_unused
+        }
+
+        /// A scene app (V3, full VR) is presenting: passthrough and chroma key must be off
+        pub fn scene_mode(&self) -> bool {
+            self.scene_mode
         }
 
         fn set_status(&mut self, status: Status) {
@@ -324,17 +370,33 @@ mod windows_impl {
         }
 
         /// Quads to draw, in client STAGE space. Empty if the writer is missing, stale or wrote
-        /// for another STAGE epoch.
+        /// for another STAGE epoch. Also updates scene_mode().
         pub fn read(&mut self, current_stage_epoch: u32) -> Vec<NativeQuad> {
             if self.mapping.is_none() {
                 self.try_open();
             }
-            let Some(block) = self.mapping.as_ref().and_then(Self::read_block) else {
-                if self.mapping.is_none() {
-                    self.set_status(Status::NotOpen);
-                }
+            let Some(mapping) = &self.mapping else {
+                self.set_status(Status::NotOpen);
+                self.scene_mode = false;
+                self.stream_unused = false;
+                self.scene_loading = false;
                 return Vec::new();
             };
+            let Some(block) = Self::read_block(mapping) else {
+                // The writer kept writing during all attempts: nothing changed for the client
+                return self.last_quads.clone();
+            };
+
+            let quads = self.parse_block(&block, current_stage_epoch);
+            self.last_quads.clone_from(&quads);
+
+            quads
+        }
+
+        fn parse_block(&mut self, block: &Block, current_stage_epoch: u32) -> Vec<NativeQuad> {
+            self.scene_mode = false;
+            self.stream_unused = false;
+            self.scene_loading = false;
 
             let header = block.header;
             let (magic, version, count, heartbeat_ms, stage_epoch, flags) = (
@@ -353,6 +415,10 @@ mod windows_impl {
                 self.set_status(Status::Stale);
                 return Vec::new();
             }
+            // Independent of the STAGE epoch: the scene app presents whether or not the quads
+            // are calibrated
+            self.scene_mode = version >= VERSION_2 && flags & FLAG_SCENE_MODE != 0;
+            self.scene_loading = version >= VERSION_2 && flags & FLAG_SCENE_LOADING != 0;
             if stage_epoch != current_stage_epoch {
                 self.set_status(Status::OtherStageEpoch {
                     block: stage_epoch,
@@ -360,6 +426,9 @@ mod windows_impl {
                 });
                 return Vec::new();
             }
+
+            // Only for the current epoch: the quads that replace the stream are drawn
+            self.stream_unused = version >= VERSION_2 && flags & FLAG_STREAM_UNUSED != 0;
 
             let quads = block
                 .quads
@@ -370,7 +439,7 @@ mod windows_impl {
             self.set_status(Status::Active {
                 version,
                 count: quads.len(),
-                scene_mode: version >= VERSION_2 && flags & FLAG_SCENE_MODE != 0,
+                scene_mode: self.scene_mode,
             });
 
             quads
@@ -415,6 +484,104 @@ mod windows_impl {
                 )
                 .is_none()
             );
+        }
+
+        fn block(version: u32, flags: u32, age_ms: u64, stage_epoch: u32) -> Block {
+            Block {
+                header: RawHeader {
+                    magic: MAGIC,
+                    version,
+                    sequence: 2,
+                    count: 0,
+                    heartbeat_ms: unsafe { GetTickCount64() }.saturating_sub(age_ms),
+                    stage_epoch,
+                    flags,
+                },
+                quads: Vec::new(),
+            }
+        }
+
+        #[test]
+        fn scene_loading_needs_a_fresh_v2_block_of_any_epoch() {
+            let mut reader = NativeQuadsReader::new();
+            let mut scene_loading = |block: Block| {
+                reader.parse_block(&block, 3);
+                reader.scene_loading()
+            };
+
+            assert!(scene_loading(block(VERSION_2, FLAG_SCENE_LOADING, 0, 3)));
+            // Starting before the quads are calibrated for this epoch
+            assert!(scene_loading(block(VERSION_2, FLAG_SCENE_LOADING, 0, 9)));
+            assert!(scene_loading(block(
+                VERSION_2,
+                FLAG_SCENE_LOADING | FLAG_SCENE_MODE,
+                0,
+                3
+            )));
+            assert!(!scene_loading(block(VERSION_2, FLAG_SCENE_MODE, 0, 3)));
+            assert!(!scene_loading(block(VERSION_1, FLAG_SCENE_LOADING, 0, 3)));
+            assert!(!scene_loading(block(
+                VERSION_2,
+                FLAG_SCENE_LOADING,
+                STALE_MS + 500,
+                3
+            )));
+        }
+
+        #[test]
+        fn stream_unused_needs_a_fresh_v2_block_of_the_current_epoch() {
+            let mut reader = NativeQuadsReader::new();
+            let mut stream_unused = |block: Block| {
+                reader.parse_block(&block, 3);
+                reader.stream_unused()
+            };
+
+            assert!(stream_unused(block(VERSION_2, FLAG_STREAM_UNUSED, 0, 3)));
+            assert!(stream_unused(block(
+                VERSION_2,
+                FLAG_STREAM_UNUSED | 0x100,
+                0,
+                3
+            )));
+            assert!(!stream_unused(block(VERSION_2, FLAG_STREAM_UNUSED, 0, 9)));
+            assert!(!stream_unused(block(VERSION_2, FLAG_SCENE_MODE, 0, 3)));
+            assert!(!stream_unused(block(VERSION_1, FLAG_STREAM_UNUSED, 0, 3)));
+            assert!(!stream_unused(block(
+                VERSION_2,
+                FLAG_STREAM_UNUSED,
+                STALE_MS + 500,
+                3
+            )));
+        }
+
+        #[test]
+        fn scene_mode_needs_a_fresh_v2_block_with_the_flag() {
+            let mut reader = NativeQuadsReader::new();
+            let mut scene_mode = |block: Block| {
+                reader.parse_block(&block, 3);
+                reader.scene_mode()
+            };
+
+            assert!(scene_mode(block(VERSION_2, FLAG_SCENE_MODE, 0, 3)));
+            // Any STAGE epoch: the scene app presents whether or not the quads are calibrated
+            assert!(scene_mode(block(VERSION_2, FLAG_SCENE_MODE, 0, 9)));
+            assert!(!scene_mode(block(VERSION_2, 0, 0, 3)));
+            // v1: the field is reserved
+            assert!(!scene_mode(block(VERSION_1, FLAG_SCENE_MODE, 0, 3)));
+            // The writer crashed or hangs: not scene mode
+            assert!(!scene_mode(block(
+                VERSION_2,
+                FLAG_SCENE_MODE,
+                STALE_MS + 500,
+                3
+            )));
+            assert!(!scene_mode(Block {
+                header: RawHeader {
+                    magic: 0,
+                    ..block(VERSION_2, FLAG_SCENE_MODE, 0, 3).header
+                },
+                quads: Vec::new(),
+            }));
         }
     }
 }

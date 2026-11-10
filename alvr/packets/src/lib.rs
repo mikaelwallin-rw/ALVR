@@ -227,6 +227,101 @@ pub enum ServerControlPacket {
     CameraFrames(Option<CameraFramesConfig>),
     // Replaces the debug native quads (empty = none)
     NativeQuads(Vec<NativeQuad>),
+    // Overlay app's persistent anchor command (create/replace or forget)
+    AnchorRequest(AnchorRequest),
+    // Overlay app's automatic hand correction (lengthened drawn fingers near the touchscreen)
+    HandCorrection(HandCorrection),
+    // Overlay app's hand display transform (drawn hands into the passthrough-consistent frame)
+    HandDisplay(HandDisplay),
+}
+
+/// Hand display transform from an overlay app: the DRAWN hands near the touch display are moved
+/// into the frame in which the overlay app draws that display (e.g. its passthrough-compensated
+/// pose), so that hand and display agree with what passthrough shows. Never applied to reported
+/// joints.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct HandDisplay {
+    pub sequence: u32,
+    /// false = identity (e.g. scene mode, where the display is drawn at its true pose)
+    pub active: bool,
+    /// STAGE -> STAGE rigid part mapping the display's true pose to its published pose
+    pub transform: Pose,
+    /// Uniform scale about the display's true centre, applied before `transform`
+    pub scale: f32,
+    /// The display quad as published (STAGE) and its full size, meters
+    pub quad_pose: Pose,
+    pub quad_size: [f32; 2],
+    /// Full weight within this distance of the quad rectangle, fading smoothly to none at
+    /// `falloff_meters`
+    pub full_meters: f32,
+    pub falloff_meters: f32,
+}
+
+/// Automatic correction of the DRAWN hands from an overlay app (e.g. from measured touch contact
+/// points): each hand's fingers are lengthened by `finger_scale` while its index tip is near the
+/// given plane, fading to no correction at `near_meters` from it. Applied on top of the client's own
+/// hand shape settings; never applied to the joints the client reports.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct HandCorrection {
+    pub sequence: u32,
+    /// Left, right; 1 = none
+    pub finger_scale: [f32; 2],
+    /// Full correction within half this distance of the plane, none beyond it
+    pub near_meters: f32,
+    /// Plane pose in the client STAGE space (the plane is its local XY plane)
+    pub plane: Pose,
+}
+
+/// What the client applies when drawing the hands (reported so that the overlay app can tell the
+/// raw tracked joints it gets from what the user sees)
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]
+pub struct HandShapeInfo {
+    /// Girth across the bones (1 = the mesh as modelled)
+    pub thickness: f32,
+    /// Uniform scale about the wrist
+    pub scale: f32,
+    /// Finger length factor from the client's own settings
+    pub fingers: f32,
+    /// Overlay app correction currently applied per hand (left, right; 1 = none), on top of
+    /// `fingers`
+    pub finger_correction: [f32; 2],
+    /// Sequence of the last HandCorrection received (0 = none)
+    pub correction_sequence: u32,
+}
+
+/// Persistent spatial anchor command from an overlay app. Carried out once per new sequence.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct AnchorRequest {
+    pub sequence: u32,
+    pub kind: AnchorRequestKind,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+pub enum AnchorRequestKind {
+    /// Create (or replace) the anchor at this client STAGE pose
+    Create(Pose),
+    Forget,
+}
+
+/// Identity of the client STAGE space and the state of the persistent anchor
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct StageInfo {
+    /// Random, persisted on the headset; changes when STAGE changes (runtime event beyond
+    /// tolerance, or the anchor seen moved in STAGE)
+    pub stage_identity: u64,
+    pub previous_stage_identity: u64,
+    pub stage_change_sequence: u32,
+    /// p_current = stage_from_previous * p_previous, when known
+    pub stage_from_previous: Option<Pose>,
+    /// VrAnchorState (0 none, 1 creating, 2 located, 3 lost, 4 unsupported, 5 error)
+    pub anchor_state: u32,
+    pub anchor_uuid: [u8; 16],
+    /// Anchor pose in STAGE (last good pose when lost)
+    pub anchor_pose: Option<Pose>,
+    pub anchor_generation: u32,
+    /// Sequence of the last anchor request carried out
+    pub anchor_request_served: u32,
+    pub product_name: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -274,6 +369,8 @@ pub enum ClientControlPacket {
     Reserved(String),
     ReservedBuffer(Vec<u8>),
     CameraFrame(Box<CameraFrame>),
+    StageInfo(StageInfo),
+    HandShape(HandShapeInfo),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -436,6 +533,18 @@ pub enum FirewallRulesAction {
     Add,
     Remove,
 }
+
+/// RealTimeConfig.ext_str token: nothing of the overlay app's is in the stream (native quads block
+/// flag), the client may skip rendering and submitting it
+pub const EXT_STREAM_UNUSED: &str = "stream_unused";
+
+/// RealTimeConfig.ext_str token: a scene app (V3, full VR) owns the view (native quads block flag;
+/// passthrough is None in the same config). The client must never show key colour frames then.
+pub const EXT_SCENE_MODE: &str = "scene_mode";
+
+/// RealTimeConfig.ext_str token: a scene app is starting or shutting down (native quads block flag
+/// kVrNativeQuadsFlagSceneLoading): the client shows its loading screen instead of the stream
+pub const EXT_SCENE_LOADING: &str = "scene_loading";
 
 // Note: server sends a packet to the client at low frequency, binary encoding, without ensuring
 // compatibility between different versions, even if within the same major version.

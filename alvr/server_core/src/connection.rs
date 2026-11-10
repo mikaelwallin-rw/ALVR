@@ -14,7 +14,8 @@ use crate::{
 use alvr_adb::{WiredConnection, WiredConnectionStatus};
 use alvr_common::{
     AnyhowToCon, BUTTON_INFO, CONTROLLER_PROFILE_INFO, ConResult, ConnectionError, ConnectionState,
-    LifecycleState, QUEST_CONTROLLER_PROFILE_PATH, con_bail, dbg_connection, debug, error,
+    LifecycleState, QUEST_CONTROLLER_PROFILE_PATH, RelaxedAtomic, con_bail, dbg_connection, debug,
+    error,
     glam::{UVec2, Vec2},
     info,
     parking_lot::{Condvar, Mutex, RwLock},
@@ -52,15 +53,22 @@ use std::{
 const RETRY_CONNECT_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const HANDSHAKE_ACTION_TIMEOUT: Duration = Duration::from_secs(2);
 pub const STREAMING_RECV_TIMEOUT: Duration = Duration::from_millis(500);
-const REAL_TIME_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+// Also the reaction time to scene mode changes (passthrough off while a scene app presents)
+const REAL_TIME_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 // Headset camera frames for overlay calibration (see VrCameraFrame.h): full rectified resolution,
 // a few frames per second
 const CAMERA_FRAME_SIZE: u32 = 2048;
-const CAMERA_FRAME_INTERVAL: Duration = Duration::from_millis(250);
+// ~12 fps: the headset needs ~78 ms per frame (SecureMR capture 35 ms + pose/JPEG 41 ms + send
+// 2 ms, measured 2026-11-10), so a calibration pass gets its frames 3x faster than at 250 ms
+const CAMERA_FRAME_INTERVAL: Duration = Duration::from_millis(83);
 // Screen thread: wait for a new screen video frame at most this long, poll the native quads at
 // this interval (pose trims must reach the headset quickly)
 const SCREEN_VIDEO_WAIT: Duration = Duration::from_millis(5);
 const NATIVE_QUADS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+// Screen video bitrate measurement, subtracted from the main stream's bitrate. The window spans
+// two keyframe periods of the overlay app (2 s), so keyframes don't make it oscillate.
+const SCREEN_VIDEO_BITRATE_INTERVAL: Duration = Duration::from_secs(4);
+const SCREEN_VIDEO_BITRATE_SMOOTHING: f32 = 0.5;
 
 const MAX_UNREAD_PACKETS: usize = 10; // Applies per stream
 
@@ -1177,18 +1185,85 @@ fn connection_pipeline(
 
     let control_sender = Arc::new(Mutex::new(control_sender));
 
+    // Scene mode from the overlay app's native quads block (written by the screen thread): a
+    // scene app (V3, full VR) is presenting, so passthrough and chroma key are turned off
+    let scene_mode = Arc::new(RelaxedAtomic::new(false));
+    // Nothing of the overlay app's is in the stream (native quads block flag): forwarded to the
+    // client in RealTimeConfig.ext_str, which then skips rendering the stream
+    let stream_unused = Arc::new(RelaxedAtomic::new(false));
+    // A scene app is starting or shutting down (native quads block flag): forwarded to the client in
+    // RealTimeConfig.ext_str, which then shows its loading screen
+    let scene_loading = Arc::new(RelaxedAtomic::new(false));
+
     let real_time_update_thread = thread::spawn({
         let control_sender = Arc::clone(&control_sender);
         let client_hostname = client_hostname.clone();
+        let scene_mode = Arc::clone(&scene_mode);
+        let stream_unused = Arc::clone(&stream_unused);
+        let scene_loading = Arc::clone(&scene_loading);
         move || {
             let mut previous_config = None;
+            let mut previous_scene_mode = false;
+            let mut previous_stream_unused = false;
+            let mut previous_scene_loading = false;
             while is_streaming(&client_hostname) {
-                let config = {
+                let mut config = {
                     let session_manager_lock = SESSION_MANAGER.read();
                     let settings = session_manager_lock.settings();
 
                     RealTimeConfig::from_settings(settings)
                 };
+
+                let scene_mode = scene_mode.value();
+                if scene_mode != previous_scene_mode {
+                    if scene_mode {
+                        info!("Scene mode on: passthrough and chroma key off");
+                    } else {
+                        info!(
+                            "Scene mode off: passthrough restored ({})",
+                            if config.passthrough.is_some() {
+                                "configured"
+                            } else {
+                                "none configured"
+                            }
+                        );
+                    }
+                    previous_scene_mode = scene_mode;
+                }
+                if scene_mode {
+                    config.passthrough = None;
+                }
+
+                let stream_unused = stream_unused.value();
+                if stream_unused != previous_stream_unused {
+                    info!(
+                        "Stream unused flag {}: the client {} the stream",
+                        if stream_unused { "on" } else { "off" },
+                        if stream_unused { "skips" } else { "renders" }
+                    );
+                    previous_stream_unused = stream_unused;
+                }
+                let scene_loading = scene_loading.value();
+                if scene_loading != previous_scene_loading {
+                    info!(
+                        "Scene loading flag {}: the client {} its loading screen",
+                        if scene_loading { "on" } else { "off" },
+                        if scene_loading { "shows" } else { "may hide" }
+                    );
+                    previous_scene_loading = scene_loading;
+                }
+
+                let mut ext_tokens = vec![];
+                if stream_unused {
+                    ext_tokens.push(alvr_packets::EXT_STREAM_UNUSED);
+                }
+                if scene_mode {
+                    ext_tokens.push(alvr_packets::EXT_SCENE_MODE);
+                }
+                if scene_loading {
+                    ext_tokens.push(alvr_packets::EXT_SCENE_LOADING);
+                }
+                config.ext_str = ext_tokens.join(",");
 
                 let same_config = previous_config.as_ref().is_some_and(|prev| config == *prev);
                 if !same_config {
@@ -1252,8 +1327,12 @@ fn connection_pipeline(
 
     // Native quads and screen video from the overlay app (ScreenVR)
     let screen_thread = thread::spawn({
+        let ctx = Arc::clone(&ctx);
         let control_sender = Arc::clone(&control_sender);
         let client_hostname = client_hostname.clone();
+        let scene_mode = Arc::clone(&scene_mode);
+        let stream_unused = Arc::clone(&stream_unused);
+        let scene_loading = Arc::clone(&scene_loading);
         move || {
             let mut screen_video_reader = ScreenVideoReader::new();
             let mut native_quads_reader = NativeQuadsReader::new();
@@ -1261,7 +1340,15 @@ fn connection_pipeline(
             // PartialEq). The client starts without any.
             let mut sent_native_quads = format!("{:?}", Vec::<NativeQuad>::new());
             let mut last_native_quads_poll = None::<Instant>;
+            // Anchor request sequence last forwarded on this connection (the client dedups across
+            // connections with its persisted served sequence)
+            let mut sent_anchor_sequence = None::<u32>;
+            let mut sent_hand_correction = None::<u32>;
+            let mut sent_hand_display = None::<(u32, bool)>;
             let mut sent_frames = 0_u64;
+            let mut bitrate_window_start = Instant::now();
+            let mut bitrate_window_bytes = 0_usize;
+            let mut screen_video_bps = 0.0_f32;
 
             while is_streaming(&client_hostname) {
                 for frame in screen_video_reader.read(SCREEN_VIDEO_WAIT) {
@@ -1277,9 +1364,32 @@ fn connection_pipeline(
                         );
                     }
                     sent_frames += 1;
+                    bitrate_window_bytes += frame.data.len();
                     screen_video_sender
                         .send_header_with_payload(&frame.header, &frame.data)
                         .ok();
+                }
+
+                let window = bitrate_window_start.elapsed();
+                if window >= SCREEN_VIDEO_BITRATE_INTERVAL {
+                    let bps = bitrate_window_bytes as f32 * 8.0 / window.as_secs_f32();
+                    screen_video_bps += (bps - screen_video_bps) * SCREEN_VIDEO_BITRATE_SMOOTHING;
+                    if bps == 0.0 && screen_video_bps < 1e5 {
+                        screen_video_bps = 0.0;
+                    }
+                    bitrate_window_start = Instant::now();
+                    bitrate_window_bytes = 0;
+
+                    if ctx
+                        .bitrate_manager
+                        .lock()
+                        .report_screen_video_bitrate(screen_video_bps)
+                    {
+                        info!(
+                            "Screen video: {:.1} Mbps, subtracted from the main stream bitrate (keeping at least half)",
+                            screen_video_bps / 1e6
+                        );
+                    }
                 }
 
                 while let Ok(stream_id) = screen_idr_receiver.try_recv() {
@@ -1292,6 +1402,9 @@ fn connection_pipeline(
                     last_native_quads_poll = Some(Instant::now());
 
                     let native_quads = native_quads_reader.read(tracking_extras::stage_epoch());
+                    scene_mode.set(native_quads_reader.scene_mode());
+                    stream_unused.set(native_quads_reader.stream_unused());
+                    scene_loading.set(native_quads_reader.scene_loading());
                     let native_quads_text = format!("{native_quads:?}");
                     let count = native_quads.len();
                     if native_quads_text != sent_native_quads
@@ -1302,6 +1415,38 @@ fn connection_pipeline(
                     {
                         debug!("Native quads sent to the client: {count}");
                         sent_native_quads = native_quads_text;
+                    }
+
+                    if let Some(request) = tracking_extras::anchor_request()
+                        && sent_anchor_sequence != Some(request.sequence)
+                        && control_sender
+                            .lock()
+                            .send(&ServerControlPacket::AnchorRequest(request))
+                            .is_ok()
+                    {
+                        info!("Anchor request {} sent to the client", request.sequence);
+                        sent_anchor_sequence = Some(request.sequence);
+                    }
+
+                    if let Some(correction) = tracking_extras::hand_correction()
+                        && sent_hand_correction != Some(correction.sequence)
+                        && control_sender
+                            .lock()
+                            .send(&ServerControlPacket::HandCorrection(correction))
+                            .is_ok()
+                    {
+                        info!("Hand correction {} sent to the client", correction.sequence);
+                        sent_hand_correction = Some(correction.sequence);
+                    }
+
+                    if let Some(display) = tracking_extras::hand_display()
+                        && sent_hand_display != Some((display.sequence, display.active))
+                        && control_sender
+                            .lock()
+                            .send(&ServerControlPacket::HandDisplay(display))
+                            .is_ok()
+                    {
+                        sent_hand_display = Some((display.sequence, display.active));
                     }
                 }
             }
@@ -1476,6 +1621,12 @@ fn connection_pipeline(
                         ctx.events_sender
                             .send(ServerCoreEvent::ProximityState(headset_is_worn))
                             .ok();
+                    }
+                    ClientControlPacket::StageInfo(info) => {
+                        tracking_extras::report_stage_info(info);
+                    }
+                    ClientControlPacket::HandShape(info) => {
+                        tracking_extras::report_hand_shape(info);
                     }
                     ClientControlPacket::CameraFrame(frame) => {
                         if let Err(e) = camera_frames::publish_frame(&frame) {

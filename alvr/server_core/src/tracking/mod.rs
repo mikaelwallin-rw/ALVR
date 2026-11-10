@@ -490,6 +490,12 @@ pub fn tracking_loop(
                         // # Safety: constant index below the fixed joint count (26)
                         .map(|joints| tracking_manager_lock.recenter_pose(joints[INDEX_TIP_JOINT]))
                 };
+            // The raw skeletons for overlay apps (tracking extras v4), same rule
+            let hand = |skeleton: Option<[Pose; 26]>, tip_tracked: bool, controller_id: u64| {
+                skeleton
+                    .filter(|_| tip_tracked && !device_motion_keys.contains(&controller_id))
+                    .map(|joints| joints.map(|joint| tracking_manager_lock.recenter_pose(joint)))
+            };
             tracking_extras::report_tracking(
                 tracking_manager_lock.driver_from_stage(),
                 [
@@ -499,6 +505,18 @@ pub fn tracking_loop(
                         *inp::HAND_LEFT_ID,
                     ),
                     fingertip(
+                        tracking.hand_skeletons[1],
+                        tracking.index_tips_tracked[1],
+                        *inp::HAND_RIGHT_ID,
+                    ),
+                ],
+                [
+                    hand(
+                        tracking.hand_skeletons[0],
+                        tracking.index_tips_tracked[0],
+                        *inp::HAND_LEFT_ID,
+                    ),
+                    hand(
                         tracking.hand_skeletons[1],
                         tracking.index_tips_tracked[1],
                         *inp::HAND_RIGHT_ID,

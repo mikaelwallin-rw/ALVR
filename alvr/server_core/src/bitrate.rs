@@ -10,6 +10,10 @@ use std::{
 };
 
 const UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+// The main stream keeps at least this fraction of its bitrate while screen video streams run
+const MIN_MAIN_BITRATE_FRACTION: f32 = 0.5;
+// Smaller changes of the screen video bitrate do not update the encoder
+const SCREEN_VIDEO_BPS_HYSTERESIS: f32 = 2e6;
 
 pub struct DynamicEncoderParams {
     pub bitrate_bps: f32,
@@ -31,6 +35,9 @@ pub struct BitrateManager {
     dynamic_decoder_max_bytes_per_frame: f32,
     previous_config: Option<BitrateConfig>,
     update_needed: bool,
+    // Measured bitrate of the overlay app's screen video streams (SCREEN_VIDEO), which share the
+    // link with the main stream
+    screen_video_bps: f32,
 }
 
 impl BitrateManager {
@@ -57,7 +64,21 @@ impl BitrateManager {
             dynamic_decoder_max_bytes_per_frame: f32::MAX,
             previous_config: None,
             update_needed: true,
+            screen_video_bps: 0.0,
         }
+    }
+
+    /// The screen video streams' current bitrate: the main stream's bitrate is lowered by it,
+    /// down to MIN_MAIN_BITRATE_FRACTION. Returns true if the main bitrate will change.
+    pub fn report_screen_video_bitrate(&mut self, bps: f32) -> bool {
+        let changed = (bps - self.screen_video_bps).abs() >= SCREEN_VIDEO_BPS_HYSTERESIS
+            || (bps == 0.0) != (self.screen_video_bps == 0.0);
+        if changed {
+            self.screen_video_bps = bps;
+            self.update_needed = true;
+        }
+
+        changed
     }
 
     // Note: This is used to calculate the framerate/frame interval. The frame present is the most
@@ -241,6 +262,8 @@ impl BitrateManager {
             }
         };
 
+        let bitrate_bps = main_stream_bitrate(bitrate_bps, self.screen_video_bps);
+
         bitrate_directives.requested_bitrate_bps = bitrate_bps;
 
         Some((
@@ -250,5 +273,32 @@ impl BitrateManager {
             },
             bitrate_directives,
         ))
+    }
+}
+
+// The configured or adapted link bitrate minus what the screen video streams use, keeping a minimum
+// for the main stream
+fn main_stream_bitrate(link_bps: f32, screen_video_bps: f32) -> f32 {
+    f32::max(
+        link_bps - screen_video_bps,
+        link_bps * MIN_MAIN_BITRATE_FRACTION,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn screen_video_lowers_the_main_bitrate_down_to_a_minimum() {
+        assert_eq!(main_stream_bitrate(30e6, 0.0), 30e6);
+        assert_eq!(main_stream_bitrate(30e6, 6e6), 24e6);
+        assert_eq!(main_stream_bitrate(30e6, 40e6), 15e6);
+
+        let mut manager = BitrateManager::new(16, 90.0);
+        assert!(manager.report_screen_video_bitrate(6e6));
+        assert!(!manager.report_screen_video_bitrate(7.5e6));
+        assert!(manager.report_screen_video_bitrate(8e6));
+        assert!(manager.report_screen_video_bitrate(0.0));
     }
 }
