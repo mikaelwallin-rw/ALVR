@@ -1,0 +1,93 @@
+ScreenVR loading screen: spec for the headset-rendered transition (v1, 2026-11-10)
+Figma: https://www.figma.com/design/G7OFvjP2mAAF6qokxNrKYR  (section D, components on page "Building blocks")
+
+PURPOSE
+Replace the magenta (chroma-key) view shown while V3 starts. Rendered by the headset (ALVR client),
+language-free (no text, nothing to localise), never black, never magenta.
+
+COLOURS (Tenstar Graphic Profile 2025)
+Background        Tenstar Ocean     #40505E  (RGB 64, 80, 94)   opaque, full view
+Track             Tenstar Aluminium #E9E9E9  at 18 % opacity   (alpha 46/255)
+Arc (progress)    Tenstar Green     #93CB4D  (RGB 147, 203, 77)
+Going back        Tenstar Orange    #F3AD2C  (RGB 243, 173, 44)  ring; icon in Aluminium #E9E9E9
+
+PLACEMENT
+- World-locked, 2.0 m in front of the seated head position. Yaw = head yaw at the moment the loading
+  screen starts (no pitch/roll). Centre 5 degrees below eye level. Not head-locked.
+- Quad 0.48 m x 0.48 m (13.7 deg) carrying the 1024x1024 texture.
+- Ring outer diameter 0.41 m = 11.7 deg (~12 deg); stroke 0.034 m (~1 deg). Well inside the central 30 deg.
+- Logo (decided): the original artwork D:\wkspaces\ScreenVR\Logos\Tenstar_Logo_Alu-2023 (4).png
+  ("TENSTAR" secondary logo, Aluminium version for dark backgrounds; 3048 x 844 px, tightly cropped,
+  aspect 3.61). Never redraw, recolour or crop it. The "Tenstar simulation" version is not used here
+  because "simulation" would be too small at this size (graphic profile: secondary logo for small formats).
+  World: a separate quad in the same world-locked plane as the ring, 0.28 m x 0.078 m (8.0 deg wide),
+  centre 0.31 m below the ring centre (about 13.6 deg below eye level). Gap from the ring's outer edge to
+  the logo's top edge: 0.065 m. Clear space: at least 1/4 of the logo height (0.02 m) free on every side
+  (the profile gives no figure; this is the rule used on the board). Opacity follows the ring
+  (fades in and out with it). Restrained on purpose: ring + logo only, nothing else.
+  Eye-buffer reference (1024, 100 deg): logo ~60 x 17 px, centre at (512, 616); ring centre at (512, 550).
+
+LAYERS (top to bottom)
+1. Tracked hands
+2. Touchscreen virtual copy at its real pose, live video, fully usable (never hidden, never moved)
+3. Indicator quad and logo quad
+4. Ocean background (opaque, full view). During cross-fades, passthrough or the simulator frame blends with it.
+
+TEXTURE GEOMETRY (1024 x 1024, transparent)
+- Centre (512, 512). Ring centreline radius 402 px, stroke 72 px -> outer diameter 876 px, inner 732 px.
+- Arc: 100 deg, centred at 12 o'clock in the static asset, round caps.
+- 512 x 512 versions: everything halved (r 201 px, stroke 36 px).
+- Hourglass (taking longer): Aluminium, stroke 28 px, inside the ring, 200 x 260 px.
+- Return arrow (going back): Aluminium, stroke 36 px, inside an all-Orange ring.
+
+ANIMATION (normal)
+- Rotation: clockwise, constant 180 deg/s (one turn per 2 s).
+- Arc length: L(t) = 105 deg - 45 deg * cos(pi * t), t in seconds -> 60..150 deg, ease-in-out sine, period 2 s.
+- Arc centre angle: theta(t) = -90 deg + 180 deg/s * t (screen coordinates, 0 deg = 3 o'clock, clockwise).
+- 12 key frames per cycle (every 1/6 s): k = 0..11, t = k/6, rotation = 30k deg,
+  arc = 60, 66, 83, 105, 128, 144, 150, 144, 128, 105, 83, 66 deg.
+- Minimal implementation: rotate loading-indicator-arc over loading-indicator-track at 180 deg/s
+  (fixed 100 deg arc, no length animation).
+
+APPEAR / DISAPPEAR
+- Indicator fade-in 0.3 s, scale 0.92 -> 1.0, ease-out, starting when passthrough is 50 % faded.
+- Indicator fade-out 0.3 s while the simulator's first frame cross-fades in.
+- Minimum visible time 0.6 s (no flashes).
+
+TIMELINE: ENTERING VR
+Context (decided): V3 does its long loading BEFORE it connects to the VR runtime. During that time the
+trainee stays in the front end in passthrough with all screens. The loading screen only covers the last
+seconds, from the VR connection to V3's first frame. Times below are relative to the VR connection.
+Start        Tap Start on the real touchscreen (passthrough, all screens); V3 loads in the background.
+0-0.3 s      (from VR connect) Main screen copies fade out. Touchscreen copy stays.
+0.3-0.8 s    Passthrough fades into the Ocean background (0.5 s, ease-in-out). Indicator fades in.
+0.8 s ->     Loading screen until V3's first frame (passthrough off; no magenta at any time).
++0-0.5 s     First simulator frame cross-fades in (0.5 s); indicator fades out.
+
+TIMELINE: LEAVING VR
+0-0.5 s      Simulator cross-fades into the loading screen; indicator fades in.
+-> front end Loading screen while V3 closes and the front end returns.
++0-0.5 s     Passthrough fades in (0.5 s); indicator fades out.
++0.5-0.8 s   Main screen copies fade in (0.3 s) at their stored positions. No calibration.
+
+VARIANTS (all language-free)
+Time-outs are fixed (decided), counted from the VR connection.
+- Taking longer (from 15 s): hourglass fades into the ring centre (0.5 s) and turns over every 4 s
+  (0.6 s ease-in-out). Ring keeps turning.
+- Going back (V3 exits before its first frame, or no first frame after 60 s): arc stops,
+  ring cross-fades to Orange (0.3 s), return arrow appears; hold 1.5 s; passthrough fades in (0.5 s)
+  with all screens. Only afterwards may a localised headset panel say "The exercise could not start."
+
+WHAT THE INSTRUCTOR SEES (decided: nothing extra needed)
+- A window on the normal monitors mirrors the trainee's VR view at all times, including the loading
+  screen, the hourglass and the going-back state.
+- Physical touchscreen: front end, then the in-cab touch UI when V3 starts it; on failure, the front end again.
+
+ASSETS IN THIS FOLDER
+loading-indicator(.svg, -1024.png, -512.png)            track + 100 deg arc
+loading-indicator-track(.svg, -1024.png, -512.png)      track only
+loading-indicator-arc(.svg, -1024.png, -512.png)        arc only (rotate this)
+loading-indicator-longer(.svg, -1024.png, -512.png)     with hourglass
+loading-indicator-going-back(.svg, -1024.png, -512.png) orange ring + return arrow
+loading-screen-reference-1024.png                       clean 1:1 loading screen with the logo, reference only (assumed 100 deg eye buffer)
+Logo texture: use the original file from D:\wkspaces\ScreenVR\Logos (not copied here).
