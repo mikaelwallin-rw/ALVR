@@ -304,7 +304,11 @@ pub extern "C" fn alvr_poll_event(out_event: *mut AlvrEvent) -> bool {
             }
             ClientCoreEvent::RealTimeConfig(_) => AlvrEvent::RealTimeConfig {},
             // Camera frames and native quads are only handled by the OpenXR client
-            ClientCoreEvent::CameraFrames(_) | ClientCoreEvent::NativeQuads(_) => return false,
+            ClientCoreEvent::CameraFrames(_)
+            | ClientCoreEvent::NativeQuads(_)
+            | ClientCoreEvent::AnchorRequest(_)
+            | ClientCoreEvent::HandCorrection(_)
+            | ClientCoreEvent::HandDisplay(_) => return false,
         };
 
         unsafe { *out_event = event };
@@ -819,6 +823,7 @@ pub extern "C" fn alvr_render_stream_opengl(
                     edge_despill_px: 0.0,
                     debug_tint: false,
                 },
+                None,
             );
         }
     });

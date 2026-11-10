@@ -57,6 +57,9 @@ const MAX_UNREAD_PACKETS: usize = 10; // Applies per stream
 pub const MAX_QUEUED_SCREEN_VIDEO_FRAMES: usize = 60;
 // Keyframe requests per screen video stream, at most one in this interval
 const SCREEN_IDR_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(200);
+// Reassembly buffers of the SCREEN_VIDEO channel, shared by all screen streams: room for the
+// keyframes of several streams arriving together plus the frames behind them
+const MAX_UNREAD_SCREEN_VIDEO_PACKETS: usize = 32;
 
 pub type DecoderCallback = dyn FnMut(Duration, &[u8]) -> bool + Send;
 
@@ -79,6 +82,39 @@ pub struct ConnectionContext {
     pub max_prediction: RwLock<Duration>,
     // Screen video access units for the client app, in arrival order
     pub screen_video_queue: Mutex<VecDeque<(ScreenVideoPacketHeader, Vec<u8>)>>,
+}
+
+// Per screen video stream loss tracking. The server sends each stream's frames with consecutive
+// frame indices, except that it may resume at a keyframe after its own loss. So a gap before a
+// non-keyframe, or a stream starting without a keyframe, is a loss of that stream only.
+#[derive(Default)]
+struct ScreenStreamTracker {
+    last_frame_index: HashMap<u32, u64>,
+    corrupted: HashSet<u32>,
+}
+
+impl ScreenStreamTracker {
+    // Whether the frame can be decoded, and whether the stream just became corrupted
+    fn accept(&mut self, header: &ScreenVideoPacketHeader) -> (bool, bool) {
+        let stream_id = header.stream_id;
+        let expected = self
+            .last_frame_index
+            .insert(stream_id, header.frame_index)
+            .map(|index| index + 1);
+
+        if header.is_keyframe {
+            self.corrupted.remove(&stream_id);
+            return (true, false);
+        }
+        let newly_corrupted =
+            expected != Some(header.frame_index) && self.corrupted.insert(stream_id);
+
+        (!self.corrupted.contains(&stream_id), newly_corrupted)
+    }
+
+    fn mark_corrupted(&mut self, stream_id: u32) {
+        self.corrupted.insert(stream_id);
+    }
 }
 
 // Sends a keyframe request for a screen video stream, rate limited per stream
@@ -324,8 +360,10 @@ fn connection_pipeline(
 
     let mut video_receiver =
         stream_socket.subscribe_to_stream::<VideoPacketHeader>(VIDEO, MAX_UNREAD_PACKETS);
-    let mut screen_video_receiver = stream_socket
-        .subscribe_to_stream::<ScreenVideoPacketHeader>(SCREEN_VIDEO, MAX_UNREAD_PACKETS);
+    let mut screen_video_receiver = stream_socket.subscribe_to_stream::<ScreenVideoPacketHeader>(
+        SCREEN_VIDEO,
+        MAX_UNREAD_SCREEN_VIDEO_PACKETS,
+    );
     let mut game_audio_receiver = stream_socket.subscribe_to_stream(AUDIO, MAX_UNREAD_PACKETS);
     let tracking_sender = stream_socket.request_stream(TRACKING);
     let mut haptics_receiver =
@@ -401,14 +439,16 @@ fn connection_pipeline(
         }
     });
 
-    // Screen video: forwarded to the client app as is. After a loss, the stream's frames are
-    // dropped until its next keyframe, which is requested.
+    // Screen video: forwarded to the client app as is. After a loss of a stream (a gap in its frame
+    // indices), its frames are dropped until its next keyframe, which is requested. Other streams
+    // on the channel are not affected.
     let screen_video_receive_thread = thread::spawn({
         let ctx = Arc::clone(&ctx);
         move || {
-            let mut corrupted_streams = HashSet::<u32>::new();
+            let mut tracker = ScreenStreamTracker::default();
             let mut last_idr_requests = HashMap::new();
             let mut received_frames = 0_u64;
+            let mut channel_losses = 0_u64;
             ctx.screen_video_queue.lock().clear();
 
             while is_streaming(&ctx) {
@@ -426,13 +466,23 @@ fn connection_pipeline(
                 }
                 received_frames += 1;
 
-                if header.is_keyframe {
-                    corrupted_streams.remove(&stream_id);
-                } else if data.had_packet_loss() {
-                    corrupted_streams.insert(stream_id);
-                    warn!("Screen video: network dropped a packet of stream {stream_id}");
+                // The channel's packet loss is not attributed here: the lost packet may belong to
+                // any stream, whose next frame then shows the gap in its frame indices
+                if data.had_packet_loss() {
+                    channel_losses += 1;
+                    if channel_losses.is_power_of_two() {
+                        info!("Screen video: {channel_losses} network loss(es) on the channel");
+                    }
                 }
-                if corrupted_streams.contains(&stream_id) {
+                let (accepted, newly_corrupted) = tracker.accept(&header);
+                if newly_corrupted {
+                    warn!(
+                        "Screen video: stream {stream_id} lost frames before frame {}, waiting for \
+                         a keyframe",
+                        header.frame_index
+                    );
+                }
+                if !accepted {
                     request_screen_idr(&ctx, &mut last_idr_requests, stream_id);
                     continue;
                 }
@@ -440,12 +490,21 @@ fn connection_pipeline(
                 let mut queue = ctx.screen_video_queue.lock();
                 queue.push_back((header, payload.to_vec()));
                 if queue.len() > MAX_QUEUED_SCREEN_VIDEO_FRAMES {
-                    // The render thread is not consuming: start over at a keyframe
-                    queue.clear();
+                    // The render thread is not consuming: every stream with dropped frames starts
+                    // over at a keyframe
+                    let dropped_streams = queue
+                        .drain(..)
+                        .map(|(header, _)| header.stream_id)
+                        .collect::<HashSet<_>>();
                     drop(queue);
-                    corrupted_streams.insert(stream_id);
-                    request_screen_idr(&ctx, &mut last_idr_requests, stream_id);
-                    warn!("Screen video: queue full, waiting for a keyframe");
+                    for &dropped_stream in &dropped_streams {
+                        tracker.mark_corrupted(dropped_stream);
+                        request_screen_idr(&ctx, &mut last_idr_requests, dropped_stream);
+                    }
+                    warn!(
+                        "Screen video: queue full, waiting for keyframes of streams \
+                         {dropped_streams:?}"
+                    );
                 }
             }
         }
@@ -617,6 +676,21 @@ fn connection_pipeline(
                             .lock()
                             .push_back(ClientCoreEvent::NativeQuads(quads));
                     }
+                    Ok(ServerControlPacket::AnchorRequest(request)) => {
+                        event_queue
+                            .lock()
+                            .push_back(ClientCoreEvent::AnchorRequest(request));
+                    }
+                    Ok(ServerControlPacket::HandCorrection(correction)) => {
+                        event_queue
+                            .lock()
+                            .push_back(ClientCoreEvent::HandCorrection(correction));
+                    }
+                    Ok(ServerControlPacket::HandDisplay(display)) => {
+                        event_queue
+                            .lock()
+                            .push_back(ClientCoreEvent::HandDisplay(display));
+                    }
                     Ok(ServerControlPacket::StartStream) => {
                         error!("Unexpected StartStream paceket");
                     }
@@ -711,4 +785,44 @@ fn connection_pipeline(
     dbg_connection!("connection_pipeline: End");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alvr_packets::ScreenVideoCodec;
+
+    fn frame(stream_id: u32, frame_index: u64, is_keyframe: bool) -> ScreenVideoPacketHeader {
+        ScreenVideoPacketHeader {
+            stream_id,
+            codec: ScreenVideoCodec::H264,
+            width: 1280,
+            height: 800,
+            frame_index,
+            is_keyframe,
+        }
+    }
+
+    #[test]
+    fn screen_stream_loss_is_tracked_per_stream() {
+        let mut tracker = ScreenStreamTracker::default();
+        assert_eq!(tracker.accept(&frame(1, 10, true)), (true, false));
+        assert_eq!(tracker.accept(&frame(2, 5, true)), (true, false));
+        // Interleaved streams without gaps
+        assert_eq!(tracker.accept(&frame(1, 11, false)), (true, false));
+        assert_eq!(tracker.accept(&frame(2, 6, false)), (true, false));
+        // Frame 12 of stream 1 lost: only stream 1 waits for a keyframe
+        assert_eq!(tracker.accept(&frame(1, 13, false)), (false, true));
+        assert_eq!(tracker.accept(&frame(2, 7, false)), (true, false));
+        assert_eq!(tracker.accept(&frame(1, 14, false)), (false, false));
+        // The server may resume at a keyframe after a gap
+        assert_eq!(tracker.accept(&frame(1, 20, true)), (true, false));
+        assert_eq!(tracker.accept(&frame(1, 21, false)), (true, false));
+        // A stream whose first frame (its keyframe) was lost
+        assert_eq!(tracker.accept(&frame(3, 2, false)), (false, true));
+        // Queue overflow
+        tracker.mark_corrupted(2);
+        assert_eq!(tracker.accept(&frame(2, 8, false)), (false, false));
+        assert_eq!(tracker.accept(&frame(2, 9, true)), (true, false));
+    }
 }

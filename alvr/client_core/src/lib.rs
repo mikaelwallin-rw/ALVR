@@ -25,8 +25,9 @@ use alvr_common::{
     warn,
 };
 use alvr_packets::{
-    BatteryInfo, ButtonEntry, CameraFrame, CameraFramesConfig, ClientControlPacket, NativeQuad,
-    OpaqueRegion, RealTimeConfig, ScreenVideoPacketHeader, StreamConfig, TrackingData,
+    AnchorRequest, BatteryInfo, ButtonEntry, CameraFrame, CameraFramesConfig, ClientControlPacket,
+    HandCorrection, HandDisplay, HandShapeInfo, NativeQuad, OpaqueRegion, RealTimeConfig,
+    ScreenVideoPacketHeader, StageInfo, StreamConfig, TrackingData,
 };
 use alvr_session::CodecType;
 use alvr_system_info::Platform;
@@ -61,6 +62,12 @@ pub enum ClientCoreEvent {
     CameraFrames(Option<CameraFramesConfig>),
     // Debug reference quads to draw as native layers (empty = none)
     NativeQuads(Vec<NativeQuad>),
+    // Overlay app's persistent anchor command
+    AnchorRequest(AnchorRequest),
+    // Overlay app's automatic hand correction
+    HandCorrection(HandCorrection),
+    // Overlay app's hand display transform
+    HandDisplay(HandDisplay),
 }
 
 // Note: this struct may change without breaking network protocol changes
@@ -305,6 +312,18 @@ impl ClientCoreContext {
             sender
                 .send(&ClientControlPacket::RequestScreenIdr { stream_id })
                 .ok();
+        }
+    }
+
+    pub fn send_hand_shape(&self, info: HandShapeInfo) {
+        if let Some(sender) = &mut *self.connection_context.control_sender.lock() {
+            sender.send(&ClientControlPacket::HandShape(info)).ok();
+        }
+    }
+
+    pub fn send_stage_info(&self, info: StageInfo) {
+        if let Some(sender) = &mut *self.connection_context.control_sender.lock() {
+            sender.send(&ClientControlPacket::StageInfo(info)).ok();
         }
     }
 

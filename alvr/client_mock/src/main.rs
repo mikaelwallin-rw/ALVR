@@ -264,7 +264,10 @@ fn client_thread(
                 ClientCoreEvent::Haptics { .. }
                 | ClientCoreEvent::RealTimeConfig(_)
                 | ClientCoreEvent::CameraFrames(_)
-                | ClientCoreEvent::NativeQuads(_) => (),
+                | ClientCoreEvent::NativeQuads(_)
+                | ClientCoreEvent::AnchorRequest(_)
+                | ClientCoreEvent::HandCorrection(_)
+                | ClientCoreEvent::HandDisplay(_) => (),
             }
 
             output_sender.send(window_output.clone()).ok();
