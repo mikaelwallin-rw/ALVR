@@ -1,0 +1,240 @@
+// Head tracking continuity, client -> server, carried in ClientControlPacket::ReservedBuffer so
+// that peers of different builds stay compatible: a server that does not know a payload ignores
+// the whole ReservedBuffer (as upstream and every earlier fork server do), and a server that gets
+// no report publishes "unknown". Payloads are tagged (4 bytes) and versioned (u16), little-endian;
+// a decoder accepts its version or newer (fields are only ever appended) and ignores trailing
+// bytes.
+
+use alvr_common::{
+    Pose,
+    glam::{Quat, Vec3},
+};
+
+pub const TRACKING_STATE_TAG: [u8; 4] = *b"SVTS";
+pub const CAMERA_STAMP_TAG: [u8; 4] = *b"SVCS";
+const TRACKING_STATE_VERSION: u16 = 1;
+const CAMERA_STAMP_VERSION: u16 = 1;
+
+/// Head tracking flags (TrackingStateReport::flags, CameraTrackingStamp::flags)
+pub const HEAD_POSITION_TRACKED: u32 = 1 << 0;
+pub const HEAD_ORIENTATION_TRACKED: u32 = 1 << 1;
+/// Position tracked continuously for >= 2 s, no re-anchor jump and no reference space change in
+/// the last 2 s, and the runtime's tracking-ready vendor event (if it sends one) confirmed
+pub const HEAD_SETTLED: u32 = 1 << 2;
+/// CameraTrackingStamp only: the client had a tracking sample close to the capture time
+pub const HEAD_STAMP_KNOWN: u32 = 1 << 3;
+
+/// Why the client's tracking epoch last changed (values shared with ScreenVR's
+/// VrTrackingEpochReason)
+pub mod epoch_reason {
+    pub const UNKNOWN: u32 = 0;
+    pub const CLIENT_START: u32 = 1;
+    pub const TRACKING_LOST: u32 = 2;
+    pub const TRACKING_REGAINED: u32 = 3;
+    pub const REANCHOR_JUMP: u32 = 4;
+    pub const STAGE_CHANGED: u32 = 5;
+    pub const CONTINUITY_UNKNOWN: u32 = 6;
+    pub const SESSION_RESTART: u32 = 7;
+}
+
+/// The client's head tracking continuity. Poses measured in STAGE stay valid only while
+/// (client_instance, client_epoch) is unchanged.
+#[derive(Clone, Copy, Debug)]
+pub struct TrackingStateReport {
+    /// Random per client process (never persisted: a restarted process cannot prove continuity)
+    pub client_instance: u64,
+    /// Starts at 1 per client process, incremented at every event that may have moved STAGE
+    pub client_epoch: u32,
+    /// epoch_reason::*
+    pub epoch_reason: u32,
+    /// HEAD_* bits (without HEAD_STAMP_KNOWN)
+    pub flags: u32,
+    /// Time since the client's epoch changed, milliseconds (saturating)
+    pub epoch_age_ms: u32,
+    /// Pure floor-height changes of STAGE carried over without an epoch change
+    pub stage_change_counter: u32,
+    /// The latest such change: p_stage_new = stage_from_previous * p_stage_previous
+    pub stage_from_previous: Pose,
+}
+
+impl PartialEq for TrackingStateReport {
+    fn eq(&self, other: &Self) -> bool {
+        self.client_instance == other.client_instance
+            && self.client_epoch == other.client_epoch
+            && self.epoch_reason == other.epoch_reason
+            && self.flags == other.flags
+            && self.epoch_age_ms == other.epoch_age_ms
+            && self.stage_change_counter == other.stage_change_counter
+            && self.stage_from_previous.position == other.stage_from_previous.position
+            && self.stage_from_previous.orientation == other.stage_from_previous.orientation
+    }
+}
+
+/// Tracking state at a camera frame's capture time (sent just before the CameraFrame packet)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CameraTrackingStamp {
+    /// Same value as CameraFrame::capture_time (XrTime, nanoseconds)
+    pub capture_ns: u64,
+    pub client_instance: u64,
+    pub client_epoch: u32,
+    /// HEAD_* bits at capture time; HEAD_STAMP_KNOWN clear = no sample close to it
+    pub flags: u32,
+}
+
+struct Writer(Vec<u8>);
+
+impl Writer {
+    fn new(tag: [u8; 4], version: u16) -> Self {
+        let mut bytes = tag.to_vec();
+        bytes.extend_from_slice(&version.to_le_bytes());
+        Self(bytes)
+    }
+    fn u32(&mut self, v: u32) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn u64(&mut self, v: u64) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn f32(&mut self, v: f32) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn pose(&mut self, pose: &Pose) {
+        let q = pose.orientation;
+        let p = pose.position;
+        for v in [q.x, q.y, q.z, q.w, p.x, p.y, p.z] {
+            self.f32(v);
+        }
+    }
+}
+
+struct Reader<'a>(&'a [u8]);
+
+impl Reader<'_> {
+    fn take<const N: usize>(&mut self) -> Option<[u8; N]> {
+        let (head, rest) = self.0.split_first_chunk::<N>()?;
+        self.0 = rest;
+        Some(*head)
+    }
+    fn u16(&mut self) -> Option<u16> {
+        self.take().map(u16::from_le_bytes)
+    }
+    fn u32(&mut self) -> Option<u32> {
+        self.take().map(u32::from_le_bytes)
+    }
+    fn u64(&mut self) -> Option<u64> {
+        self.take().map(u64::from_le_bytes)
+    }
+    fn f32(&mut self) -> Option<f32> {
+        self.take().map(f32::from_le_bytes)
+    }
+    fn pose(&mut self) -> Option<Pose> {
+        let mut v = [0.0; 7];
+        for value in &mut v {
+            *value = self.f32()?;
+        }
+        let orientation = Quat::from_xyzw(v[0], v[1], v[2], v[3]);
+        let position = Vec3::new(v[4], v[5], v[6]);
+        (orientation.is_finite() && position.is_finite() && orientation.length() > 0.5).then(
+            || Pose {
+                orientation: orientation.normalize(),
+                position,
+            },
+        )
+    }
+}
+
+// The payload after a matching tag and a supported version
+fn open(bytes: &[u8], tag: [u8; 4], version: u16) -> Option<Reader<'_>> {
+    let mut reader = Reader(bytes);
+    (reader.take::<4>()? == tag && reader.u16()? >= version).then_some(reader)
+}
+
+impl TrackingStateReport {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new(TRACKING_STATE_TAG, TRACKING_STATE_VERSION);
+        w.u64(self.client_instance);
+        w.u32(self.client_epoch);
+        w.u32(self.epoch_reason);
+        w.u32(self.flags);
+        w.u32(self.epoch_age_ms);
+        w.u32(self.stage_change_counter);
+        w.pose(&self.stage_from_previous);
+        w.0
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut r = open(bytes, TRACKING_STATE_TAG, TRACKING_STATE_VERSION)?;
+        Some(Self {
+            client_instance: r.u64()?,
+            client_epoch: r.u32()?,
+            epoch_reason: r.u32()?,
+            flags: r.u32()?,
+            epoch_age_ms: r.u32()?,
+            stage_change_counter: r.u32()?,
+            stage_from_previous: r.pose()?,
+        })
+    }
+}
+
+impl CameraTrackingStamp {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new(CAMERA_STAMP_TAG, CAMERA_STAMP_VERSION);
+        w.u64(self.capture_ns);
+        w.u64(self.client_instance);
+        w.u32(self.client_epoch);
+        w.u32(self.flags);
+        w.0
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut r = open(bytes, CAMERA_STAMP_TAG, CAMERA_STAMP_VERSION)?;
+        Some(Self {
+            capture_ns: r.u64()?,
+            client_instance: r.u64()?,
+            client_epoch: r.u32()?,
+            flags: r.u32()?,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trips_and_rejects_foreign_payloads() {
+        let report = TrackingStateReport {
+            client_instance: 0x0123_4567_89ab_cdef,
+            client_epoch: 7,
+            epoch_reason: epoch_reason::TRACKING_REGAINED,
+            flags: HEAD_POSITION_TRACKED | HEAD_SETTLED,
+            epoch_age_ms: 1234,
+            stage_change_counter: 2,
+            stage_from_previous: Pose {
+                orientation: Quat::IDENTITY,
+                position: Vec3::new(0.0, 0.3686, 0.0),
+            },
+        };
+        let bytes = report.encode();
+        assert_eq!(TrackingStateReport::decode(&bytes), Some(report));
+        // Trailing bytes of a newer version are ignored
+        let mut longer = bytes.clone();
+        longer.extend_from_slice(&[1, 2, 3, 4]);
+        assert_eq!(TrackingStateReport::decode(&longer), Some(report));
+        // Truncated, other tag, older version
+        assert_eq!(TrackingStateReport::decode(&bytes[..bytes.len() - 1]), None);
+        assert_eq!(CameraTrackingStamp::decode(&bytes), None);
+        let mut old = bytes.clone();
+        old[4] = 0;
+        assert_eq!(TrackingStateReport::decode(&old), None);
+
+        let stamp = CameraTrackingStamp {
+            capture_ns: 495_492_938_843_390,
+            client_instance: 42,
+            client_epoch: 3,
+            flags: HEAD_STAMP_KNOWN | HEAD_POSITION_TRACKED,
+        };
+        assert_eq!(CameraTrackingStamp::decode(&stamp.encode()), Some(stamp));
+        assert_eq!(TrackingStateReport::decode(&stamp.encode()), None);
+    }
+}

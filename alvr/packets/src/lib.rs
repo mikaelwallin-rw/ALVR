@@ -17,6 +17,9 @@ use std::{
     time::Duration,
 };
 
+mod tracking_state;
+pub use tracking_state::*;
+
 pub const TRACKING: u16 = 0;
 pub const HAPTICS: u16 = 1;
 pub const AUDIO: u16 = 2;

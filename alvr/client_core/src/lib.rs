@@ -321,6 +321,13 @@ impl ClientCoreContext {
         }
     }
 
+    /// Tagged payloads (e.g. alvr_packets::TrackingStateReport) that any server can ignore
+    pub fn send_reserved_buffer(&self, bytes: Vec<u8>) {
+        if let Some(sender) = &mut *self.connection_context.control_sender.lock() {
+            sender.send(&ClientControlPacket::ReservedBuffer(bytes)).ok();
+        }
+    }
+
     pub fn send_stage_info(&self, info: StageInfo) {
         if let Some(sender) = &mut *self.connection_context.control_sender.lock() {
             sender.send(&ClientControlPacket::StageInfo(info)).ok();
