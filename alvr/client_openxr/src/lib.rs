@@ -16,6 +16,8 @@ mod ref_markers;
 mod screen_video;
 mod stage_identity;
 mod stream;
+mod tracking_diag;
+mod tracking_state;
 
 use crate::stream::ParsedStreamConfig;
 use alvr_client_core::{ClientCapabilities, ClientCoreContext, ClientCoreEvent};
@@ -288,8 +290,14 @@ pub fn entry_point() {
     // terminated, so the names above never match and stay disabled. The SecureMR names are
     // nul terminated so that they do get enabled.
     .chain(
-        [SECURE_MR_EXTENSION_NAME, READBACK_TENSOR_EXTENSION_NAME]
-            .into_iter()
+        // XR_PICO_virtual_boundary: read-only polling by the tracking diagnostics
+        // (tracking_diag.rs); dropped by intersection() when the runtime does not offer it
+        [
+            SECURE_MR_EXTENSION_NAME,
+            READBACK_TENSOR_EXTENSION_NAME,
+            tracking_diag::VIRTUAL_BOUNDARY_EXTENSION_NAME,
+        ]
+        .into_iter()
             .map(|s| format!("{s}\0").into_bytes()),
     )
     .chain(
@@ -346,6 +354,9 @@ pub fn entry_point() {
                 .to_owned()
         })
         .collect::<Vec<_>>();
+    let virtual_boundary_enabled = other_exts
+        .iter()
+        .any(|name| name == tracking_diag::VIRTUAL_BOUNDARY_EXTENSION_NAME);
 
     let platform = alvr_system_info::platform(
         xr_instance
@@ -508,11 +519,17 @@ pub fn entry_point() {
         let mut last_hand_shape_sent = None::<(String, Instant)>;
         let mut ref_markers = ref_markers::RefMarkers::new(&graphics_context);
         let mut stage_identity = stage_identity::StageIdentity::new(&xr_session);
+        // TRACKING DIAGNOSTICS (log only, screenvr_tracking_diag.log). Declared after xr_session:
+        // dropped (sampler joined) before the session
+        let tracking_diag = tracking_diag::TrackingDiag::new(&xr_session, virtual_boundary_enabled);
 
-        let mut event_storage = xr::EventDataBuffer::new();
+        let mut event_storage = std::mem::MaybeUninit::<xr::sys::EventDataBuffer>::uninit();
         let mut headset_is_worn = true;
         'render_loop: loop {
-            while let Some(event) = xr_instance.poll_event(&mut event_storage).unwrap() {
+            // Same as xr_instance.poll_event(), plus a diagnostic line per event (also unknown types)
+            while let Some(event) =
+                tracking_diag::poll_event(&xr_instance, &mut event_storage).unwrap()
+            {
                 match event {
                     xr::Event::EventsLost(event) => {
                         error!("OpenXR: lost {} events!", event.lost_event_count());
@@ -529,9 +546,11 @@ pub fn entry_point() {
                             passthrough_layer = PassthroughLayer::new(&xr_session, platform).ok();
 
                             session_running = true;
+                            tracking_diag.set_running(true);
                         }
                         xr::SessionState::STOPPING => {
                             session_running = false;
+                            tracking_diag.set_running(false);
 
                             passthrough_layer = None;
 
@@ -605,6 +624,7 @@ pub fn entry_point() {
                         lobby.update_hud_message(&message);
                     }
                     ClientCoreEvent::StreamingStarted(config) => {
+                        tracking_diag::mark("stream started");
                         let config = ParsedStreamConfig::new(&config);
 
                         let context = StreamContext::new(
@@ -646,6 +666,7 @@ pub fn entry_point() {
                         core_context.send_proximity_state(headset_is_worn);
                     }
                     ClientCoreEvent::StreamingStopped => {
+                        tracking_diag::mark("stream stopped");
                         if passthrough_layer.is_none() {
                             passthrough_layer = PassthroughLayer::new(&xr_session, platform).ok();
                         }
@@ -762,6 +783,7 @@ pub fn entry_point() {
                     panic!();
                 }
             };
+            tracking_diag.set_frame_time(frame_state.predicted_display_time);
             let frame_interval =
                 Duration::from_nanos(frame_state.predicted_display_period.as_nanos() as _);
             let vsync_time =
@@ -788,6 +810,9 @@ pub fn entry_point() {
             let hands_selected = stream_context.as_ref().map(StreamContext::hands_selected);
             if let Some(space) = &native_quads_space {
                 stage_identity.update(&core_context, space, frame_state.predicted_display_time);
+                tracking_diag.set_anchor(stage_identity.anchor_state());
+                // Head tracking continuity for the overlay app (ReservedBuffer, never blocks)
+                tracking_state::send_report(&core_context);
             }
             if stream_context.is_some() {
                 screen_video.update(

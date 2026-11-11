@@ -422,6 +422,8 @@ fn capture_loop(
         let send_start = Instant::now();
         match frame {
             Ok(frame) if started.elapsed() > WARMUP => {
+                // Tracking state at the capture time, right before the frame it describes
+                crate::tracking_state::send_camera_stamp(core_context, frame.capture_time);
                 core_context.send_camera_frame(frame);
                 sent_count += 1;
                 if sent_count == 1 {

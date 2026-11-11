@@ -331,6 +331,13 @@ impl StageIdentity {
         }
     }
 
+    /// Anchor state and STAGE pose, for the tracking diagnostics (no allocation)
+    pub fn anchor_state(&self) -> Option<(u32, Option<Pose>)> {
+        self.anchor
+            .as_ref()
+            .map(|anchor| (anchor.status.state, anchor.status.pose))
+    }
+
     pub fn info(&self) -> StageInfo {
         let status = self.anchor.as_ref().map(|anchor| anchor.status.clone());
         StageInfo {
