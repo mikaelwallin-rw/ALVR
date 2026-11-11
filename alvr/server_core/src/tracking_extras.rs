@@ -52,11 +52,151 @@ pub(crate) fn to_matrix(pose: Pose) -> [[f32; 4]; 3] {
 pub use windows_impl::{
     TRACKING_EXTRAS_WRITER, anchor_request, bump_stage_epoch, camera_frames_request,
     hand_correction, hand_display, recenter_counter, report_hand_shape, report_stage_info,
-    report_tracking, stage_epoch,
+    report_tracking, report_tracking_state, stage_epoch, tracking_epoch_for,
 };
 
 /// Joints of a hand skeleton (XR_EXT_hand_tracking order, 26), driver space
 pub type HandJoints = [Pose; 26];
+
+// ---------------------------------------------------------------------------------------------
+// Version 5: head tracking continuity (client tracking_state.rs; contract VrTrackingExtras.h v5)
+
+/// headTrackingFlags bit 3: a client report arrived within TRACKING_REPORT_STALE_MS (client
+/// connected and its session running). Bits 0-2 (position tracked, orientation tracked, settled)
+/// are published only while this bit is set.
+pub const HEAD_TRACKING_LIVE: u32 = 1 << 3;
+pub const TRACKING_REPORT_STALE_MS: u64 = 1000;
+const EPOCH_HISTORY: usize = 16;
+
+/// Server-run tracking epoch, derived from the client's (instance, epoch) reports. 0 = unknown (no
+/// report from a client that sends them since the server started).
+pub struct ServerTrackingEpoch {
+    pub epoch: u32,
+    pub reason: u32,
+    /// Server clock (ms) when the epoch changed, back-dated by the client's epoch age
+    pub changed_ms: u64,
+    pub report: Option<alvr_packets::TrackingStateReport>,
+    pub report_ms: u64,
+    pub stage_change_counter: u32,
+    pub stage_change_epoch: u32,
+    pub stage_from_previous: Option<Pose>,
+    // (client instance, client epoch) -> server epoch, most recent last
+    history: std::collections::VecDeque<((u64, u32), u32)>,
+}
+
+impl Default for ServerTrackingEpoch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ServerTrackingEpoch {
+    pub const fn new() -> Self {
+        Self {
+            epoch: 0,
+            reason: 0,
+            changed_ms: 0,
+            report: None,
+            report_ms: 0,
+            stage_change_counter: 0,
+            stage_change_epoch: 0,
+            stage_from_previous: None,
+            history: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Returns a log line when the epoch or the stage change counter changed
+    pub fn on_report(
+        &mut self,
+        report: alvr_packets::TrackingStateReport,
+        now_ms: u64,
+    ) -> Option<String> {
+        use alvr_packets::epoch_reason;
+
+        let previous = self.report;
+        let new_epoch = match previous {
+            None => Some(epoch_reason::CLIENT_START),
+            Some(last) if last.client_instance != report.client_instance => {
+                Some(epoch_reason::CLIENT_START)
+            }
+            Some(last) if last.client_epoch != report.client_epoch => Some(report.epoch_reason),
+            Some(_) => None,
+        };
+        let mut line = None;
+        if let Some(reason) = new_epoch {
+            self.epoch = self.epoch.wrapping_add(1).max(1);
+            self.reason = reason;
+            self.changed_ms = now_ms.saturating_sub(u64::from(report.epoch_age_ms));
+            self.history
+                .push_back(((report.client_instance, report.client_epoch), self.epoch));
+            if self.history.len() > EPOCH_HISTORY {
+                self.history.pop_front();
+            }
+            line = Some(format!(
+                "tracking epoch {} (reason {reason}, client {:016x} epoch {} reason {}, {} ms ago)",
+                self.epoch,
+                report.client_instance,
+                report.client_epoch,
+                report.epoch_reason,
+                report.epoch_age_ms
+            ));
+        }
+        if let Some(last) = previous
+            && last.client_instance == report.client_instance
+            && last.stage_change_counter != report.stage_change_counter
+        {
+            self.stage_change_counter = self.stage_change_counter.wrapping_add(1);
+            self.stage_change_epoch = self.epoch;
+            self.stage_from_previous = Some(report.stage_from_previous);
+            line = Some(format!(
+                "{}STAGE floor-height change {} in tracking epoch {}: {:?}",
+                line.map_or(String::new(), |l| format!("{l}; ")),
+                self.stage_change_counter,
+                self.epoch,
+                report.stage_from_previous.position
+            ));
+        }
+        self.report = Some(report);
+        self.report_ms = now_ms;
+        line
+    }
+
+    /// Server epoch of a client epoch seen recently, 0 = unknown
+    pub fn epoch_for(&self, client_instance: u64, client_epoch: u32) -> u32 {
+        self.history
+            .iter()
+            .rev()
+            .find(|(key, _)| *key == (client_instance, client_epoch))
+            .map_or(0, |(_, epoch)| *epoch)
+    }
+
+    /// headTrackingFlags: the client's bits while live, else 0
+    pub fn flags(&self, now_ms: u64) -> u32 {
+        match self.report {
+            Some(report) if now_ms.saturating_sub(self.report_ms) <= TRACKING_REPORT_STALE_MS => {
+                (report.flags & 0b111) | HEAD_TRACKING_LIVE
+            }
+            _ => 0,
+        }
+    }
+}
+
+/// ClientControlPacket::ReservedBuffer: tagged payloads of newer clients (unknown ones ignored)
+pub fn report_reserved_buffer(bytes: &[u8]) {
+    if let Some(report) = alvr_packets::TrackingStateReport::decode(bytes) {
+        report_tracking_state(report);
+    } else if let Some(stamp) = alvr_packets::CameraTrackingStamp::decode(bytes) {
+        crate::camera_frames::report_stamp(stamp);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn report_tracking_state(_report: alvr_packets::TrackingStateReport) {}
+
+#[cfg(not(windows))]
+pub fn tracking_epoch_for(_client_instance: u64, _client_epoch: u32) -> u32 {
+    0
+}
 
 #[cfg(not(windows))]
 pub fn report_stage_info(_info: StageInfo) {}
@@ -151,7 +291,7 @@ impl Drop for TrackingExtrasHeartbeat {
 
 #[cfg(windows)]
 mod windows_impl {
-    use super::{HandJoints, to_matrix};
+    use super::{HandJoints, ServerTrackingEpoch, to_matrix};
     use alvr_common::{
         Pose,
         glam::{Mat3, Quat, Vec3},
@@ -184,8 +324,10 @@ mod windows_impl {
     const EXTRAS_MAGIC: u32 = 0x584B_5254; // 'TRKX' little-endian
     const REQUEST_MAGIC: u32 = 0x514B_5254; // 'TRKQ' little-endian
     // Version 2 appends stage_epoch, version 3 the stage identity, the anchor and the product
-    // name: older readers only read the first 2256 / 2264 bytes
-    const VERSION: u32 = 3;
+    // name, version 4 the tracked hands: older readers only read the first 2256 / 2264 / 2456 bytes
+    // Version 5: head tracking continuity (tracking epoch, head tracking flags, floor-height
+    // STAGE changes); older readers only read the first 3304 bytes
+    const VERSION: u32 = 5;
     // Oldest request block accepted; version 2 appends the anchor request
     const REQUEST_VERSION: u32 = 1;
     const REQUEST_VERSION_ANCHOR: u32 = 2;
@@ -270,6 +412,17 @@ mod windows_impl {
         product_name: [u8; PRODUCT_NAME_BYTES],
         // Version 4
         hands: [RawHand; 2],
+        // Version 5
+        head_tracking_flags: u32,
+        tracking_epoch: u32,
+        tracking_epoch_time_ms: u64,
+        client_instance_id: u64,
+        client_tracking_epoch: u32,
+        tracking_epoch_reason: u32,
+        stage_change_counter: u32,
+        stage_change_epoch: u32,
+        stage_change_from_previous: [[f32; 4]; 3],
+        tracking_report_ms: u64,
     }
 
     #[repr(C, packed(4))]
@@ -339,11 +492,14 @@ mod windows_impl {
     const _: () = assert!(mem::size_of::<RawMarker>() == 64);
     const _: () = assert!(
         mem::size_of::<RawExtrasBlock>()
-            == 24 + 48 + 2 * 64 + 8 + 64 * MAX_MARKERS + 8 + 192 + 2 * 424
+            == 24 + 48 + 2 * 64 + 8 + 64 * MAX_MARKERS + 8 + 192 + 2 * 424 + 96
     );
     const _: () = assert!(mem::size_of::<RawHand>() == 424);
     const _: () = assert!(mem::offset_of!(RawExtrasBlock, hands) == 2456);
-    const _: () = assert!(mem::size_of::<RawExtrasBlock>() == 3304);
+    const _: () = assert!(mem::offset_of!(RawExtrasBlock, head_tracking_flags) == 3304);
+    const _: () = assert!(mem::offset_of!(RawExtrasBlock, stage_change_from_previous) == 3344);
+    const _: () = assert!(mem::offset_of!(RawExtrasBlock, tracking_report_ms) == 3392);
+    const _: () = assert!(mem::size_of::<RawExtrasBlock>() == 3400);
     const _: () = assert!(mem::offset_of!(RawExtrasBlock, stage_identity) == 2264);
     const _: () = assert!(mem::offset_of!(RawRequestBlock, anchor_request) == 32);
     const _: () = assert!(mem::offset_of!(RawRequestBlock, hand_finger_scale) == 88);
@@ -412,6 +568,23 @@ mod windows_impl {
         TRACKING_EXTRAS_WRITER
             .lock()
             .report_tracking(driver_from_stage, fingertips, hands);
+    }
+
+    // The client's head tracking continuity report (every 250 ms and on change while streaming)
+    pub fn report_tracking_state(report: alvr_packets::TrackingStateReport) {
+        let mut writer = TRACKING_EXTRAS_WRITER.lock();
+        if let Some(line) = writer.tracking.on_report(report, now_ms()) {
+            info!("Tracking extras: {line}");
+        }
+        writer.publish();
+    }
+
+    // Server tracking epoch of a recent (client instance, client epoch), 0 = unknown
+    pub fn tracking_epoch_for(client_instance: u64, client_epoch: u32) -> u32 {
+        TRACKING_EXTRAS_WRITER
+            .lock()
+            .tracking
+            .epoch_for(client_instance, client_epoch)
     }
 
     // What the client applies when drawing the hands
@@ -526,6 +699,7 @@ mod windows_impl {
         hand_shape: Option<HandShapeInfo>,
         hand_correction: Option<HandCorrection>,
         hand_display: Option<HandDisplay>,
+        tracking: ServerTrackingEpoch,
     }
 
     impl TrackingExtrasWriter {
@@ -554,6 +728,7 @@ mod windows_impl {
                 hand_shape: None,
                 hand_correction: None,
                 hand_display: None,
+                tracking: ServerTrackingEpoch::new(),
             }
         }
 
@@ -806,6 +981,18 @@ mod windows_impl {
                 reserved_v3: 0,
                 product_name: [0; PRODUCT_NAME_BYTES],
                 hands: [RawHand::default(); 2],
+                head_tracking_flags: self.tracking.flags(now),
+                tracking_epoch: self.tracking.epoch,
+                tracking_epoch_time_ms: self.tracking.changed_ms,
+                client_instance_id: self.tracking.report.map_or(0, |r| r.client_instance),
+                client_tracking_epoch: self.tracking.report.map_or(0, |r| r.client_epoch),
+                tracking_epoch_reason: self.tracking.reason,
+                stage_change_counter: self.tracking.stage_change_counter,
+                stage_change_epoch: self.tracking.stage_change_epoch,
+                stage_change_from_previous: to_matrix(
+                    self.tracking.stage_from_previous.unwrap_or(Pose::IDENTITY),
+                ),
+                tracking_report_ms: self.tracking.report_ms,
             };
             let shape = self.hand_shape;
             let hands = std::array::from_fn(|idx| {
@@ -1025,5 +1212,66 @@ mod windows_impl {
             assert!(same_bits(Pose::IDENTITY, Pose::IDENTITY));
             assert!(!same_bits(Pose::IDENTITY, moved));
         }
+    }
+}
+
+
+#[cfg(test)]
+mod epoch_tests {
+    use super::{HEAD_TRACKING_LIVE, ServerTrackingEpoch, TRACKING_REPORT_STALE_MS};
+    use alvr_common::{
+        Pose,
+        glam::{Quat, Vec3},
+    };
+    use alvr_packets::{HEAD_POSITION_TRACKED, HEAD_SETTLED, TrackingStateReport, epoch_reason};
+
+    fn report(instance: u64, epoch: u32, reason: u32, stage_changes: u32) -> TrackingStateReport {
+        TrackingStateReport {
+            client_instance: instance,
+            client_epoch: epoch,
+            epoch_reason: reason,
+            flags: HEAD_POSITION_TRACKED | HEAD_SETTLED,
+            epoch_age_ms: 100,
+            stage_change_counter: stage_changes,
+            stage_from_previous: Pose {
+                orientation: Quat::IDENTITY,
+                position: Vec3::new(0.0, -0.3686, 0.0),
+            },
+        }
+    }
+
+    #[test]
+    fn epoch_follows_client_instance_and_epoch() {
+        let mut server = ServerTrackingEpoch::new();
+        assert_eq!(server.epoch, 0, "unknown until a report");
+        assert_eq!(server.flags(0), 0);
+
+        assert!(server.on_report(report(7, 3, epoch_reason::TRACKING_REGAINED, 0), 1000).is_some());
+        assert_eq!(server.epoch, 1);
+        assert_eq!(server.reason, epoch_reason::CLIENT_START);
+        assert_eq!(server.changed_ms, 900);
+        // Same client epoch (reconnect of the same process with continuous tracking): no change
+        assert!(server.on_report(report(7, 3, epoch_reason::TRACKING_REGAINED, 0), 5000).is_none());
+        assert_eq!(server.epoch, 1);
+        // Client epoch changed
+        server.on_report(report(7, 4, epoch_reason::TRACKING_LOST, 0), 6000);
+        assert_eq!((server.epoch, server.reason), (2, epoch_reason::TRACKING_LOST));
+        // New client process
+        server.on_report(report(8, 1, epoch_reason::CLIENT_START, 0), 7000);
+        assert_eq!((server.epoch, server.reason), (3, epoch_reason::CLIENT_START));
+        // Pure floor change: counter, no epoch change
+        server.on_report(report(8, 1, epoch_reason::CLIENT_START, 1), 7100);
+        assert_eq!(server.epoch, 3);
+        assert_eq!((server.stage_change_counter, server.stage_change_epoch), (1, 3));
+        // History for camera stamps
+        assert_eq!(server.epoch_for(7, 3), 1);
+        assert_eq!(server.epoch_for(7, 4), 2);
+        assert_eq!(server.epoch_for(9, 1), 0);
+        // Live flags only while reports are fresh
+        assert_eq!(
+            server.flags(7100),
+            HEAD_POSITION_TRACKED | HEAD_SETTLED | HEAD_TRACKING_LIVE
+        );
+        assert_eq!(server.flags(7100 + TRACKING_REPORT_STALE_MS + 1), 0);
     }
 }

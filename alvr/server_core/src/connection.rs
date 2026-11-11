@@ -1633,7 +1633,12 @@ fn connection_pipeline(
                             warn!("Camera frame dropped: {e:?}");
                         }
                     }
-                    ClientControlPacket::Reserved(_) | ClientControlPacket::ReservedBuffer(_) => (),
+                    // Tagged payloads of newer clients (head tracking continuity, camera frame
+                    // tracking stamps); unknown ones are ignored
+                    ClientControlPacket::ReservedBuffer(bytes) => {
+                        tracking_extras::report_reserved_buffer(&bytes);
+                    }
+                    ClientControlPacket::Reserved(_) => (),
                 }
 
                 disconnection_deadline = Instant::now() + KEEPALIVE_TIMEOUT;

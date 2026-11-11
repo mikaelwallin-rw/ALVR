@@ -12,11 +12,40 @@
 //   p_stage = M * p_cam) with OpenCV camera axes. `recenter_counter` pairs it with the
 //   stage -> driver transform of `Local\VRTrackingExtras_v1`.
 
+// - Tracking stamp (2026-11-11, no version change): a 40-byte VrCameraFrameTrackingStamp right
+//   after the pixel area (offset 152 + 2048 * 2048), written under the same seqlock. It holds the
+//   head tracking state at the capture time (from the client's CameraTrackingStamp sent just before
+//   the frame). Readers that map only header + pixels never see it; readers must map the whole
+//   section and accept the stamp only when its magic, frameIndex and captureNs match the header.
+
 use alvr_common::anyhow::Result;
-use alvr_packets::CameraFrame;
+use alvr_packets::{CameraFrame, CameraTrackingStamp};
+use std::collections::VecDeque;
 
 #[cfg(windows)]
 pub use windows_impl::{publish_frame, refresh_heartbeat};
+
+// The client sends a frame's stamp right before the frame; a few are kept in case of reordering
+const STAMPS_KEPT: usize = 8;
+static STAMPS: alvr_common::parking_lot::Mutex<VecDeque<CameraTrackingStamp>> =
+    alvr_common::parking_lot::Mutex::new(VecDeque::new());
+
+/// ClientControlPacket::ReservedBuffer with a CameraTrackingStamp
+pub fn report_stamp(stamp: CameraTrackingStamp) {
+    let mut stamps = STAMPS.lock();
+    stamps.push_back(stamp);
+    while stamps.len() > STAMPS_KEPT {
+        stamps.pop_front();
+    }
+}
+
+// The stamp of the frame captured at `capture_ns`, if the client sent one
+#[cfg_attr(not(windows), allow(dead_code))]
+fn take_stamp(capture_ns: u64) -> Option<CameraTrackingStamp> {
+    let mut stamps = STAMPS.lock();
+    let index = stamps.iter().position(|s| s.capture_ns == capture_ns)?;
+    stamps.remove(index)
+}
 
 #[cfg(not(windows))]
 pub fn publish_frame(_frame: &CameraFrame) -> Result<()> {
@@ -58,8 +87,8 @@ fn decode_gray(frame: &CameraFrame) -> Result<Vec<u8>> {
 
 #[cfg(windows)]
 mod windows_impl {
-    use super::decode_gray;
-    use crate::tracking_extras::{recenter_counter, to_matrix};
+    use super::{decode_gray, take_stamp};
+    use crate::tracking_extras::{recenter_counter, to_matrix, tracking_epoch_for};
     use alvr_common::{anyhow::Result, info, parking_lot::Mutex, warn};
     use alvr_packets::{CameraEye, CameraFrame};
     use std::{
@@ -72,8 +101,9 @@ mod windows_impl {
             Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
             System::{
                 Memory::{
-                    CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
-                    PAGE_READWRITE, UnmapViewOfFile,
+                    CreateFileMappingW, FILE_MAP_WRITE, MEMORY_BASIC_INFORMATION,
+                    MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
+                    VirtualQuery,
                 },
                 SystemInformation::GetTickCount64,
             },
@@ -126,9 +156,34 @@ mod windows_impl {
     const HEADER_SIZE: usize = mem::size_of::<RawHeader>();
     const BLOCK_SIZE: usize = HEADER_SIZE + (MAX_WIDTH * MAX_HEIGHT) as usize;
 
+    // VrCameraFrame.h VrCameraFrameTrackingStamp, at BLOCK_SIZE
+    const STAMP_MAGIC: u32 = 0x5354_4643; // 'CFTS' little-endian
+    // headTrackingFlags bit 3 in the stamp: the client sent a stamp for this frame
+    const STAMP_KNOWN_BIT: u32 = 1 << 3;
+
+    #[repr(C, packed(4))]
+    #[derive(Clone, Copy)]
+    struct RawTrackingStamp {
+        magic: u32,
+        size: u32,
+        frame_index: u32,
+        head_tracking_flags: u32,
+        capture_ns: u64,
+        tracking_epoch: u32,
+        client_tracking_epoch: u32,
+        client_instance_id: u64,
+    }
+
+    const _: () = assert!(mem::size_of::<RawTrackingStamp>() == 40);
+    const STAMP_SIZE: usize = mem::size_of::<RawTrackingStamp>();
+    const SECTION_SIZE: usize = BLOCK_SIZE + STAMP_SIZE;
+
     struct Mapping {
         handle: HANDLE,
         view: MEMORY_MAPPED_VIEW_ADDRESS,
+        // Bytes addressable in the view (a section left by an older writer may be smaller than
+        // SECTION_SIZE; views are page-granular)
+        view_size: usize,
     }
 
     // The mapping is only accessed from behind a Mutex
@@ -207,19 +262,47 @@ mod windows_impl {
                         None,
                         PAGE_READWRITE,
                         0,
-                        BLOCK_SIZE as u32,
+                        SECTION_SIZE as u32,
                         w!("Local\\VRCameraFrame_v1"),
                     )
                 } {
                     Ok(handle) => {
-                        let view =
-                            unsafe { MapViewOfFile(handle, FILE_MAP_WRITE, 0, 0, BLOCK_SIZE) };
-                        if view.Value.is_null() {
-                            warn!("Camera frames: MapViewOfFile failed");
-                            unsafe { CloseHandle(handle).ok() };
+                        // The whole section: one created by an older writer (still held open by
+                        // a reader) is smaller
+                        let view = unsafe { MapViewOfFile(handle, FILE_MAP_WRITE, 0, 0, 0) };
+                        let mut info = MEMORY_BASIC_INFORMATION::default();
+                        let queried = !view.Value.is_null()
+                            && unsafe {
+                                VirtualQuery(
+                                    Some(view.Value),
+                                    &mut info,
+                                    mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                                )
+                            } != 0;
+                        if view.Value.is_null() || !queried || info.RegionSize < BLOCK_SIZE {
+                            warn!("Camera frames: MapViewOfFile failed or section too small");
+                            unsafe {
+                                if !view.Value.is_null() {
+                                    UnmapViewOfFile(view).ok();
+                                }
+                                CloseHandle(handle).ok();
+                            }
                         } else {
-                            info!("Camera frames: shared memory Local\\VRCameraFrame_v1 created");
-                            self.mapping = Some(Mapping { handle, view });
+                            info!(
+                                "Camera frames: shared memory Local\\VRCameraFrame_v1 created \
+                                 ({} bytes mapped, tracking stamp {})",
+                                info.RegionSize,
+                                if info.RegionSize >= SECTION_SIZE {
+                                    "written"
+                                } else {
+                                    "not written (older section)"
+                                }
+                            );
+                            self.mapping = Some(Mapping {
+                                handle,
+                                view,
+                                view_size: info.RegionSize,
+                            });
                         }
                     }
                     Err(e) => warn!("Camera frames: CreateFileMappingW failed: {e}"),
@@ -244,6 +327,14 @@ mod windows_impl {
 
         let pixels = decode_gray(frame)?;
         let recenter_counter = recenter_counter();
+        let capture_ns = frame.capture_time.as_nanos() as u64;
+        // Before the frame writer's lock (tracking_epoch_for locks the extras writer)
+        let stamp = take_stamp(capture_ns).map(|stamp| {
+            (
+                stamp,
+                tracking_epoch_for(stamp.client_instance, stamp.client_epoch),
+            )
+        });
 
         let mut writer = WRITER.lock();
         writer.last_frame = Some(Instant::now());
@@ -284,6 +375,19 @@ mod windows_impl {
             stage_from_camera: to_matrix(frame.stage_from_camera),
         };
 
+        let tracking_stamp = RawTrackingStamp {
+            magic: STAMP_MAGIC,
+            size: STAMP_SIZE as u32,
+            frame_index,
+            // Bits 0-2 as the client sent them; bit 3 = known. No stamp: all 0 (unknown)
+            head_tracking_flags: stamp.map_or(0, |(s, _)| (s.flags & 0b111) | STAMP_KNOWN_BIT),
+            capture_ns,
+            tracking_epoch: stamp.map_or(0, |(_, epoch)| epoch),
+            client_tracking_epoch: stamp.map_or(0, |(s, _)| s.client_epoch),
+            client_instance_id: stamp.map_or(0, |(s, _)| s.client_instance),
+        };
+        let write_stamp = mapping.view_size >= SECTION_SIZE;
+
         mapping.locked_write(|base| {
             let source = ptr::from_ref(&header).cast::<u8>();
             // # Safety: the view is BLOCK_SIZE bytes, the header is HEADER_SIZE bytes and the
@@ -297,6 +401,14 @@ mod windows_impl {
                     HEADER_SIZE - SEQUENCE_OFFSET - 4,
                 );
                 ptr::copy_nonoverlapping(pixels.as_ptr(), base.add(HEADER_SIZE), pixels.len());
+                // # Safety: only when the view holds SECTION_SIZE bytes
+                if write_stamp {
+                    ptr::copy_nonoverlapping(
+                        ptr::from_ref(&tracking_stamp).cast::<u8>(),
+                        base.add(BLOCK_SIZE),
+                        STAMP_SIZE,
+                    );
+                }
             }
         });
 
