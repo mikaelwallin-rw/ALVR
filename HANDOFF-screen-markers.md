@@ -1,23 +1,72 @@
 # HANDOFF: ALVR side of ScreenVR "Physical" placement (branch `feature/screen-markers`)
 
-Written Friday 2026-11-06 by `alvr_session`, for Monday. The ScreenVR side is in
-`D:\wkspaces\ScreenVR\HANDOFF.md`; the task list is `D:\wkspaces\ScreenVR\TASKS.md` (A1–A5 are ALVR
-tasks).
+Written Friday 2026-11-06 by `alvr_session`; brought up to date 2026-11-11. The ScreenVR side is in
+`D:\wkspaces\ScreenVR\HANDOFF.md` (session log 2026-11-11 has the details behind this file); the task list
+is `D:\wkspaces\ScreenVR\TASKS.md`. **The ScreenVR <-> ALVR interface (shared memory, packets, switch
+files, compatibility) is described ONLY in `D:\wkspaces\ScreenVR\docs\AlvrInterface.md`.**
+
+Sections below "Deployed (2026-11-11)" are dated history; where they disagree, the newer section wins.
 
 ## Commits (on `feature/screen-markers`, NOT pushed)
 
 | Commit | What |
 |---|---|
-| `bb2fe92c` | Tracking extras for overlay apps: fingertips, driverFromStage, recenterCounter, `stageEpoch`, request block (`server_core/src/tracking_extras.rs`) |
+| `bb2fe92c` | Tracking extras for overlay apps: fingertips, driverFromStage, recenterCounter, `stageEpoch`, request block |
 | `a9a2a0b8` | PICO's own OpenXR loader (unlocks `XR_PICO_*`), `XR_DIAG` extension logging |
-| `6a2b5c9e` | Headset camera frames via PICO SecureMR → `Local\VRCameraFrame_v1` |
-| `0f2fe90e` | Fix: camera pose = head pose × per-model extrinsics (SecureMR LOCAL mismatch, below) |
-| `057a573a` | Debug native reference quads (`Local\VRNativeQuads_v1` → OpenXR quad layers) |
+| `6a2b5c9e` | Headset camera frames via PICO SecureMR -> `Local\VRCameraFrame_v1` |
+| `0f2fe90e` | Camera pose = head pose x per-model extrinsics (SecureMR LOCAL mismatch) |
+| `057a573a` | Debug native reference quads (`Local\VRNativeQuads_v1` -> OpenXR quad layers) |
+| `13faa49c`, `cd78788f` | CAMPOSE tools, first handoff |
+| `ccc2a548`..`77ceae8c` | sRGB native quads, natively drawn hand-tracked hands, hidden SteamVR hand models |
+| `5fa0ef0b`..`f4fb56bb` | Screen video on native quads (multi-stream), scene mode/loading, STAGE identity + anchor, hand extras v4, loading screen, mip path, hand tuning |
+| `4198cff9` | Handoff 2026-11-10 |
+| `2e285591` | PICO capture-library camera extrinsics as the default set (`fit` A/B switch, unknown-model warning) |
+| `5be46d3f` | `XR_PICO_camera_image` probe behind `screenvr_camera_probe.txt` (TEST ONLY, inert without the file, slated for removal) |
+| `24acb3ea` | Packets: `TrackingStateReport` / `CameraTrackingStamp` in `ReservedBuffer` |
+| `c35aa22b` | Server: tracking extras v5 (`trackingEpoch`, `headTrackingFlags`, floor-height stage change) + camera-frame tracking stamp |
+| `c3d3847d` | Client: head tracking epoch state machine + tracking diagnostics log (= deployed tree) |
+| (this file) | docs commit on top |
 
-Not committed: this file and `tools/screen_markers/*.py`; the untracked `CLAUDE.md`, `HANDOVER.md`,
-`resources/SM_Hand_*.FBX` and `resources/pico_hand_retarget_instructions.md` were deliberately left out
-(agent config, stale notes, third-party meshes with an unclear licence).
+Intermediate commits of 2026-11-11 were not build-tested one by one; `c3d3847d` is the deployed tree.
+Deliberately NOT committed: `CLAUDE.md`, `HANDOVER.md`, `resources/SM_Hand_*.FBX`,
+`resources/pico_hand_retarget_instructions.md` (agent config, stale notes, third-party meshes with an unclear
+licence).
 
+## Deployed (2026-11-11 13:42; verified running)
+
+- Streamer driver **`76182441`** (`C:\Tenstar\VR\Pico\alvr\pc\alvr_server\bin\win64\driver_alvr_server.dll`)
+  + client APK **`1367d3f0`** (`C:\Tenstar\VR\Pico\alvr\alvr_client.apk`) = commit `c3d3847d`.
+- Contents beyond 2026-11-10: PICO capture-library camera extrinsics as default; tracking extras **version 5**
+  (`trackingEpoch`, `headTrackingFlags` PT/OT/SETTLED/LIVE, `clientInstanceId`/`clientTrackingEpoch`,
+  floor-height stage change); 40-byte `CFTS` tracking stamp after the camera pixels; tracking diagnostics log;
+  `XR_PICO_virtual_boundary` enabled when offered (read-only polling); camera-image probe (inert without its file).
+- Transport of the new state is `ReservedBuffer` (ignored by older peers); the other fork packets still need
+  driver and APK installed together (see AlvrInterface.md "Compatibility and deployment").
+- Backups of today's steps (all under `C:\Tenstar\VR\Pico\alvr\`): streamer `pc_backup_20261111_pre_extras5`
+  (before 76182441), `pc_backup_20261111_pre_picodefault` (before 61de28d6); APKs `alvr_client.apk.bak-2ce2f6e4`
+  (diagnostics build, before 1367d3f0), `.bak-b51e35d1` (PICO default), `.bak-146b41f6`, `.bak-41853163`,
+  `.bak-0cb31ce8`. Candidates kept: `alvr_client.apk.candidate-*`, `driver_candidate_*`.
+
+### Headset switch files (`/sdcard/Android/data/alvr.client.dev/files`; table in AlvrInterface.md)
+
+Read every second (`debug_switches.rs`): `screenvr_display_time.txt`, `screenvr_quad_settings.txt`,
+`screenvr_video_path.txt`, `screenvr_stall.txt`, `screenvr_stream_wait.txt`, `screenvr_stream_unused.txt`,
+`screenvr_hands_scale.txt`, `screenvr_hands_msaa.txt`, `screenvr_key_probe.txt`, `screenvr_loading.txt`,
+`screenvr_loading_preview.txt`, `screenvr_projected_passthrough.txt`, `screenvr_hands.txt`,
+`screenvr_refmarkers.txt`, `screenvr_fake_hands.txt`, `screenvr_camera_probe.txt` (test only),
+`screenvr_camera_extrinsics.txt` (`fit` = legacy A/B). Written by the client: `screenvr_switches_applied.txt`
+(crash-loop guard), `screenvr_stage.txt` (stage identity state; product state), `screenvr_tracking_diag.log`
+(+ `.1`; pull with `adb pull /sdcard/Android/data/alvr.client.dev/files/screenvr_tracking_diag.log`).
+
+### Superseded findings (kept below as history; do not act on them)
+
+- The hand-eye **fitted** extrinsics (`CAMERA_EXTRINSICS`, "Key finding" section) are known wrong (SecureMR
+  camera pose ~40 mm too high / ~34 mm too far back, wrong roll sign): they were a cause of the misalignment.
+  Default is PICO's own set; `fit` is A/B only.
+- **Stage identity and the persistent anchor are unreliable** as "STAGE moved" evidence on PICO: the anchor
+  moves with a re-created origin and the identity said "unchanged" through every re-creation.
+- **The tracking origin is re-created at the head whenever head position tracking is lost and comes back**
+  (sleep > ~2 min, app restart, reboot); recenter changes LOCAL only. Use `trackingEpoch` / SETTLED (extras v5).
 ## Loading screen instead of magenta (2026-11-10 afternoon, BUILT, NOT INSTALLED)
 
 Candidates (copied, not deployed): `C:\Tenstar\VR\Pico\alvr\alvr_client.apk.candidate-76f9e45d`,
@@ -213,7 +262,7 @@ Spec + assets: `client_openxr/loading_assets/` (loading-spec.txt v1 copied from 
 - Black screencaps after a loading screen were the headset falling asleep (static sleep), not the
   client.
 
-## Deployed (verified on the headset Tuesday 2026-11-10 08:30)
+## History: deployed 2026-11-10 (superseded by "Deployed (2026-11-11)" above)
 
 - Streamer driver **fe40f746** in `C:\Tenstar\VR\Pico\alvr\pc\alvr_server\bin\win64\driver_alvr_server.dll`
   = HEAD 5fa0ef0b + the UNCOMMITTED working tree (E4 + multi-stream, below).
@@ -621,6 +670,9 @@ every flip is logged. Git Bash: `export MSYS_NO_PATHCONV=1`.
 
 | Target | Streamer (copy over `pc\`) | APK |
 |---|---|---|
+| Before extras v5 / tracking epoch (driver 61de28d6, APK 2ce2f6e4) | `pc_backup_20261111_pre_extras5` | `alvr_client.apk.bak-2ce2f6e4` |
+| Before the tracking diagnostics (APK b51e35d1) | unchanged (driver 61de28d6) | `alvr_client.apk.bak-b51e35d1` |
+| Before the PICO-default extrinsics (driver c5401609) | `pc_backup_20261111_pre_picodefault` | `alvr_client.apk.bak-146b41f6` |
 | Before stage identity/anchor (driver ac2dc000, APK 0a0e1e36) | `pc_backup_20261110_pre_stageid` | `alvr_client.apk.bak-0a0e1e36` |
 | Before the camera rate change (driver 4167e40f) | `pc_backup_20261110_pre_camrate` | `alvr_client.apk.bak-043e8f50` |
 | Before the hands work (APK 02c70bc9) | unchanged (driver 4167e40f) | `alvr_client.apk.bak-a4e4ed0b` |
@@ -664,7 +716,7 @@ the old one as `.bak-<hash>`.
 
 Git Bash: `export MSYS_NO_PATHCONV=1` before adb commands with `/sdcard/...` paths.
 
-## Key finding: SecureMR's LOCAL is not always the app's LOCAL
+## Key finding: SecureMR's LOCAL is not always the app's LOCAL (2026-11-06; the fitted extrinsics below are SUPERSEDED, see top)
 
 - SecureMR reports the camera pose relative to *its own* LOCAL space. In some client processes it equals
   the app's XR LOCAL; in others it was offset by (0.08, 0, 8.66) cm, same rotation (11:12–16:22 Friday;
@@ -697,25 +749,10 @@ Git Bash: `export MSYS_NO_PATHCONV=1` before adb commands with `/sdcard/...` pat
     rotation in the pass). H2 recovers view_from_camera and SecureMR's LOCAL in STAGE regardless of the
     mismatch; this is how the bug was found.
 
-## Contracts (source of truth: ScreenVR headers)
+## Contracts
 
-- `Local\VRTrackingExtras_v1` (v2, written by ALVR): driverFromStage, recenterCounter, fingertips,
-  markerStatus, stageEpoch. `Local\VRTrackingRequest_v1` (written by ScreenVR): bits 1 markers
-  (answered Unsupported), 2 camera frames, 4 right camera. `Local\VRCameraFrame_v1`: 152-byte header +
-  2048² GRAY8. See `VrTrackingExtras.h`, `VrCameraFrame.h`.
-- `Local\VROpaqueRegions_v1` (pre-existing): regions forced opaque under chroma key.
-- **`Local\VRNativeQuads_v1`** (new, ScreenVR `VrNativeQuads.h`, reader `server_core/src/native_quads.rs`):
-  pack(4), seqlock, heartbeat ≤100 ms, stale 1000 ms. Header magic `0x4441514E`, version 1, sequence,
-  count (≤16), heartbeatMs, stageEpoch, reserved; then 16 × 80-byte quads: `stageFromQuad` (HmdMatrix34,
-  client STAGE, quad in XY facing +Z), width/height m, columns/rows (1..256), dark/light/outline RGBA
-  (bytes R,G,B,A), outlinePixels. Drawn only while stageEpoch equals ALVR's. Server polls on the keepalive
-  loop (1 s) and sends `ServerControlPacket::NativeQuads` on change. Client
-  (`client_openxr/src/native_quads.rs`): one static RGBA8 swapchain per quad, `XrCompositionLayerQuad` in
-  STAGE, submitted after the stream layer (always on top), unpremultiplied alpha.
-  - Switch: ScreenVR `config.json` → `physical.debugNativeQuads` (0 off, 1 opaque, 2 see-through,
-    3 none). Edit the file IN PLACE: a `sed -i` replace was not picked up by ScreenVR's watcher.
-  - Verified rendering Friday; the alignment measurement (TASKS S2) is still to do. If the chessboard
-    parity looks vertically flipped, the texture row order in `native_quads.rs` is the place.
+See `D:\wkspaces\ScreenVR\docs\AlvrInterface.md` (layouts, versions, writers/readers, packets, switch files,
+compatibility). The contract headers are ScreenVR's `src/Vr*.h`; the old description that stood here was stale.
 
 ## Headset facts worth knowing
 
