@@ -36,6 +36,12 @@
 // - screenvr_fake_hands.txt: "1" = TEST ONLY: when no hand is tracked, draw a synthetic left hand
 //   in front of the STAGE origin, so that the hands renderer's per-frame uploads run on an unworn
 //   headset.
+// - screenvr_camera_extrinsics.txt: absent/"pico" = camera frames use PICO's own camera extrinsics
+//   (capture library, CAMERA_EXTRINSICS_PICO in camera_frames.rs; the default); "fit" = the old
+//   hand-eye fitted set, KNOWN WRONG legacy set kept only for A/B measurement (to be removed in the
+//   cleanup). Applied live to the next camera frame; logged as CAMERA_EXTRINSICS. "pico" (and any
+//   value other than "fit") is normalised to the default, so it never counts as a non-default
+//   switch for the crash-loop guard below.
 // CRASH-LOOP GUARD: whenever non-default switches are applied, screenvr_switches_applied.txt gets
 // the time and the switches. If at start-up the same switches were applied less than
 // CRASH_GUARD_WINDOW ago (the previous run died, or was restarted, right after applying them), the
@@ -71,6 +77,7 @@ pub struct DebugSwitches {
     pub loading_preview: String,
     pub hands_scale: Option<f32>,
     pub hands_msaa: Option<u32>,
+    pub camera_extrinsics: String,
 }
 
 fn read(name: &str) -> String {
@@ -124,6 +131,12 @@ fn read_all() -> DebugSwitches {
             .parse::<u32>()
             .ok()
             .filter(|v| alvr_graphics::HANDS_SAMPLE_COUNTS.contains(v)),
+        // Only "fit" (legacy A/B set) is non-default; "pico"/absent/other = default = empty
+        camera_extrinsics: if read("screenvr_camera_extrinsics.txt").eq_ignore_ascii_case("fit") {
+            "fit".to_owned()
+        } else {
+            String::new()
+        },
     }
 }
 

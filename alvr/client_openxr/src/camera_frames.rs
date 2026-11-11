@@ -13,7 +13,10 @@ use alvr_packets::{CameraEye, CameraFrame, CameraFramesConfig};
 use openxr as xr;
 use std::{
     f32::consts::PI,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -35,9 +38,12 @@ const TIMING_LOG_FRAMES: u32 = 20;
 // own LOCAL space, which does not always match the app's LOCAL space: on a PICO 4 Ultra Enterprise
 // both were identical, and after the runtime re-established its spaces SecureMR's was 8.66 cm
 // away (same rotation). The camera pose is therefore derived from the head pose with these
-// extrinsics. Measured by hand-eye calibration of CAMPOSE_DIAG data (head rotation up to 75
-// degrees, residual below 1 mm, equal in both space regimes to 0.1 mm). Both cameras share one
-// rotation; baseline 64.1 mm.
+// extrinsics. The default set is CAMERA_EXTRINSICS_PICO below.
+// LEGACY SET, KNOWN WRONG, selected only by switch value "fit" for A/B measurement, to be removed in
+// the cleanup: measured by hand-eye calibration of CAMPOSE_DIAG data (head rotation up to 75
+// degrees, residual below 1 mm), it reproduces SecureMR's reported camera pose, which is ~40 mm too
+// high and ~34 mm too far back with the wrong roll sign. Both cameras share one rotation; baseline
+// 64.1 mm.
 const CAMERA_EXTRINSICS: &[(&str, CameraExtrinsics)] = &[(
     "PICO 4 Ultra Enterprise",
     CameraExtrinsics {
@@ -51,6 +57,102 @@ const CAMERA_EXTRINSICS: &[(&str, CameraExtrinsics)] = &[(
         },
     },
 )];
+
+// DEFAULT SET (debug switch screenvr_camera_extrinsics.txt absent or "pico"; confirmed correct in
+// the headset 2026-11-11): PICO's own calibration, read on
+// a PICO 4 Ultra Enterprise (PICO OS 5.15.7, 2026-11-11) with the enterprise capture library:
+// com.pxr.capturelib.PXRCapture.getCameraExtrinsics (libpvrcapturelib.so ->
+// /system_ext/lib64/libpxrcapturendk.so -> PXRCapture service). Raw row-major 4x4 per camera, metres,
+// camera (OpenCV axes) -> PICO body frame (x up, y left, z back):
+//   left  [ 0.0136635401 -0.999839348  0.0116010717 -0.0201851018
+//          -0.999903774  -0.0136904047 -0.00223944977 0.0827398289
+//           0.00239791337 -0.0115693566 -0.999930198 -0.0169578897 ]
+//   right  same rotation, translation (-0.0193091163, 0.0186348305, -0.0168041567)
+// PICO's Unreal plugin (PICOEnterprise libCameraRenderingPlugin.so, getCameraParametersNew) turns
+// them into head-relative camera poses as A * E with the constant (.rodata, float, row-major)
+//   A = [ 0 -1  0  0.05057 ;  1  0  0  0.01874 ;  0  0  1 -0.05194 ;  0 0 0 1 ]
+// i.e. body axes -> (right, up, back) plus the body origin in the head frame. These are A * E for
+// both cameras. Compared with the fitted set: same lateral position (0.03 mm), but 40.5/38.7 mm
+// lower and 34.0/33.6 mm further forward, and rolled +1.57 deg (PICO +0.78, fit -0.79 deg) - the
+// same roll as ScreenVR's empirical cameraRollCorrectionDeg -1.6 (so use 0 with this set).
+const CAMERA_EXTRINSICS_PICO: &[(&str, CameraExtrinsics)] = &[(
+    "PICO 4 Ultra Enterprise",
+    CameraExtrinsics {
+        left: Pose {
+            orientation: Quat::from_xyzw(-0.999_959, -0.006_839, -0.001_159, 0.005_793),
+            position: Vec3::new(-0.032_170, -0.001_445, -0.068_898),
+        },
+        right: Pose {
+            orientation: Quat::from_xyzw(-0.999_959, -0.006_839, -0.001_159, 0.005_793),
+            position: Vec3::new(0.031_935, -0.000_569, -0.068_744),
+        },
+    },
+)];
+
+/// Which extrinsics set the camera frames use (debug switch screenvr_camera_extrinsics.txt)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ExtrinsicsSet {
+    // LEGACY, KNOWN WRONG (~40 mm too high, ~34 mm too far back, wrong roll sign): hand-eye fit of
+    // SecureMR camera poses (CAMERA_EXTRINSICS). Only for A/B measurement via the switch value
+    // "fit"; to be removed in the cleanup.
+    Fit,
+    // PICO's capture library calibration (CAMERA_EXTRINSICS_PICO), the default
+    Pico,
+}
+
+impl ExtrinsicsSet {
+    // "fit" selects the legacy set; anything else (absent, "pico", unknown text) the default
+    fn from_switch(value: &str) -> Self {
+        if value.eq_ignore_ascii_case("fit") {
+            Self::Fit
+        } else {
+            Self::Pico
+        }
+    }
+
+    fn table(self) -> &'static [(&'static str, CameraExtrinsics)] {
+        match self {
+            Self::Fit => CAMERA_EXTRINSICS,
+            Self::Pico => CAMERA_EXTRINSICS_PICO,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Fit => "fit",
+            Self::Pico => "pico",
+        }
+    }
+}
+
+// Roll, pitch, yaw (degrees) of a VIEW-from-camera rotation (OpenCV camera axes) in VIEW axes:
+// roll = camera +x (image right) tipped up (counter-clockwise seen from behind the headset), pitch =
+// optical axis tipped up, yaw = optical axis turned right
+fn roll_pitch_yaw_deg(view_from_camera: Quat) -> (f32, f32, f32) {
+    let x = view_from_camera * Vec3::X;
+    let z = view_from_camera * Vec3::Z;
+    (
+        x.y.atan2(x.x).to_degrees(),
+        z.y.clamp(-1.0, 1.0).asin().to_degrees(),
+        z.x.atan2(-z.z).to_degrees(),
+    )
+}
+
+fn extrinsics_text(extrinsics: &CameraExtrinsics) -> String {
+    let side = |pose: Pose| {
+        let p = pose.position * 1000.0;
+        let (roll, pitch, yaw) = roll_pitch_yaw_deg(pose.orientation.normalize());
+        format!(
+            "({:.2}, {:.2}, {:.2}) mm roll {roll:.2} pitch {pitch:.2} yaw {yaw:.2} deg",
+            p.x, p.y, p.z
+        )
+    };
+    format!(
+        "left {} | right {} (VIEW right/up/back)",
+        side(extrinsics.left),
+        side(extrinsics.right)
+    )
+}
 
 #[derive(Clone, Copy)]
 struct CameraExtrinsics {
@@ -82,20 +184,83 @@ fn product_name() -> String {
     String::new()
 }
 
-fn camera_extrinsics() -> Option<CameraExtrinsics> {
+// For the unknown-model warning
+#[cfg(target_os = "android")]
+fn model_name() -> String {
+    alvr_system_info::android::model_name()
+}
+
+#[cfg(not(target_os = "android"))]
+fn model_name() -> String {
+    String::new()
+}
+
+/// For the camera probe's comparison (extra_extensions/camera_image_probe.rs): product name and
+/// VIEW-from-camera poses (OpenCV camera axes) of the left and right camera, if known
+pub(crate) fn reference_extrinsics() -> (String, Option<(Pose, Pose)>) {
     let product = product_name();
     let extrinsics = CAMERA_EXTRINSICS
         .iter()
         .find(|(name, _)| *name == product)
-        .map(|(_, extrinsics)| *extrinsics);
+        .map(|(_, extrinsics)| {
+            (
+                extrinsics.view_from_camera(CameraEye::Left),
+                extrinsics.view_from_camera(CameraEye::Right),
+            )
+        });
+
+    (product, extrinsics)
+}
+
+// Camera frame sources alive (normally 0 or 1), for the camera probe
+static ACTIVE_SOURCES: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether the SecureMR camera pass is running (the camera probe avoids running alongside it)
+pub(crate) fn camera_pass_active() -> bool {
+    ACTIVE_SOURCES.load(Ordering::Relaxed) > 0
+}
+
+fn find_extrinsics(set: ExtrinsicsSet, product: &str) -> Option<CameraExtrinsics> {
+    set.table()
+        .iter()
+        .find(|(name, _)| *name == product)
+        .map(|(_, extrinsics)| *extrinsics)
+}
+
+// The extrinsics of the requested set for this model and the set requested. Unknown model: None
+// (the camera pose reported by SecureMR is used; no extrinsics are invented) and a loud warning.
+// Called once at the start of a camera pass (and again when the switch changes).
+fn camera_extrinsics(requested: ExtrinsicsSet) -> (Option<CameraExtrinsics>, ExtrinsicsSet) {
+    let product = product_name();
+    let extrinsics = find_extrinsics(requested, &product);
     if extrinsics.is_none() {
         warn!(
-            "Camera frames: no camera extrinsics for {product:?}, using the SecureMR camera pose \
-            (may be offset if SecureMR's LOCAL space differs from the app's)"
+            "CAMERA_EXTRINSICS UNKNOWN MODEL: no {:?} camera extrinsics for product/model {product:?} \
+             (model {:?}); falling back to SecureMR's own camera pose. Monitor poses will be offset \
+             by several cm (about 40 mm too high and 34 mm too near on the PICO 4 Ultra Enterprise) \
+             until extrinsics for this model are added to camera_frames.rs",
+            requested.name(),
+            model_name()
         );
     }
 
-    extrinsics
+    (extrinsics, requested)
+}
+
+fn requested_extrinsics_set() -> ExtrinsicsSet {
+    ExtrinsicsSet::from_switch(&crate::debug_switches::get().camera_extrinsics)
+}
+
+// One line per camera pass start and per switch change: the set in use and its values
+fn log_extrinsics_in_use(extrinsics: Option<&CameraExtrinsics>, set: ExtrinsicsSet) {
+    match extrinsics {
+        Some(extrinsics) => info!(
+            "CAMERA_EXTRINSICS set={} {}",
+            set.name(),
+            extrinsics_text(extrinsics)
+        ),
+        None => info!("CAMERA_EXTRINSICS set=none (camera pose from SecureMR)"),
+    }
 }
 
 struct ReferenceSpaces<'a> {
@@ -128,6 +293,7 @@ impl CameraFrameSource {
         alvr_system_info::try_get_permission("android.permission.CAMERA");
 
         let running = Arc::new(RelaxedAtomic::new(true));
+        ACTIVE_SOURCES.fetch_add(1, Ordering::Relaxed);
 
         let thread = thread::Builder::new()
             .name("camera_frames".into())
@@ -155,6 +321,7 @@ impl Drop for CameraFrameSource {
         if let Some(thread) = self.thread.take() {
             thread.join().ok();
         }
+        ACTIVE_SOURCES.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -190,7 +357,11 @@ fn capture_loop(
             return;
         }
     };
-    let extrinsics = camera_extrinsics();
+    let mut requested_set = requested_extrinsics_set();
+    let (mut extrinsics, mut extrinsics_set) = camera_extrinsics(requested_set);
+    log_extrinsics_in_use(extrinsics.as_ref(), extrinsics_set);
+    // Logs CAMPOSE_DIFF again for the first frame after a switch of the extrinsics set
+    let mut log_difference_pending = false;
     info!(
         "Camera frames: started, {0}x{0} every {1:?}, camera pose from {2}",
         config.image_size,
@@ -212,6 +383,17 @@ fn capture_loop(
     while running.value() {
         let deadline = Instant::now() + config.interval;
 
+        // Applied live: the switch is polled by the debug switches thread
+        let requested = requested_extrinsics_set();
+        if requested != requested_set {
+            requested_set = requested;
+            (extrinsics, extrinsics_set) = camera_extrinsics(requested);
+            log_extrinsics_in_use(extrinsics.as_ref(), extrinsics_set);
+            log_difference_pending = true;
+        }
+        let log_path_difference = started.elapsed() > WARMUP
+            && (sent_count == 0 || log_difference_pending);
+
         let capture_start = Instant::now();
         let result = camera.capture().map_err(|e| format!("capture failed: {e}"));
         let encode_start = Instant::now();
@@ -225,14 +407,17 @@ fn capture_loop(
                 },
                 capture,
                 config.eye,
-                extrinsics,
+                extrinsics.map(|extrinsics| (extrinsics, extrinsics_set)),
                 PoseDiagnostics {
                     log_poses: sent_count < POSE_DIAG_FRAMES,
-                    // Once per run: the first frame after the warm-up
-                    log_path_difference: sent_count == 0 && started.elapsed() > WARMUP,
+                    // The first frame after the warm-up, and after a switch of the set
+                    log_path_difference,
                 },
             )
         });
+        if log_path_difference && frame.is_ok() {
+            log_difference_pending = false;
+        }
 
         let send_start = Instant::now();
         match frame {
@@ -333,7 +518,7 @@ fn make_frame(
     spaces: &ReferenceSpaces,
     capture: CameraCapture,
     eye: CameraEye,
-    extrinsics: Option<CameraExtrinsics>,
+    extrinsics: Option<(CameraExtrinsics, ExtrinsicsSet)>,
     diagnostics: PoseDiagnostics,
 ) -> Result<CameraFrame, String> {
     let capture_time = to_runtime_time(instance, capture.timestamp)?;
@@ -390,7 +575,7 @@ fn make_frame(
 
     let stage_from_view = crate::from_xr_pose(view_location.pose);
     let securemr_stage_from_camera = stage_from_local * local_from_camera;
-    let stage_from_camera = if let Some(extrinsics) = extrinsics {
+    let stage_from_camera = if let Some((extrinsics, _)) = extrinsics {
         if !view_location.location_flags.contains(
             xr::SpaceLocationFlags::POSITION_VALID | xr::SpaceLocationFlags::ORIENTATION_VALID,
         ) {
@@ -412,15 +597,16 @@ fn make_frame(
             m
         );
     }
-    if diagnostics.log_path_difference && extrinsics.is_some() {
+    if let (true, Some((_, set))) = (diagnostics.log_path_difference, extrinsics) {
         // Nonzero when SecureMR's LOCAL space differs from the app's (or the extrinsics are off)
         let difference = securemr_stage_from_camera.position - stage_from_camera.position;
         let angle = securemr_stage_from_camera
             .orientation
             .angle_between(stage_from_camera.orientation);
         info!(
-            "CAMPOSE_DIFF eye={eye:?} securemr - extrinsics: position ({:.1}, {:.1}, {:.1}) cm \
-            (|{:.1}| cm), rotation {:.2} deg",
+            "CAMPOSE_DIFF eye={eye:?} securemr - extrinsics(set={}): position ({:.1}, {:.1}, {:.1}) \
+            cm (|{:.1}| cm), rotation {:.2} deg",
+            set.name(),
             difference.x * 100.0,
             difference.y * 100.0,
             difference.z * 100.0,
@@ -459,4 +645,79 @@ fn make_frame(
         head_angular_speed,
         jpeg,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MODEL: &str = "PICO 4 Ultra Enterprise";
+
+    fn set(set: ExtrinsicsSet) -> CameraExtrinsics {
+        find_extrinsics(set, MODEL).unwrap()
+    }
+
+    #[test]
+    fn switch_values() {
+        assert_eq!(ExtrinsicsSet::from_switch(""), ExtrinsicsSet::Pico);
+        assert_eq!(ExtrinsicsSet::from_switch("pico"), ExtrinsicsSet::Pico);
+        assert_eq!(ExtrinsicsSet::from_switch("PICO"), ExtrinsicsSet::Pico);
+        assert_eq!(ExtrinsicsSet::from_switch("garbage"), ExtrinsicsSet::Pico);
+        assert_eq!(ExtrinsicsSet::from_switch("fit"), ExtrinsicsSet::Fit);
+        assert_eq!(ExtrinsicsSet::from_switch("FIT"), ExtrinsicsSet::Fit);
+    }
+
+    #[test]
+    fn baseline_and_rotation() {
+        for s in [ExtrinsicsSet::Fit, ExtrinsicsSet::Pico] {
+            let e = set(s);
+            let baseline = (e.right.position - e.left.position).length() * 1000.0;
+            assert!((baseline - 64.1).abs() < 0.2, "{s:?} baseline {baseline} mm");
+            for pose in [e.left, e.right] {
+                assert!((pose.orientation.length() - 1.0).abs() < 1e-4, "{s:?} not unit");
+                // Looks forward (-Z), image down is VIEW down
+                let m = Mat3::from_quat(pose.orientation.normalize());
+                assert!((m.transpose() * m - Mat3::IDENTITY).abs_diff_eq(Mat3::ZERO, 1e-5));
+                assert!(m.z_axis.z < -0.99 && m.y_axis.y < -0.99 && m.x_axis.x > 0.99);
+            }
+        }
+    }
+
+    #[test]
+    fn pico_minus_fit() {
+        let (fit, pico) = (set(ExtrinsicsSet::Fit), set(ExtrinsicsSet::Pico));
+        for (f, p) in [(fit.left, pico.left), (fit.right, pico.right)] {
+            let d = (p.position - f.position) * 1000.0;
+            // VIEW right/up/back, mm: same lateral position, ~40 mm lower, ~34 mm further forward
+            assert!(d.x.abs() < 0.5, "right {}", d.x);
+            assert!((d.y + 40.0).abs() < 2.0, "up {}", d.y);
+            assert!((d.z + 34.0).abs() < 1.0, "back {}", d.z);
+            let (fit_roll, fit_pitch, _) = roll_pitch_yaw_deg(f.orientation.normalize());
+            let (pico_roll, pico_pitch, _) = roll_pitch_yaw_deg(p.orientation.normalize());
+            assert!((fit_roll + 0.79).abs() < 0.05, "fit roll {fit_roll}");
+            assert!((pico_roll - 0.78).abs() < 0.05, "pico roll {pico_roll}");
+            assert!((fit_pitch - pico_pitch).abs() < 0.05);
+        }
+    }
+
+    // PICO's set equals A * E of the raw capture library matrices (see CAMERA_EXTRINSICS_PICO)
+    #[test]
+    fn pico_set_from_raw() {
+        let rotation = Mat3::from_cols(
+            Vec3::new(0.013_663_54, -0.999_903_8, 0.002_397_913),
+            Vec3::new(-0.999_839_35, -0.013_690_405, -0.011_569_357),
+            Vec3::new(0.011_601_072, -0.002_239_45, -0.999_930_2),
+        );
+        let body_to_view = Mat3::from_cols(Vec3::Y, -Vec3::X, Vec3::Z);
+        let origin = Vec3::new(0.050_57, 0.018_74, -0.051_94);
+        let raw_left = Vec3::new(-0.020_185_1, 0.082_739_83, -0.016_957_89);
+        let raw_right = Vec3::new(-0.019_309_116, 0.018_634_83, -0.016_804_157);
+        let pico = set(ExtrinsicsSet::Pico);
+        let expected = Quat::from_mat3(&(body_to_view * rotation));
+        for (pose, raw) in [(pico.left, raw_left), (pico.right, raw_right)] {
+            assert!(pose.orientation.normalize().angle_between(expected) < 1e-3);
+            let position = body_to_view * raw + origin;
+            assert!((pose.position - position).length() < 2e-6, "{position:?}");
+        }
+    }
 }
