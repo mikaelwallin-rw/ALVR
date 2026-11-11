@@ -36,6 +36,10 @@
 // - screenvr_fake_hands.txt: "1" = TEST ONLY: when no hand is tracked, draw a synthetic left hand
 //   in front of the STAGE origin, so that the hands renderer's per-frame uploads run on an unworn
 //   headset.
+// - screenvr_camera_probe.txt: any content = TEST ONLY: once per app start, log what PICO's
+//   XR_PICO_camera_image reports as the passthrough cameras' extrinsics and intrinsics (prefix
+//   CAMERA_PROBE, extra_extensions/camera_image_probe.rs). Read at start-up too: the extension is
+//   only requested at instance creation when the file exists then (restart the app after setting it).
 // - screenvr_camera_extrinsics.txt: absent/"pico" = camera frames use PICO's own camera extrinsics
 //   (capture library, CAMERA_EXTRINSICS_PICO in camera_frames.rs; the default); "fit" = the old
 //   hand-eye fitted set, KNOWN WRONG legacy set kept only for A/B measurement (to be removed in the
@@ -77,7 +81,18 @@ pub struct DebugSwitches {
     pub loading_preview: String,
     pub hands_scale: Option<f32>,
     pub hands_msaa: Option<u32>,
+    pub camera_probe: bool,
     pub camera_extrinsics: String,
+}
+
+const CAMERA_PROBE_FILE: &str = "screenvr_camera_probe.txt";
+
+/// screenvr_camera_probe.txt at instance creation (decides whether XR_PICO_camera_image is
+/// requested). Read directly: the poll thread has not run yet. Honours the crash-loop guard: not
+/// when a previous run applied the probe less than CRASH_GUARD_WINDOW ago.
+pub fn camera_probe_requested_at_startup() -> bool {
+    !read(CAMERA_PROBE_FILE).is_empty()
+        && !recently_applied().is_some_and(|switches| switches.contains("camera_probe: true"))
 }
 
 fn read(name: &str) -> String {
@@ -131,6 +146,7 @@ fn read_all() -> DebugSwitches {
             .parse::<u32>()
             .ok()
             .filter(|v| alvr_graphics::HANDS_SAMPLE_COUNTS.contains(v)),
+        camera_probe: !read(CAMERA_PROBE_FILE).is_empty(),
         // Only "fit" (legacy A/B set) is non-default; "pico"/absent/other = default = empty
         camera_extrinsics: if read("screenvr_camera_extrinsics.txt").eq_ignore_ascii_case("fit") {
             "fit".to_owned()

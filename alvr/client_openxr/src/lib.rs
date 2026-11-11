@@ -267,6 +267,16 @@ pub fn entry_point() {
     selected_exts.meta_body_tracking_full_body = true;
     selected_exts.meta_simultaneous_hands_and_controllers = true;
     selected_exts.meta_detached_controllers = true;
+    // DEBUG SWITCH screenvr_camera_probe.txt (TEST ONLY): XR_PICO_camera_image is requested only
+    // when the switch file exists at start-up, so that without it the instance is unchanged
+    // (extra_extensions/camera_image_probe.rs)
+    let mut camera_image_ext = extra_extensions::CameraImageExtensionState {
+        requested: debug_switches::camera_probe_requested_at_startup(),
+        ..Default::default()
+    };
+    if camera_image_ext.requested {
+        camera_image_ext.offered_version = extra_extensions::camera_image_extension_version(&xr_entry);
+    }
     selected_exts.other = [
         META_BODY_TRACKING_FIDELITY_EXTENSION_NAME,
         BD_MOTION_TRACKING_EXTENSION_NAME,
@@ -282,12 +292,48 @@ pub fn entry_point() {
             .into_iter()
             .map(|s| format!("{s}\0").into_bytes()),
     )
+    .chain(
+        camera_image_ext
+            .requested
+            .then(|| format!("{}\0", extra_extensions::CAMERA_IMAGE_EXTENSION_NAME).into_bytes()),
+    )
     .collect();
 
     selected_exts = selected_exts.intersection(&available_exts);
+    camera_image_ext.enabled = selected_exts
+        .other
+        .iter()
+        .any(|name| extra_extensions::is_camera_image_extension(name));
 
     let available_layers = xr_entry.enumerate_layers().unwrap();
     info!("OpenXR available layers: {available_layers:#?}");
+
+    let create_instance = |extensions: &xr::ExtensionSet| {
+        xr_entry.create_instance(
+            &xr::ApplicationInfo {
+                application_name: "ALVR Client",
+                application_version: 0,
+                engine_name: "ALVR",
+                engine_version: 0,
+                api_version: openxr_version,
+            },
+            extensions,
+            &[],
+        )
+    };
+    let mut instance_result = create_instance(&selected_exts);
+    // The test-only camera extension must never keep the app from starting: retry without it
+    if let Err(e) = &instance_result
+        && camera_image_ext.enabled
+    {
+        camera_image_ext.instance_error = Some(*e);
+        camera_image_ext.enabled = false;
+        selected_exts
+            .other
+            .retain(|name| !extra_extensions::is_camera_image_extension(name));
+        instance_result = create_instance(&selected_exts);
+    }
+    let xr_instance = instance_result.unwrap();
 
     let other_exts = selected_exts
         .other
@@ -300,20 +346,6 @@ pub fn entry_point() {
                 .to_owned()
         })
         .collect::<Vec<_>>();
-
-    let xr_instance = xr_entry
-        .create_instance(
-            &xr::ApplicationInfo {
-                application_name: "ALVR Client",
-                application_version: 0,
-                engine_name: "ALVR",
-                engine_version: 0,
-                api_version: openxr_version,
-            },
-            &selected_exts,
-            &[],
-        )
-        .unwrap();
 
     let platform = alvr_system_info::platform(
         xr_instance
@@ -329,6 +361,8 @@ pub fn entry_point() {
     let graphics_context = Rc::new(GraphicsContext::new_gl());
 
     let mut last_lobby_message = String::new();
+    // DEBUG SWITCH screenvr_camera_probe.txt: once per app start
+    let mut camera_probe_started = false;
 
     'session_loop: loop {
         let xr_system = xr_instance
@@ -359,6 +393,9 @@ pub fn entry_point() {
         }
         for name in &other_exts {
             info!("XR_DIAG extension enabled (other): {name}");
+        }
+        if camera_image_ext.requested {
+            extra_extensions::log_camera_image_extension(&camera_image_ext);
         }
 
         let views_config = xr_instance
@@ -549,6 +586,16 @@ pub fn entry_point() {
             if !session_running {
                 thread::sleep(Duration::from_millis(100));
                 continue;
+            }
+
+            // DEBUG SWITCH screenvr_camera_probe.txt (TEST ONLY): one-shot log of PICO's camera
+            // extrinsics/intrinsics, on its own thread (extra_extensions/camera_image_probe.rs)
+            if !camera_probe_started
+                && camera_image_ext.requested
+                && crate::debug_switches::get().camera_probe
+            {
+                camera_probe_started = true;
+                extra_extensions::spawn_camera_probe(xr_session.clone(), camera_image_ext);
             }
 
             while let Some(event) = core_context.poll_event() {
