@@ -33,7 +33,12 @@
 // SETTLED: position tracked continuously for >= SETTLE, no jump > JUMP_METERS and no reference
 // space change (any type) within SETTLE, the epoch unchanged for SETTLE, and, once the runtime has
 // sent PICO's undocumented event 1200007323 in this process, its latest value is 3 (it sends 1 at
-// session start/wake and 3 when 6DoF tracking is established).
+// session start/wake and 3 when 6DoF tracking is established). The 3 does NOT always follow: when
+// the headset is put on after a wake during which position tracking never dropped, the runtime
+// sends 1 at session READY and nothing after it (2026-11-12 07:06:43, head tracked the whole
+// time; the calibration waited "for head tracking" until it timed out). So a value of 1 stops
+// holding SETTLED back once the position has been tracked without a break for VENDOR_WAIT, counted
+// from the event.
 
 use alvr_common::{Pose, glam::Quat};
 use alvr_packets::{
@@ -62,6 +67,8 @@ const STAMP_MAX_AGE_NANOS: i64 = 100_000_000;
 // 3 = 6DoF tracking established (2026-11-11 logs)
 pub const PICO_TRACKING_EVENT_TYPE: i32 = 1_200_007_323;
 pub const PICO_TRACKING_READY_VALUE: u32 = 3;
+// How long a "tracking starting" vendor event holds SETTLED back when no "established" follows
+pub const VENDOR_WAIT_NANOS: i64 = 5_000_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpaceKind {
@@ -117,6 +124,8 @@ pub struct EpochMachine {
     last_local_change_boot_ns: Option<i64>,
     vendor_seen: bool,
     vendor_ready: bool,
+    // boot time of the sample before the latest not-ready vendor event (None while ready)
+    vendor_starting_boot_ns: Option<i64>,
     sessions: u32,
     pending_stage: Option<PendingStage>,
     stage_history: VecDeque<(i64, Pose)>,
@@ -159,6 +168,7 @@ impl EpochMachine {
             last_local_change_boot_ns: None,
             vendor_seen: false,
             vendor_ready: false,
+            vendor_starting_boot_ns: None,
             sessions: 0,
             pending_stage: None,
             stage_history: VecDeque::new(),
@@ -256,6 +266,19 @@ impl EpochMachine {
     pub fn on_vendor_tracking_event(&mut self, value: u32) {
         self.vendor_seen = true;
         self.vendor_ready = value == PICO_TRACKING_READY_VALUE;
+        self.vendor_starting_boot_ns = if self.vendor_ready {
+            None
+        } else {
+            Some(self.last.map_or(self.epoch_changed_boot_ns, |last| last.boot_ns))
+        };
+        self.lines.push(format!(
+            "VENDOR tracking event value {value} ({})",
+            if self.vendor_ready {
+                "established"
+            } else {
+                "starting: SETTLED waits for 3, or for 5 s of unbroken position tracking"
+            }
+        ));
     }
 
     fn in_window(&self, sample: &Sample) -> bool {
@@ -330,6 +353,13 @@ impl EpochMachine {
 
         // Settled
         let older = |t: Option<i64>| t.is_none_or(|t| sample.boot_ns - t >= SETTLE_NANOS);
+        // The vendor "starting" event without a following "established" (see the header)
+        let vendor_ok = !self.vendor_seen
+            || self.vendor_ready
+            || self.vendor_starting_boot_ns.is_some_and(|event| {
+                self.position_tracked_since
+                    .is_some_and(|since| sample.boot_ns - since.max(event) >= VENDOR_WAIT_NANOS)
+            });
         let settled = sample.position_tracked
             && self
                 .position_tracked_since
@@ -337,7 +367,7 @@ impl EpochMachine {
             && older(self.last_jump_boot_ns)
             && older(self.last_reference_change_boot_ns)
             && older(Some(self.epoch_changed_boot_ns))
-            && (!self.vendor_seen || self.vendor_ready)
+            && vendor_ok
             && self.pending_stage.is_none();
         let flags = u32::from(sample.position_tracked) * HEAD_POSITION_TRACKED
             | u32::from(sample.orientation_tracked) * HEAD_ORIENTATION_TRACKED
@@ -844,6 +874,31 @@ mod tests {
         rig.awake(100 * MS);
         assert!(rig.settled());
         assert_eq!(rig.m.epoch(), before);
+    }
+
+    // 2026-11-12 07:06:43: headset put on after a wake, PT never dropped, STAGE changed; the
+    // runtime sent vendor 1 at READY and never 3. SETTLED must still come.
+    #[test]
+    fn vendor_starting_without_established_settles_after_the_wait() {
+        let mut rig = running();
+        let before = rig.m.epoch();
+        rig.idle(9 * S);
+        rig.m.on_session_ready();
+        rig.m.on_vendor_tracking_event(1);
+        rig.awake(4900 * MS);
+        assert!(!rig.settled(), "less than 5 s since the vendor 1");
+        rig.awake(200 * MS);
+        assert!(rig.settled(), "tracked without a break for 5 s after the vendor 1");
+        assert_eq!(rig.m.epoch(), before);
+        // Tracking lost after a vendor 1: the wait restarts at the regain
+        rig.m.on_vendor_tracking_event(1);
+        rig.tracked = false;
+        rig.awake(3 * S);
+        rig.tracked = true;
+        rig.awake(4900 * MS);
+        assert!(!rig.settled(), "less than 5 s since the position came back");
+        rig.awake(200 * MS);
+        assert!(rig.settled());
     }
 
     // Awake pause, fast head turns, and a 62 mm snap while tracked outside any window (13:13:53)

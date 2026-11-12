@@ -688,7 +688,14 @@ every flip is logged. Git Bash: `export MSYS_NO_PATHCONV=1`.
 | Before camera v3 | `pc_backup_20261106_pre_camv3` | `alvr_client.apk.bak-cam-f337bf14` |
 | Before any of this work | `pc_backup_20261106_pre_extras` | `alvr_client.apk.bak-20261106` (original production client) |
 
-All under `C:\Tenstar\VR\Pico\alvr\`.
+All under `C:\TenstarDev\VR\Pico\alvr\` since 2026-11-12 (moved from `C:\Tenstar\VR\Pico\alvr\`, which now
+belongs to the fleet installer; every `C:\Tenstar\VR\Pico\alvr\...` path in this file means the `C:\TenstarDev`
+copy now. `D:\wkspaces\ScreenVR\tools\Switch-VrStack.ps1` selects which copy SteamVR uses).
+
+**2026-11-12:** client APK `ef584717` deployed = `a93938bb` + SETTLED fix in `tracking_state.rs`: PICO's vendor
+event 1200007323 = 1 without a following 3 (headset put on after a wake with no tracking loss) no longer blocks
+SETTLED forever; 5 s of unbroken position tracking since the event is enough (`VENDOR_WAIT_NANOS`). Previous APK:
+`alvr_client.apk.bak-1367d3f0`.
 
 ## Build and deploy
 
