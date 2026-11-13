@@ -13,20 +13,19 @@
 // The pixel margins are measured in the encoded stream image (after foveated encoding) at each edge
 // point, so they follow both the viewing angle and the local encoding resolution.
 
-use crate::{GraphicsContext, OpaqueRegionGeometry};
+use crate::{FOVEATION_UNIFORM_VEC4_COUNT, GraphicsContext, OpaqueRegionGeometry};
 use alvr_common::{
     Fov, Pose,
-    glam::{Mat4, UVec2, Vec2, Vec3},
+    glam::{Mat4, UVec2, Vec2, Vec3, Vec4},
 };
 use std::{mem, ops::Range, rc::Rc};
 use wgpu::{
     Buffer, BufferAddress, BufferDescriptor, BufferUsages, ColorTargetState, ColorWrites,
     CompareFunction, DepthBiasState, DepthStencilState, Extent3d, FragmentState,
     PipelineCompilationOptions, PipelineLayoutDescriptor, PrimitiveState, PrimitiveTopology,
-    PushConstantRange, RenderPass, RenderPipeline, RenderPipelineDescriptor, ShaderStages,
-    StencilFaceState, StencilOperation, StencilState, TextureDescriptor, TextureDimension,
-    TextureFormat, TextureUsages, TextureView, VertexAttribute, VertexBufferLayout, VertexFormat,
-    VertexState, VertexStepMode, include_wgsl,
+    RenderPass, RenderPipeline, RenderPipelineDescriptor, StencilFaceState, StencilOperation,
+    StencilState, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView,
+    VertexAttribute, VertexBufferLayout, VertexFormat, VertexState, VertexStepMode, include_wgsl,
 };
 
 pub const MAX_OPAQUE_REGIONS: usize = 32;
@@ -96,7 +95,8 @@ struct Foveation {
 /// Maps view uv to pixel coordinates in the encoded stream image.
 #[derive(Clone, Copy, Debug)]
 pub struct EncodedPixelMap {
-    foveation: Option<Foveation>,
+    // Per view (the foveation centers can differ per eye)
+    foveation: Option<[Foveation; 2]>,
     resolution: Vec2,
 }
 
@@ -108,41 +108,41 @@ impl EncodedPixelMap {
         }
     }
 
-    /// From the foveated encoding shader constants (see `foveated_encoding_shader_constants`) and
-    /// the encoded (staging) resolution.
-    pub fn from_foveation_constants(
-        constants: &[(&'static str, f64)],
+    /// From the foveation uniforms of stream.wgsl (see `foveated_encoding_data`) and the encoded
+    /// (staging) resolution.
+    pub fn from_foveation_uniforms(
+        uniforms: &[Vec4; FOVEATION_UNIFORM_VEC4_COUNT],
         encoded_resolution: UVec2,
     ) -> Self {
-        let value = |name: &str| {
-            constants
-                .iter()
-                .find(|(key, _)| *key == name)
-                .map_or(0.0, |(_, value)| *value as f32)
+        let common = uniforms[0];
+        let eye = |view_idx: usize| {
+            let [center, bounds, left, right, right_curve] =
+                [0, 1, 2, 3, 4].map(|i| uniforms[1 + view_idx * 5 + i]);
+            Foveation {
+                view_ratio: common.truncate().truncate(),
+                edge_ratio: Vec2::new(common.z, common.w),
+                c1: Vec2::new(center.x, center.y),
+                c2: Vec2::new(center.z, center.w),
+                lo_bound: Vec2::new(bounds.x, bounds.y),
+                hi_bound: Vec2::new(bounds.z, bounds.w),
+                a_left: Vec2::new(left.x, left.y),
+                b_left: Vec2::new(left.z, left.w),
+                a_right: Vec2::new(right.x, right.y),
+                b_right: Vec2::new(right.z, right.w),
+                c_right: Vec2::new(right_curve.x, right_curve.y),
+            }
         };
-        let pair = |x: &str, y: &str| Vec2::new(value(x), value(y));
         Self {
-            foveation: Some(Foveation {
-                view_ratio: pair("VIEW_WIDTH_RATIO", "VIEW_HEIGHT_RATIO"),
-                edge_ratio: pair("EDGE_X_RATIO", "EDGE_Y_RATIO"),
-                c1: pair("C1_X", "C1_Y"),
-                c2: pair("C2_X", "C2_Y"),
-                lo_bound: pair("LO_BOUND_X", "LO_BOUND_Y"),
-                hi_bound: pair("HI_BOUND_X", "HI_BOUND_Y"),
-                a_left: pair("A_LEFT_X", "A_LEFT_Y"),
-                b_left: pair("B_LEFT_X", "B_LEFT_Y"),
-                a_right: pair("A_RIGHT_X", "A_RIGHT_Y"),
-                b_right: pair("B_RIGHT_X", "B_RIGHT_Y"),
-                c_right: pair("C_RIGHT_X", "C_RIGHT_Y"),
-            }),
+            foveation: Some([eye(0), eye(1)]),
             resolution: encoded_resolution.as_vec2(),
         }
     }
 
     pub fn pixel(&self, uv: Vec2, view_idx: usize) -> Vec2 {
-        let Some(f) = self.foveation else {
+        let Some(foveation) = self.foveation else {
             return uv * self.resolution;
         };
+        let f = foveation[view_idx];
 
         let mut uv = uv;
         if view_idx == 1 {
@@ -353,8 +353,8 @@ pub fn stream_stencil_state() -> DepthStencilState {
     };
     DepthStencilState {
         format: STENCIL_FORMAT,
-        depth_write_enabled: false,
-        depth_compare: CompareFunction::Always,
+        depth_write_enabled: None,
+        depth_compare: None,
         stencil: StencilState {
             front: face,
             back: face,
@@ -383,14 +383,11 @@ impl OpaqueRegionsRenderer {
     ) -> Self {
         let device = &context.device;
 
-        // Explicit layout: it cannot be inferred with push constants
+        // Explicit layout: it cannot be inferred with immediates
         let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: None,
             bind_group_layouts: &[],
-            push_constant_ranges: &[PushConstantRange {
-                stages: ShaderStages::VERTEX,
-                range: 0..TRANSFORM_SIZE,
-            }],
+            immediate_size: TRANSFORM_SIZE,
         });
         let shader_module =
             device.create_shader_module(include_wgsl!("../resources/opaque_regions.wgsl"));
@@ -430,8 +427,8 @@ impl OpaqueRegionsRenderer {
             },
             depth_stencil: Some(DepthStencilState {
                 format: STENCIL_FORMAT,
-                depth_write_enabled: false,
-                depth_compare: CompareFunction::Always,
+                depth_write_enabled: None,
+                depth_compare: None,
                 stencil: StencilState {
                     front: replace,
                     back: replace,
@@ -452,7 +449,7 @@ impl OpaqueRegionsRenderer {
                     write_mask: ColorWrites::empty(),
                 })],
             }),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -555,7 +552,7 @@ impl OpaqueRegionsRenderer {
             return;
         }
         render_pass.set_pipeline(&self.pipeline);
-        render_pass.set_push_constants(ShaderStages::VERTEX, 0, transform_bytes);
+        render_pass.set_immediates(0, transform_bytes);
         render_pass.set_vertex_buffer(
             0,
             self.vertex_buffers[view_idx].slice(..u64::from(ranges[3].end) * VERTEX_SIZE),
@@ -699,19 +696,25 @@ mod tests {
 
     #[test]
     fn foveated_periphery_gets_wider_margin() {
-        let (encoded_resolution, constants) = crate::foveated_encoding_shader_constants(
-            UVec2::new(2000, 2000),
-            alvr_session::FoveatedEncodingConfig {
-                force_enable: true,
-                center_size_x: 0.45,
-                center_size_y: 0.4,
-                center_shift_x: 0.4,
-                center_shift_y: 0.1,
-                edge_ratio_x: 4.0,
-                edge_ratio_y: 5.0,
-            },
-        );
-        let pixel_map = EncodedPixelMap::from_foveation_constants(&constants, encoded_resolution);
+        // Parameters as the server negotiates them for a 2000x2000 view: center size 0.45 x 0.4,
+        // shift 0.4 x 0.1, edge ratio 4 x 5 (alignment as in the server's foveation setup)
+        let view = Vec2::splat(2000.0);
+        let edge_ratio = Vec2::new(4.0, 5.0);
+        let edge_size = view - Vec2::new(0.45, 0.4) * view;
+        let center_size = 1.0 - (edge_size / (edge_ratio * 2.0)).ceil() * (edge_ratio * 2.0) / view;
+        let optimized = (center_size + (1.0 - center_size) / edge_ratio) * view;
+        let aligned = (optimized / 32.0).ceil() * 32.0;
+        let params = alvr_common::AlvrFoveatedEncodingParams {
+            encoded_view_resolution: aligned.as_uvec2().to_array(),
+            view_ratio: (optimized / aligned).to_array(),
+            center_size: center_size.to_array(),
+            center_shifts: [[0.4, 0.1]; 2],
+            edge_ratio: edge_ratio.to_array(),
+        };
+        let encoded_resolution = aligned.as_uvec2();
+        let uniforms =
+            crate::foveated_encoding_data(&params, params.center_shifts.map(Vec2::from_array));
+        let pixel_map = EncodedPixelMap::from_foveation_uniforms(&uniforms, encoded_resolution);
 
         // The mapping is monotonic and covers the encoded image
         let start = pixel_map.pixel(Vec2::ZERO, 0);

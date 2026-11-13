@@ -1,3 +1,16 @@
+struct Immediate {
+    reprojection_transform: mat4x4f,
+    view_idx: u32,
+    passthrough_mode: u32, // 0: Blend, 1: RGB chroma key, 2: HSV chroma key
+    blend_alpha: f32,
+    // Chroma key edge cleanup: bits 0..8 = erosion radius (texels), bits 8..16 = despill (0..=255)
+    ck_edge: u32,
+    ck_channel0: vec4f,
+    ck_channel1: vec4f,
+    ck_channel2: vec4f,
+}
+var<immediate> imm: Immediate;
+
 const DIV12: f32 = 1.0 / 12.92;
 const DIV1: f32 = 1.0 / 1.055;
 const THRESHOLD: f32 = 0.04045;
@@ -31,45 +44,6 @@ override UPSCALE_EDGE_SHARPNESS: f32 = 2.0;
 
 override ENABLE_FFE: bool = false;
 
-override VIEW_WIDTH_RATIO: f32 = 0.0;
-override VIEW_HEIGHT_RATIO: f32 = 0.0;
-override EDGE_X_RATIO: f32 = 0.0;
-override EDGE_Y_RATIO: f32 = 0.0;
-
-override C1_X: f32 = 0.0;
-override C1_Y: f32 = 0.0;
-override C2_X: f32 = 0.0;
-override C2_Y: f32 = 0.0;
-override LO_BOUND_X: f32 = 0.0;
-override LO_BOUND_Y: f32 = 0.0;
-override HI_BOUND_X: f32 = 0.0;
-override HI_BOUND_Y: f32 = 0.0;
-
-override A_LEFT_X: f32 = 0.0;
-override A_LEFT_Y: f32 = 0.0;
-override B_LEFT_X: f32 = 0.0;
-override B_LEFT_Y: f32 = 0.0;
-
-override A_RIGHT_X: f32 = 0.0;
-override A_RIGHT_Y: f32 = 0.0;
-override B_RIGHT_X: f32 = 0.0;
-override B_RIGHT_Y: f32 = 0.0;
-override C_RIGHT_X: f32 = 0.0;
-override C_RIGHT_Y: f32 = 0.0;
-
-struct PushConstant {
-    reprojection_transform: mat4x4f,
-    view_idx: u32,
-    passthrough_mode: u32, // 0: Blend, 1: RGB chroma key, 2: HSV chroma key
-    blend_alpha: f32,
-    // Chroma key edge cleanup: bits 0..8 = erosion radius (texels), bits 8..16 = despill (0..=255)
-    ck_edge: u32,
-    ck_channel0: vec4f,
-    ck_channel1: vec4f,
-    ck_channel2: vec4f,
-}
-var<push_constant> pc: PushConstant;
-
 struct OpaqueRegions {
     flags: u32,
     _pad0: u32,
@@ -81,7 +55,19 @@ struct OpaqueRegions {
 
 @group(0) @binding(0) var stream_texture: texture_2d<f32>;
 @group(0) @binding(1) var stream_sampler: sampler;
-@group(0) @binding(2) var<uniform> opaque: OpaqueRegions;
+struct FoveationEyeUniforms {
+    c1_c2: vec4f,
+    lo_hi_bound: vec4f,
+    a_left_b_left: vec4f,
+    a_right_b_right: vec4f,
+    c_right: vec4f,
+}
+struct FoveationUniforms {
+    view_ratio_edge_ratio: vec4f,
+    eyes: array<FoveationEyeUniforms, 2>,
+}
+@group(0) @binding(2) var<uniform> foveation: FoveationUniforms;
+@group(0) @binding(3) var<uniform> opaque: OpaqueRegions;
 
 struct VertexOutput {
     @builtin(position) position: vec4f,
@@ -93,7 +79,7 @@ fn vertex_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     var result: VertexOutput;
 
     result.uv = vec2f(f32(vertex_index & 1), f32(vertex_index >> 1));
-    result.position = pc.reprojection_transform * vec4f(result.uv.x - 0.5, 0.5 - result.uv.y, 0.0, 1.0);
+    result.position = imm.reprojection_transform * vec4f(result.uv.x - 0.5, 0.5 - result.uv.y, 0.0, 1.0);
 
     return result;
 }
@@ -104,22 +90,23 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     // tell upscaler to target a lower resolution for the edges
     var upscale_source_resolution = 1.0;
     if ENABLE_FFE {
-        let view_size_ratio = vec2f(VIEW_WIDTH_RATIO, VIEW_HEIGHT_RATIO);
-        let edge_ratio = vec2f(EDGE_X_RATIO, EDGE_Y_RATIO);
+        let view_size_ratio = foveation.view_ratio_edge_ratio.xy;
+        let edge_ratio = foveation.view_ratio_edge_ratio.zw;
+        let eye = foveation.eyes[imm.view_idx];
 
-        let c1 = vec2f(C1_X, C1_Y);
-        let c2 = vec2f(C2_X, C2_Y);
-        let lo_bound = vec2f(LO_BOUND_X, LO_BOUND_Y);
-        let hi_bound = vec2f(HI_BOUND_X, HI_BOUND_Y);
+        let c1 = eye.c1_c2.xy;
+        let c2 = eye.c1_c2.zw;
+        let lo_bound = eye.lo_hi_bound.xy;
+        let hi_bound = eye.lo_hi_bound.zw;
 
-        let a_left = vec2f(A_LEFT_X, A_LEFT_Y);
-        let b_left = vec2f(B_LEFT_X, B_LEFT_Y);
+        let a_left = eye.a_left_b_left.xy;
+        let b_left = eye.a_left_b_left.zw;
 
-        let a_right = vec2f(A_RIGHT_X, A_RIGHT_Y);
-        let b_right = vec2f(B_RIGHT_X, B_RIGHT_Y);
-        let c_right = vec2f(C_RIGHT_X, C_RIGHT_Y);
+        let a_right = eye.a_right_b_right.xy;
+        let b_right = eye.a_right_b_right.zw;
+        let c_right = eye.c_right.xy;
 
-        if pc.view_idx == 1 {
+        if imm.view_idx == 1 {
             corrected_uv.x = 1.0 - corrected_uv.x;
         }
 
@@ -149,7 +136,7 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
 
         corrected_uv = corrected_uv * view_size_ratio;
 
-        if pc.view_idx == 1 {
+        if imm.view_idx == 1 {
             corrected_uv.x = 1.0 - corrected_uv.x;
         }
     }
@@ -163,8 +150,8 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
 
     color = decode_color(color);
 
-    var alpha = pc.blend_alpha; // Default to Blend passthrough mode
-    if pc.passthrough_mode != 0 { // Chroma key
+    var alpha = imm.blend_alpha; // Default to Blend passthrough mode
+    if imm.passthrough_mode != 0 { // Chroma key
         if FORCED_REGION_CLASS != REGION_NONE {
             return forced_region_output(color);
         }
@@ -175,8 +162,8 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         var despill = 0.0;
         var edge_cleanup = false;
         if ENABLE_EDGE_CLEANUP {
-            erosion_px = f32(pc.ck_edge & 0xffu);
-            despill = f32((pc.ck_edge >> 8u) & 0xffu) / 255.0;
+            erosion_px = f32(imm.ck_edge & 0xffu);
+            despill = f32((imm.ck_edge >> 8u) & 0xffu) / 255.0;
             // Fully keyed pixels (most of the background) need no edge cleanup: skip the taps.
             edge_cleanup = mask > 0.0 && (erosion_px > 0.0 || despill > 0.0);
         }
@@ -264,7 +251,7 @@ fn decode_color(color_in: vec3f) -> vec3f {
 // 1 = opaque, 0 = keyed
 fn key_mask(color: vec3f) -> f32 {
     var current = color;
-    if pc.passthrough_mode == 2 { // HSV mode
+    if imm.passthrough_mode == 2 { // HSV mode
         current = rgb_to_hsv(color);
     }
     return chroma_key_mask(current);
@@ -296,19 +283,19 @@ fn ring_min_mask(uv: vec2f, texel: vec2f, radius: f32, with_diagonals: bool) -> 
 
 // Representative key colour, in the same space as the decoded stream colour
 fn key_color() -> vec3f {
-    if pc.passthrough_mode == 2 {
+    if imm.passthrough_mode == 2 {
         // Middle of the fully keyed hue range [start_min, end_min], at full saturation and value
-        let start_min = pc.ck_channel0.y;
-        let end_min = pc.ck_channel0.z;
+        let start_min = imm.ck_channel0.y;
+        let end_min = imm.ck_channel0.z;
         let hue = fract(start_min + fract(end_min - start_min) * 0.5);
         return clamp(abs(fract(vec3f(hue) + vec3f(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, vec3f(0.0), vec3f(1.0));
     }
 
     // RGB mode: each channel range is symmetric around the key value
     return 0.5 * vec3f(
-        pc.ck_channel0.x + pc.ck_channel0.w,
-        pc.ck_channel1.x + pc.ck_channel1.w,
-        pc.ck_channel2.x + pc.ck_channel2.w,
+        imm.ck_channel0.x + imm.ck_channel0.w,
+        imm.ck_channel1.x + imm.ck_channel1.w,
+        imm.ck_channel2.x + imm.ck_channel2.w,
     );
 }
 
@@ -328,10 +315,10 @@ fn remove_key_spill(color: vec3f, amount: f32) -> vec3f {
 }
 
 fn chroma_key_mask(color: vec3f) -> f32 {
-    let start_max = vec3f(pc.ck_channel0.x, pc.ck_channel1.x, pc.ck_channel2.x);
-    let start_min = vec3f(pc.ck_channel0.y, pc.ck_channel1.y, pc.ck_channel2.y);
-    let end_min = vec3f(pc.ck_channel0.z, pc.ck_channel1.z, pc.ck_channel2.z);
-    let end_max = vec3f(pc.ck_channel0.w, pc.ck_channel1.w, pc.ck_channel2.w);
+    let start_max = vec3f(imm.ck_channel0.x, imm.ck_channel1.x, imm.ck_channel2.x);
+    let start_min = vec3f(imm.ck_channel0.y, imm.ck_channel1.y, imm.ck_channel2.y);
+    let end_min = vec3f(imm.ck_channel0.z, imm.ck_channel1.z, imm.ck_channel2.z);
+    let end_max = vec3f(imm.ck_channel0.w, imm.ck_channel1.w, imm.ck_channel2.w);
 
     let start_mask = smoothstep(start_min.yz, start_max.yz, color.yz);
     let end_mask = smoothstep(end_min.yz, end_max.yz, color.yz);

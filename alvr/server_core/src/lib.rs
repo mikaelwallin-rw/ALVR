@@ -21,9 +21,9 @@ pub use tracking::HandType;
 
 use crate::connection::VideoPacket;
 use alvr_common::{
-    ConnectionState, DEVICE_ID_TO_PATH, DeviceMotion, LifecycleState, Pose, RelaxedAtomic,
-    ViewParams, dbg_server_core, error,
-    glam::Vec2,
+    AlvrFoveatedEncodingParams, ConnectionState, DEVICE_ID_TO_PATH, DeviceMotion, LifecycleState,
+    Pose, ViewParams, dbg_server_core, error,
+    glam::{UVec2, Vec2},
     info,
     parking_lot::{Mutex, RwLock},
     settings_schema::Switch,
@@ -36,7 +36,9 @@ use alvr_packets::{
     VideoPacketHeader,
 };
 use alvr_server_io::ServerSessionManager;
-use alvr_session::{CodecType, OpenvrProperty, PassthroughMode, Settings};
+use alvr_session::{
+    CodecType, H264Profile, OpenvrProperty, PassthroughMode, Settings, SteamvrHmdInitConfig,
+};
 use alvr_sockets::StreamSender;
 use bitrate::{BitrateManager, DynamicEncoderParams};
 use statistics::StatisticsManager;
@@ -89,12 +91,24 @@ pub fn initialize_environment(layout: afs::Layout) {
     SESSION_MANAGER.write().session_mut();
 }
 
+pub struct ServerNegotiatedStreamingConfig {
+    pub transcoding_view_resolution: UVec2,
+    pub emulated_headset_view_resolution: UVec2,
+    pub refresh_rate: f32,
+    pub foveated_encoding: Option<AlvrFoveatedEncodingParams>,
+    pub codec: CodecType,
+    pub h264_profile: H264Profile,
+    pub use_10bit_encoder: bool,
+    pub encoding_gamma: f32,
+    pub enable_hdr: bool,
+}
+
 pub enum ServerCoreEvent {
     SetOpenvrProperty {
         device_id: u64,
         prop: OpenvrProperty,
     },
-    ClientConnected,
+    ClientConnected(ServerNegotiatedStreamingConfig),
     ClientDisconnected,
     Battery(BatteryInfo),
     PlayspaceSync(Vec2),
@@ -179,6 +193,14 @@ pub fn settings() -> Settings {
     SESSION_MANAGER.read().settings().clone()
 }
 
+pub fn steamvr_hmd_init_config() -> SteamvrHmdInitConfig {
+    SESSION_MANAGER
+        .read()
+        .session()
+        .steamvr_hmd_init_config
+        .clone()
+}
+
 pub fn registered_button_set() -> HashSet<u64> {
     let session_manager = SESSION_MANAGER.read();
     if let Switch::Enabled(input_mapping) = &session_manager.settings().headset.controllers {
@@ -190,7 +212,6 @@ pub fn registered_button_set() -> HashSet<u64> {
 
 pub struct ServerCoreContext {
     lifecycle_state: Arc<RwLock<LifecycleState>>,
-    is_restarting: RelaxedAtomic,
     connection_context: Arc<ConnectionContext>,
     connection_thread: Arc<RwLock<Option<JoinHandle<()>>>>,
     webserver_runtime: Option<Runtime>,
@@ -253,9 +274,7 @@ impl ServerCoreContext {
         (
             Self {
                 lifecycle_state: Arc::new(RwLock::new(LifecycleState::StartingUp)),
-                is_restarting: RelaxedAtomic::new(false),
                 connection_context,
-
                 connection_thread: Arc::new(RwLock::new(None)),
                 webserver_runtime: Some(webserver_runtime),
                 _tracking_extras_heartbeat: tracking_extras::TrackingExtrasHeartbeat::start(),
@@ -396,6 +415,7 @@ impl ServerCoreContext {
         &self,
         timestamp: Duration,
         global_view_params: [ViewParams; 2],
+        foveation_center_shifts: Option<[[f32; 2]; 2]>,
         is_idr: bool,
         nal_buffer: Vec<u8>,
     ) {
@@ -467,6 +487,7 @@ impl ServerCoreContext {
                     header: VideoPacketHeader {
                         timestamp,
                         global_view_params,
+                        foveation_center_shifts,
                         is_idr,
                         opaque_regions,
                     },
@@ -506,15 +527,12 @@ impl ServerCoreContext {
                 .get_encoder_params(&session_manager_lock.settings().video.bitrate)
         };
 
-        if let Some((params, stats)) = pair {
+        pair.map(|(params, stats)| {
             if let Some(stats_manager) = &mut *self.connection_context.statistics_manager.write() {
                 stats_manager.report_throughput_stats(stats);
             }
-
-            Some(params)
-        } else {
-            None
-        }
+            params
+        })
     }
 
     pub fn report_composed(&self, target_timestamp: Duration, offset: Duration) {
@@ -553,14 +571,6 @@ impl ServerCoreContext {
             .write()
             .as_mut()
             .map(|stats| stats.duration_until_next_vsync())
-    }
-
-    pub fn restart(self) {
-        dbg_server_core!("restart");
-
-        self.is_restarting.set(true);
-
-        // drop is called here for self
     }
 }
 
@@ -601,11 +611,19 @@ impl Drop for ServerCoreContext {
         }
 
         // apply openvr config for the next launch
-        dbg_server_core!("Setting restart settings chache");
+        dbg_server_core!("Setting restart settings cache");
         {
             let mut session_manager_lock = SESSION_MANAGER.write();
-            session_manager_lock.session_mut().openvr_config =
-                connection::contruct_openvr_config(session_manager_lock.session());
+            let new_steamvr_hmd_init_config = session_manager_lock
+                .session()
+                .steamvr_hmd_init_config
+                .clone();
+            let settings = session_manager_lock.session().to_settings();
+            let new_hash =
+                connection::compute_restart_settings_hash(&new_steamvr_hmd_init_config, &settings);
+            let mut session = session_manager_lock.session_mut();
+            session.steamvr_hmd_init_config = new_steamvr_hmd_init_config;
+            session.restart_settings_hash = new_hash;
         }
 
         // todo: check if this is still needed

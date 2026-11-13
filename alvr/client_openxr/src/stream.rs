@@ -4,12 +4,13 @@ use crate::{
     interaction::{self, InteractionContext, InteractionSourcesConfig},
 };
 use alvr_client_core::{
-    ClientCoreContext,
+    ClientCoreContext, VideoFrameMetadata,
     video_decoder::{self, VideoDecoderConfig, VideoDecoderSource},
 };
 use alvr_common::{
-    BUTTON_INFO, DETACHED_CONTROLLER_LEFT_ID, DETACHED_CONTROLLER_RIGHT_ID, HAND_LEFT_ID,
-    HAND_RIGHT_ID, HEAD_ID, Pose, RelaxedAtomic, ViewParams,
+    AlvrFoveatedEncodingParams, BUTTON_INFO, DETACHED_CONTROLLER_LEFT_ID,
+    DETACHED_CONTROLLER_RIGHT_ID, HAND_LEFT_ID, HAND_RIGHT_ID, HEAD_ID, Pose, RelaxedAtomic,
+    ViewParams,
     anyhow::Result,
     error,
     glam::{UVec2, Vec2},
@@ -20,10 +21,12 @@ use alvr_graphics::{
     GraphicsContext, OpaqueRegionGeometry, OpaqueRegionsParams, StreamRenderer, StreamViewParams,
     key_chroma_direction, magenta_chroma_direction,
 };
-use alvr_packets::{CameraFramesConfig, OpaqueRegion, RealTimeConfig, StreamConfig, TrackingData};
+use alvr_packets::{
+    CameraFramesConfig, ClientStreamConfig, OpaqueRegion, RealTimeConfig, TrackingData,
+};
 use alvr_session::{
     ClientsideFoveationConfig, ClientsideFoveationMode, ClientsidePostProcessingConfig, CodecType,
-    FoveatedEncodingConfig, MediacodecProperty, PassthroughMode, UpscalingConfig,
+    MediacodecProperty, PassthroughMode, UpscalingConfig,
 };
 use alvr_system_info::Platform;
 use openxr as xr;
@@ -44,7 +47,7 @@ pub struct ParsedStreamConfig {
     pub encoding_gamma: f32,
     pub enable_hdr: bool,
     pub passthrough: Option<PassthroughMode>,
-    pub foveated_encoding_config: Option<FoveatedEncodingConfig>,
+    pub foveated_encoding_config: Option<AlvrFoveatedEncodingParams>,
     pub clientside_foveation_config: Option<ClientsideFoveationConfig>,
     pub clientside_post_processing: Option<ClientsidePostProcessingConfig>,
     pub upscaling: Option<UpscalingConfig>,
@@ -57,18 +60,14 @@ pub struct ParsedStreamConfig {
 }
 
 impl ParsedStreamConfig {
-    pub fn new(config: &StreamConfig) -> Self {
+    pub fn new(config: &ClientStreamConfig) -> Self {
         Self {
             view_resolution: config.negotiated_config.view_resolution,
             refresh_rate_hint: config.negotiated_config.refresh_rate_hint,
             encoding_gamma: config.negotiated_config.encoding_gamma,
             enable_hdr: config.negotiated_config.enable_hdr,
             passthrough: config.settings.video.passthrough.as_option().cloned(),
-            foveated_encoding_config: config
-                .negotiated_config
-                .enable_foveated_encoding
-                .then(|| config.settings.video.foveated_encoding.as_option().cloned())
-                .flatten(),
+            foveated_encoding_config: config.negotiated_config.foveated_encoding,
             clientside_foveation_config: config
                 .settings
                 .video
@@ -99,7 +98,7 @@ pub struct StreamContext {
     stage_reference_space: Arc<xr::Space>,
     view_reference_space: Arc<xr::Space>,
     swapchains: [xr::Swapchain<xr::OpenGlEs>; 2],
-    last_good_view_params: [ViewParams; 2],
+    last_good_video_frame_metadata: VideoFrameMetadata,
     last_good_opaque_regions: Arc<Vec<OpaqueRegion>>,
     opaque_regions_scratch: Vec<OpaqueRegionGeometry>,
     // (enabled in the config, regions received with the frame), logged on change
@@ -219,7 +218,7 @@ impl StreamContext {
                     .collect(),
             ],
             format,
-            config.foveated_encoding_config.clone(),
+            config.foveated_encoding_config,
             !((core_ctx.platform().is_pico()
                 || (core_ctx.platform() == Platform::SamsungGalaxyXR))
                 && config.enable_hdr),
@@ -263,7 +262,10 @@ impl StreamContext {
             stage_reference_space,
             view_reference_space,
             swapchains,
-            last_good_view_params: [ViewParams::DUMMY; 2],
+            last_good_video_frame_metadata: VideoFrameMetadata {
+                view_params: [ViewParams::DUMMY; 2],
+                foveation_center_shifts: None,
+            },
             last_good_opaque_regions: Arc::new(Vec::new()),
             opaque_regions_scratch: Vec::new(),
             opaque_regions_log_state: None,
@@ -439,8 +441,12 @@ impl StreamContext {
         // loop, so taking one per loop could let the decoder's output back up (queue overflow, then
         // input saturation and keyframe requests)
         while let Some((timestamp, _)) = source.get_frame() {
-            self.last_good_view_params = self.core_context.report_compositor_start(timestamp);
-            self.last_good_opaque_regions = self.core_context.last_frame_opaque_regions();
+            Self::report_compositor_start(
+                &self.core_context,
+                &mut self.last_good_video_frame_metadata,
+                &mut self.last_good_opaque_regions,
+                timestamp,
+            );
             if let Some(xr_now) = crate::xr_runtime_now(self.xr_session.instance()) {
                 self.core_context.report_submit(
                     timestamp,
@@ -448,6 +454,24 @@ impl StreamContext {
                 );
             }
         }
+    }
+
+    // Takes over the metadata (view params, foveation centers, opaque regions) of a decoded frame
+    fn report_compositor_start(
+        core_context: &ClientCoreContext,
+        last_good_video_frame_metadata: &mut VideoFrameMetadata,
+        last_good_opaque_regions: &mut Arc<Vec<OpaqueRegion>>,
+        timestamp: Duration,
+    ) {
+        if let Some(metadata) = core_context.report_compositor_start(timestamp) {
+            *last_good_video_frame_metadata = VideoFrameMetadata {
+                foveation_center_shifts: metadata
+                    .foveation_center_shifts
+                    .or(last_good_video_frame_metadata.foveation_center_shifts),
+                ..metadata
+            };
+        }
+        *last_good_opaque_regions = core_context.last_frame_opaque_regions();
     }
 
     pub fn update_real_time_config(&mut self, config: &RealTimeConfig) {
@@ -480,17 +504,25 @@ impl StreamContext {
             }
         }
 
-        let (timestamp, view_params, buffer_ptr) =
+        let (timestamp, frame_metadata, buffer_ptr) =
             if let Some((timestamp, buffer_ptr)) = frame_result {
-                let view_params = self.core_context.report_compositor_start(timestamp);
+                Self::report_compositor_start(
+                    &self.core_context,
+                    &mut self.last_good_video_frame_metadata,
+                    &mut self.last_good_opaque_regions,
+                    timestamp,
+                );
 
-                self.last_good_view_params = view_params;
-                self.last_good_opaque_regions = self.core_context.last_frame_opaque_regions();
-
-                (timestamp, view_params, buffer_ptr)
+                // Keep displaying new images even when their metadata is unavailable.
+                (timestamp, self.last_good_video_frame_metadata, buffer_ptr)
             } else {
-                (vsync_time, self.last_good_view_params, ptr::null_mut())
+                (
+                    vsync_time,
+                    self.last_good_video_frame_metadata,
+                    ptr::null_mut(),
+                )
             };
+        let view_params = frame_metadata.view_params;
 
         let left_swapchain_idx = self.swapchains[0].acquire_image().unwrap();
         let right_swapchain_idx = self.swapchains[1].acquire_image().unwrap();
@@ -605,6 +637,9 @@ impl StreamContext {
                 },
             ],
             self.config.passthrough.as_ref(),
+            frame_metadata
+                .foveation_center_shifts
+                .map(|centers| centers.map(Vec2::from_array)),
             &OpaqueRegionsParams {
                 regions: &self.opaque_regions_scratch,
                 edge_band,

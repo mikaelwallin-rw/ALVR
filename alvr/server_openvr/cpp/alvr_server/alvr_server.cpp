@@ -12,7 +12,6 @@
 #include "Logger.h"
 #include "Paths.h"
 #include "PoseHistory.h"
-#include "Settings.h"
 #include "TrackedDevice.h"
 #include "bindings.h"
 #include "driverlog.h"
@@ -91,6 +90,7 @@ public:
     std::map<uint64_t, TrackedDevice*> tracked_devices;
 
     virtual vr::EVRInitError Init(vr::IVRDriverContext* pContext) override {
+        InitializeRuntime(); // sets up rust logging/runtime, keep first
         Debug("DriverProvider::Init");
 
         VR_INIT_SERVER_DRIVER_CONTEXT(pContext);
@@ -115,7 +115,6 @@ public:
         this->left_controller.reset();
         this->right_controller.reset();
         this->hmd.reset();
-        // this->generic_trackers.clear();
 
         CleanupDriverLog();
 
@@ -146,7 +145,7 @@ public:
             }
 #ifdef __linux__
             else if (event.eventType == vr::VREvent_ChaperoneUniverseHasChanged
-                     || event.eventType == vr::VREvent_ChaperoneRoomSetupFinished
+                     || event.eventType == vr::VREvent_ChaperoneRoomSetupCommitted
                      || event.eventType == vr::VREvent_ChaperoneFlushCache
                      || event.eventType == vr::VREvent_ChaperoneSettingsHaveChanged
                      || event.eventType == vr::VREvent_SeatedZeroPoseReset
@@ -180,7 +179,7 @@ public:
 static bool g_last_left_using_hand = false;
 static bool g_last_right_using_hand = false;
 
-// bindigs for Rust
+// bindings for Rust
 
 const unsigned char* FRAME_RENDER_VS_CSO_PTR;
 unsigned int FRAME_RENDER_VS_CSO_LEN;
@@ -207,27 +206,10 @@ unsigned int RGBTOYUV420_SHADER_COMP_SPV_LEN;
 const char* g_sessionPath;
 const char* g_driverRootDir;
 
-void (*LogError)(const char* stringPtr);
-void (*LogWarn)(const char* stringPtr);
-void (*LogInfo)(const char* stringPtr);
-void (*LogDebug)(const char* stringPtr);
-void (*LogEncoder)(const char* stringPtr);
-void (*LogPeriodically)(const char* tag, const char* stringPtr);
-void (*DriverReadyIdle)(bool setDefaultChaprone);
-void (*SetVideoConfigNals)(const unsigned char* configBuffer, int len, int codec);
-void (*VideoSend)(unsigned long long targetTimestampNs, unsigned char* buf, int len, bool isIdr);
-void (*HapticsSend)(unsigned long long path, float duration_s, float frequency, float amplitude);
-void (*ShutdownRuntime)();
-unsigned long long (*PathStringToHash)(const char* path);
-void (*ReportPresent)(unsigned long long timestamp_ns, unsigned long long offset_ns);
-void (*ReportComposed)(unsigned long long timestamp_ns, unsigned long long offset_ns);
-FfiDynamicEncoderParams (*GetDynamicEncoderParams)();
-unsigned long long (*GetSerialNumber)(unsigned long long deviceID, char* outString);
-void (*SetOpenvrProps)(void* instancePtr, unsigned long long deviceID);
-void (*RegisterButtons)(void* instancePtr, unsigned long long deviceID);
-void (*WaitForVSync)();
+Settings g_settings;
+const Settings* Settings_Instance() { return &g_settings; }
 
-void CppInit(bool earlyHmdInitialization) {
+void CppInit(bool earlyHmdInitialization, Settings settings) {
     g_driver_provider.early_hmd_initialization = earlyHmdInitialization;
 
     HookCrashHandler();
@@ -235,7 +217,7 @@ void CppInit(bool earlyHmdInitialization) {
     // Initialize path constants
     init_paths();
 
-    Settings::Instance().Load();
+    g_settings = settings;
 
     load_debug_privilege();
 }
@@ -250,8 +232,8 @@ void* CppOpenvrEntryPoint(const char* interface_name, int* return_code) {
     }
 }
 
-bool InitializeStreaming() {
-    Settings::Instance().Load();
+bool InitializeStreaming(Settings settings) {
+    g_settings = settings;
 
     if (!g_driver_provider.devices_initialized) {
         if (!g_driver_provider.early_hmd_initialization) {
@@ -265,8 +247,8 @@ bool InitializeStreaming() {
         }
 
         // Note: for controllers, hands and trackers don't bail out if registration fails
-        if (Settings::Instance().m_enableControllers) {
-            auto controllerSkeletonLevel = Settings::Instance().m_useSeparateHandTrackers
+        if (Settings_Instance()->m_enableControllers) {
+            auto controllerSkeletonLevel = Settings_Instance()->m_useSeparateHandTrackers
                 ? vr::VRSkeletalTracking_Estimated
                 : vr::VRSkeletalTracking_Partial;
 
@@ -286,7 +268,7 @@ bool InitializeStreaming() {
                 );
             }
 
-            if (Settings::Instance().m_useSeparateHandTrackers) {
+            if (Settings_Instance()->m_useSeparateHandTrackers) {
                 auto left_hand_tracker
                     = new Controller(HAND_TRACKER_LEFT_ID, vr::VRSkeletalTracking_Full);
                 if (left_hand_tracker->register_device(true)) {
@@ -309,7 +291,7 @@ bool InitializeStreaming() {
             }
         }
 
-        if (Settings::Instance().m_enableBodyTrackingFakeVive) {
+        if (Settings_Instance()->m_enableBodyTrackingFakeVive) {
             auto chestTracker = std::make_unique<FakeViveTracker>(BODY_CHEST_ID);
             if (chestTracker->register_device(true)) {
                 g_driver_provider.tracked_devices.insert({ BODY_CHEST_ID, chestTracker.get() });
@@ -336,7 +318,7 @@ bool InitializeStreaming() {
                 g_driver_provider.generic_trackers.push_back(std::move(rightElbowTracker));
             }
 
-            if (Settings::Instance().m_bodyTrackingHasLegs) {
+            if (Settings_Instance()->m_bodyTrackingHasLegs) {
                 auto leftKneeTracker = std::make_unique<FakeViveTracker>(BODY_LEFT_KNEE_ID);
                 if (leftKneeTracker->register_device(true)) {
                     g_driver_provider.tracked_devices.insert({ BODY_LEFT_KNEE_ID,
@@ -457,7 +439,7 @@ void SetTracking(
         bool right_ctrl = rightHandData.controllerMotion != nullptr;
         bool left_skel = leftHandData.handSkeleton != nullptr;
         bool right_skel = rightHandData.handSkeleton != nullptr;
-        bool use_separate = Settings::Instance().m_useSeparateHandTrackers ? true : false;
+        bool use_separate = Settings_Instance()->m_useSeparateHandTrackers ? true : false;
 
         // Persist previous values across calls
         static bool prev_left_using_hand = left_using_hand;
@@ -540,7 +522,7 @@ void SetTracking(
         RequestDriverResync();
     }
 
-    if (Settings::Instance().m_enableBodyTrackingFakeVive) {
+    if (Settings_Instance()->m_enableBodyTrackingFakeVive) {
         std::map<uint64_t, FfiDeviceMotion> motionsMap;
         for (int i = 0; i < bodyTrackerMotionCount; i++) {
             auto m = bodyTrackerMotions[i];

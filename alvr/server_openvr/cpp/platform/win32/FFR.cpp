@@ -1,6 +1,5 @@
 #include "FFR.h"
 
-#include "alvr_server/Settings.h"
 #include "alvr_server/Utils.h"
 #include "alvr_server/bindings.h"
 
@@ -20,64 +19,36 @@ struct FoveationVars {
 
     float centerSizeX;
     float centerSizeY;
-    float centerShiftX;
-    float centerShiftY;
+    float centerShiftLeftX;
+    float centerShiftLeftY;
+    float centerShiftRightX;
+    float centerShiftRightY;
     float edgeRatioX;
     float edgeRatioY;
+    float padding[2];
 };
 
+static_assert(sizeof(FoveationVars) == 64, "FoveationVars must match the HLSL constant buffer");
+
 FoveationVars CalculateFoveationVars() {
-    float targetEyeWidth = (float)Settings::Instance().m_renderWidth / 2;
-    float targetEyeHeight = (float)Settings::Instance().m_renderHeight;
+    const auto* settings = Settings_Instance();
+    const auto& params = settings->m_foveatedEncoding;
 
-    float centerSizeX = (float)Settings::Instance().m_foveationCenterSizeX;
-    float centerSizeY = (float)Settings::Instance().m_foveationCenterSizeY;
-    float centerShiftX = (float)Settings::Instance().m_foveationCenterShiftX;
-    float centerShiftY = (float)Settings::Instance().m_foveationCenterShiftY;
-    float edgeRatioX = (float)Settings::Instance().m_foveationEdgeRatioX;
-    float edgeRatioY = (float)Settings::Instance().m_foveationEdgeRatioY;
-
-    float edgeSizeX = targetEyeWidth - centerSizeX * targetEyeWidth;
-    float edgeSizeY = targetEyeHeight - centerSizeY * targetEyeHeight;
-
-    float centerSizeXAligned
-        = 1. - ceil(edgeSizeX / (edgeRatioX * 2.)) * (edgeRatioX * 2.) / targetEyeWidth;
-    float centerSizeYAligned
-        = 1. - ceil(edgeSizeY / (edgeRatioY * 2.)) * (edgeRatioY * 2.) / targetEyeHeight;
-
-    float edgeSizeXAligned = targetEyeWidth - centerSizeXAligned * targetEyeWidth;
-    float edgeSizeYAligned = targetEyeHeight - centerSizeYAligned * targetEyeHeight;
-
-    float centerShiftXAligned = ceil(centerShiftX * edgeSizeXAligned / (edgeRatioX * 2.))
-        * (edgeRatioX * 2.) / edgeSizeXAligned;
-    float centerShiftYAligned = ceil(centerShiftY * edgeSizeYAligned / (edgeRatioY * 2.))
-        * (edgeRatioY * 2.) / edgeSizeYAligned;
-
-    float foveationScaleX = (centerSizeXAligned + (1. - centerSizeXAligned) / edgeRatioX);
-    float foveationScaleY = (centerSizeYAligned + (1. - centerSizeYAligned) / edgeRatioY);
-
-    float optimizedEyeWidth = foveationScaleX * targetEyeWidth;
-    float optimizedEyeHeight = foveationScaleY * targetEyeHeight;
-
-    // round the frame dimensions to a number of pixel multiple of 32 for the encoder
-    auto optimizedEyeWidthAligned = (uint32_t)ceil(optimizedEyeWidth / 32.f) * 32;
-    auto optimizedEyeHeightAligned = (uint32_t)ceil(optimizedEyeHeight / 32.f) * 32;
-
-    float eyeWidthRatioAligned = optimizedEyeWidth / optimizedEyeWidthAligned;
-    float eyeHeightRatioAligned = optimizedEyeHeight / optimizedEyeHeightAligned;
-
-    return { (uint32_t)targetEyeWidth,
-             (uint32_t)targetEyeHeight,
-             optimizedEyeWidthAligned,
-             optimizedEyeHeightAligned,
-             eyeWidthRatioAligned,
-             eyeHeightRatioAligned,
-             centerSizeXAligned,
-             centerSizeYAligned,
-             centerShiftXAligned,
-             centerShiftYAligned,
-             edgeRatioX,
-             edgeRatioY };
+    return { settings->m_renderWidth / 2,
+             settings->m_renderHeight,
+             params.encodedViewResolution[0],
+             params.encodedViewResolution[1],
+             params.viewRatio[0],
+             params.viewRatio[1],
+             params.centerSize[0],
+             params.centerSize[1],
+             params.centerShifts[0][0],
+             params.centerShifts[0][1],
+             params.centerShifts[1][0],
+             params.centerShifts[1][1],
+             params.edgeRatio[0],
+             params.edgeRatio[1],
+             { 0.0f, 0.0f } };
 }
 }
 
@@ -92,7 +63,8 @@ FFR::FFR(ID3D11Device* device)
 
 void FFR::Initialize(ID3D11Texture2D* compositionTexture) {
     auto fovVars = CalculateFoveationVars();
-    ComPtr<ID3D11Buffer> foveatedRenderingBuffer = CreateBuffer(mDevice.Get(), fovVars);
+    mFoveatedRenderingBuffer = CreateBuffer(mDevice.Get(), fovVars, D3D11_USAGE_DEFAULT);
+    mDevice->GetImmediateContext(&mImmediateContext);
 
     std::vector<uint8_t> quadShaderCSO(
         QUAD_SHADER_CSO_PTR, QUAD_SHADER_CSO_PTR + QUAD_SHADER_CSO_LEN
@@ -103,11 +75,11 @@ void FFR::Initialize(ID3D11Texture2D* compositionTexture) {
         mDevice.Get(),
         fovVars.optimizedEyeWidth * 2,
         fovVars.optimizedEyeHeight,
-        Settings::Instance().m_enableHdr ? DXGI_FORMAT_R16G16B16A16_FLOAT
+        Settings_Instance()->m_enableHdr ? DXGI_FORMAT_R16G16B16A16_FLOAT
                                          : DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
     );
 
-    if (Settings::Instance().m_enableFoveatedEncoding) {
+    if (Settings_Instance()->m_enableFoveatedEncoding) {
         std::vector<uint8_t> compressAxisAlignedShaderCSO(
             COMPRESS_AXIS_ALIGNED_CSO_PTR,
             COMPRESS_AXIS_ALIGNED_CSO_PTR + COMPRESS_AXIS_ALIGNED_CSO_LEN
@@ -118,7 +90,7 @@ void FFR::Initialize(ID3D11Texture2D* compositionTexture) {
             mQuadVertexShader.Get(),
             compressAxisAlignedShaderCSO,
             mOptimizedTexture.Get(),
-            foveatedRenderingBuffer.Get()
+            mFoveatedRenderingBuffer.Get()
         );
 
         mPipelines.push_back(compressAxisAlignedPipeline);
@@ -127,7 +99,19 @@ void FFR::Initialize(ID3D11Texture2D* compositionTexture) {
     }
 }
 
-void FFR::Render() {
+void FFR::Render(uint64_t targetTimestampNs) {
+    auto fovVars = CalculateFoveationVars();
+    UpdateBuffer(mImmediateContext.Get(), mFoveatedRenderingBuffer.Get(), &fovVars);
+
+    // Publish the same centers that were uploaded for this frame, without re-aligning them.
+    ReportEncoderFoveationCenters(
+        targetTimestampNs,
+        fovVars.centerShiftLeftX,
+        fovVars.centerShiftLeftY,
+        fovVars.centerShiftRightX,
+        fovVars.centerShiftRightY
+    );
+
     for (auto& p : mPipelines) {
         p.Render();
     }

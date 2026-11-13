@@ -2,13 +2,14 @@ name: Build artifacts for PRs
 
 on:
   pull_request:
-    branches: [master]
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build-windows:
+    if: github.event.sender.login != 'pre-commit-ci-lite[bot]'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
@@ -42,6 +43,7 @@ jobs:
 
 
   build-linux:
+    if: github.event.sender.login != 'pre-commit-ci-lite[bot]'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
@@ -76,6 +78,7 @@ jobs:
           path: ./artifacts/*
 
   build-android:
+    if: github.event.sender.login != 'pre-commit-ci-lite[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

@@ -13,7 +13,7 @@
 // The mesh's own girth per joint (median distance of the vertices it dominates from the bone
 // axis) is measured at load and logged next to the tracked XR_EXT_hand_tracking joint radii.
 
-use super::{GraphicsContext, MAX_PUSH_CONSTANTS_SIZE};
+use super::{GraphicsContext, MAX_IMMEDIATE_SIZE};
 use alvr_common::{
     Pose, ViewParams,
     glam::{Mat4, UVec2, Vec3, Vec4},
@@ -23,11 +23,10 @@ use wgpu::{
     BlendState, Buffer, BufferDescriptor, BufferUsages, Color, ColorTargetState, ColorWrites,
     CommandEncoderDescriptor, CompareFunction, DepthStencilState, Device, Extent3d, FragmentState,
     IndexFormat, LoadOp, MultisampleState, Operations, PipelineLayoutDescriptor, PrimitiveState,
-    PrimitiveTopology, PushConstantRange, RenderPassColorAttachment,
-    RenderPassDepthStencilAttachment, RenderPassDescriptor, RenderPipeline,
-    RenderPipelineDescriptor, ShaderStages, StoreOp, TextureDescriptor, TextureDimension,
-    TextureFormat, TextureUsages, TextureView, VertexBufferLayout, VertexState, VertexStepMode,
-    include_wgsl, vertex_attr_array,
+    PrimitiveTopology, RenderPassColorAttachment, RenderPassDepthStencilAttachment,
+    RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, StoreOp, TextureDescriptor,
+    TextureDimension, TextureFormat, TextureUsages, TextureView, VertexBufferLayout, VertexState,
+    VertexStepMode, include_wgsl, vertex_attr_array,
 };
 
 pub const HAND_JOINT_COUNT: usize = 26;
@@ -58,7 +57,7 @@ const VIEW_PROJ_CONST_SIZE: u32 = mem::size_of::<Mat4>() as u32;
 const EYE_POSITION_CONST_SIZE: u32 = mem::size_of::<Vec4>() as u32;
 const PUSH_CONSTANTS_SIZE: u32 = VIEW_PROJ_CONST_SIZE + EYE_POSITION_CONST_SIZE;
 const _: () = assert!(
-    PUSH_CONSTANTS_SIZE <= MAX_PUSH_CONSTANTS_SIZE,
+    PUSH_CONSTANTS_SIZE <= MAX_IMMEDIATE_SIZE,
     "Push constants size exceeds the maximum size"
 );
 
@@ -359,10 +358,7 @@ impl HandsRenderer {
             layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
                 label: Some("hands"),
                 bind_group_layouts: &[],
-                push_constant_ranges: &[PushConstantRange {
-                    stages: ShaderStages::VERTEX_FRAGMENT,
-                    range: 0..PUSH_CONSTANTS_SIZE,
-                }],
+                immediate_size: PUSH_CONSTANTS_SIZE,
             })),
             vertex: VertexState {
                 module: &shader_module,
@@ -382,8 +378,8 @@ impl HandsRenderer {
             },
             depth_stencil: Some(DepthStencilState {
                 format: DEPTH_FORMAT,
-                depth_write_enabled: true,
-                depth_compare: CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(CompareFunction::Less),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
@@ -401,7 +397,7 @@ impl HandsRenderer {
                     write_mask: ColorWrites::ALL,
                 })],
             }),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -528,6 +524,7 @@ impl HandsRenderer {
                 label: Some(&format!("hands_view_{view_idx}")),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view,
+                    depth_slice: None,
                     resolve_target,
                     ops: Operations {
                         load: LoadOp::Clear(Color::TRANSPARENT),
@@ -553,7 +550,7 @@ impl HandsRenderer {
                 .collect::<Vec<u8>>();
 
             pass.set_pipeline(&self.pipeline);
-            pass.set_push_constants(ShaderStages::VERTEX_FRAGMENT, 0, &push_constants);
+            pass.set_immediates(0, &push_constants);
             for (mesh, joints) in self.meshes.iter().zip(&hands) {
                 if joints.is_some() {
                     pass.set_vertex_buffer(0, mesh.vertex_buffers[ring_index].slice(..));

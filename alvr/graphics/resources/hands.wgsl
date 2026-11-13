@@ -2,18 +2,20 @@
 // arrive in the STAGE space. Output is premultiplied alpha for an alpha-blended OpenXR projection
 // layer.
 
+// Must be the first declaration: wgpu GLES backend bug with the position of the immediate block
+// (upstream #3452)
+struct PushConstant {
+    view_proj: mat4x4f,
+    eye_position: vec4f,
+}
+var<immediate> pc: PushConstant;
+
 // Pico's MI_Hand look: dark body, light fresnel rim (linear colors)
 const INNER_COLOR = vec3f(0.1311, 0.1543, 0.2448);
 const RIM_COLOR = vec3f(0.7101, 0.7946, 1.0);
 const RIM_STRENGTH: f32 = 0.85;
 const RIM_EXPONENT: f32 = 2.5;
 const ALPHA: f32 = 1.0;
-
-struct PushConstant {
-    view_proj: mat4x4f,
-    eye_position: vec4f,
-}
-var<push_constant> pc: PushConstant;
 
 struct VertexInput {
     @location(0) stage_position: vec3f,

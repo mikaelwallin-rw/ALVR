@@ -26,8 +26,8 @@ use alvr_common::{
 };
 use alvr_packets::{
     AnchorRequest, BatteryInfo, ButtonEntry, CameraFrame, CameraFramesConfig, ClientControlPacket,
-    HandShapeInfo, NativeQuad, OpaqueRegion, RealTimeConfig, ScreenVideoPacketHeader, StageInfo,
-    StreamConfig, TrackingData,
+    ClientStreamConfig, HandShapeInfo, NativeQuad, OpaqueRegion, RealTimeConfig,
+    ScreenVideoPacketHeader, StageInfo, TrackingData,
 };
 use alvr_session::CodecType;
 use alvr_system_info::Platform;
@@ -44,7 +44,7 @@ pub use logging_backend::init_logging;
 
 pub enum ClientCoreEvent {
     UpdateHudMessage(String),
-    StreamingStarted(Box<StreamConfig>),
+    StreamingStarted(Box<ClientStreamConfig>),
     StreamingStopped,
     Haptics {
         device_id: u64,
@@ -82,18 +82,26 @@ pub struct ClientCapabilities {
     pub prefer_hdr: bool,
 }
 
+#[derive(Clone, Copy)]
+pub struct VideoFrameMetadata {
+    pub view_params: [ViewParams; 2],
+    /// If absent, reuse the previous centers or the negotiated centers before the first update.
+    pub foveation_center_shifts: Option<[[f32; 2]; 2]>,
+}
+
 pub struct ClientCoreContext {
     platform: Platform,
     lifecycle_state: Arc<RwLock<LifecycleState>>,
     event_queue: Arc<Mutex<VecDeque<ClientCoreEvent>>>,
     connection_context: Arc<ConnectionContext>,
     connection_thread: Arc<Mutex<Option<JoinHandle<()>>>>,
-    last_good_global_view_params: Mutex<[ViewParams; 2]>,
     last_good_opaque_regions: Mutex<Arc<Vec<OpaqueRegion>>>,
 }
 
 impl ClientCoreContext {
-    pub fn new(capabilities: ClientCapabilities) -> Self {
+    /// On Android, requests microphone permission together with the additional permissions.
+    #[cfg_attr(not(target_os = "android"), expect(unused_variables))]
+    pub fn new(capabilities: ClientCapabilities, additional_permissions: Vec<&str>) -> Self {
         dbg_client_core!("Create");
 
         // Make sure to reset config in case of version compat mismatch.
@@ -104,8 +112,9 @@ impl ClientCoreContext {
 
         #[cfg(target_os = "android")]
         {
-            dbg_client_core!("Getting permissions");
-            alvr_system_info::try_get_permission(alvr_system_info::MICROPHONE_PERMISSION);
+            let mut permissions = additional_permissions;
+            permissions.push(alvr_system_info::MICROPHONE_PERMISSION);
+            alvr_system_info::try_get_permissions(&permissions);
             alvr_system_info::set_wifi_lock(true);
         }
 
@@ -134,7 +143,6 @@ impl ClientCoreContext {
             event_queue,
             connection_context,
             connection_thread: Arc::new(Mutex::new(Some(connection_thread))),
-            last_good_global_view_params: Mutex::new([ViewParams::DUMMY; 2]),
             last_good_opaque_regions: Mutex::new(Arc::new(Vec::new())),
         }
     }
@@ -379,23 +387,34 @@ impl ClientCoreContext {
         *self.connection_context.state.write() = ConnectionState::Disconnecting;
     }
 
-    pub fn report_compositor_start(&self, timestamp: Duration) -> [ViewParams; 2] {
+    /// Returns metadata matching this decoded frame, if available.
+    /// If no match is found, the caller can display the frame using its previous metadata.
+    pub fn report_compositor_start(&self, timestamp: Duration) -> Option<VideoFrameMetadata> {
         dbg_client_core!("report_compositor_start");
 
         if let Some(stats) = &mut *self.connection_context.statistics_manager.lock() {
             stats.report_compositor_start(timestamp);
         }
 
-        let global_view_params_lock = &mut *self.last_good_global_view_params.lock();
-        for entry in &*self.connection_context.global_view_params_queue.lock() {
-            if entry.timestamp == timestamp {
-                *global_view_params_lock = entry.view_params;
-                *self.last_good_opaque_regions.lock() = Arc::clone(&entry.opaque_regions);
-                break;
-            }
+        if let Some((_, regions)) = self
+            .connection_context
+            .opaque_regions_queue
+            .lock()
+            .iter()
+            .rev()
+            .find(|(frame_timestamp, _)| *frame_timestamp == timestamp)
+        {
+            *self.last_good_opaque_regions.lock() = Arc::clone(regions);
         }
 
-        *global_view_params_lock
+        self.connection_context
+            .video_frame_metadata_queue
+            .lock()
+            .iter()
+            .rev()
+            .find_map(|(frame_timestamp, metadata)| {
+                (*frame_timestamp == timestamp).then_some(*metadata)
+            })
     }
 
     /// Opaque regions of the frame last passed to `report_compositor_start`, in the same space as

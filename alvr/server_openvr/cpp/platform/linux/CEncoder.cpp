@@ -21,7 +21,7 @@
 #include "FrameRender.h"
 #include "alvr_server/Logger.h"
 #include "alvr_server/PoseHistory.h"
-#include "alvr_server/Settings.h"
+#include "alvr_server/bindings.h"
 #include "ffmpeg_helper.h"
 #include "protocol.h"
 
@@ -236,14 +236,14 @@ void CEncoder::Run() {
             if (m_captureFrame) {
                 m_captureFrame = false;
                 render.CaptureInputFrame(
-                    Settings::Instance().m_captureFrameDir + "/alvr_frame_input.ppm"
+                    (std::string)Settings_Instance()->m_captureFrameDir + "/alvr_frame_input.ppm"
                 );
                 render.CaptureOutputFrame(
-                    Settings::Instance().m_captureFrameDir + "/alvr_frame_output.ppm"
+                    (std::string)Settings_Instance()->m_captureFrameDir + "/alvr_frame_output.ppm"
                 );
             }
 
-            render.Render(frame_info.image, frame_info.semaphore_value);
+            render.Render(frame_info.image, frame_info.semaphore_value, pose->targetTimestampNs);
 
             if (!valid_timestamps) {
                 ReportPresent(pose->targetTimestampNs, 0);

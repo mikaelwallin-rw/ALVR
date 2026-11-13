@@ -25,7 +25,7 @@ void CEncoder::Initialize(std::shared_ptr<CD3DRender> d3dRender) {
 #ifdef ALVR_GPL
     Exception swException;
 
-    if (Settings::Instance().m_force_sw_encoding) {
+    if (Settings_Instance()->m_forceSwEncoding) {
         try {
             Debug("Try to use VideoEncoderSW.\n");
             m_videoEncoder
@@ -114,7 +114,7 @@ bool CEncoder::CopyToStaging(
     m_FrameRender->Startup();
 
     m_FrameRender->RenderFrame(
-        pTexture, bounds, poses, layerCount, recentering, message, debugText
+        pTexture, bounds, poses, layerCount, recentering, targetTimestampNs, message, debugText
     );
     return true;
 }

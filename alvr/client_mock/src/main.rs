@@ -97,7 +97,7 @@ impl eframe::App for Window {
 
         let mut input = self.input.clone();
 
-        CentralPanel::default().show_inside(ui, |ui| {
+        CentralPanel::default().show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.heading(RichText::new(&self.output.hud_message));
             });
@@ -204,7 +204,7 @@ fn client_thread(
         preferred_encoding_gamma: 1.0,
         prefer_hdr: false,
     };
-    let client_core_context = Arc::new(ClientCoreContext::new(capabilities));
+    let client_core_context = Arc::new(ClientCoreContext::new(capabilities, vec![]));
 
     client_core_context.resume();
 

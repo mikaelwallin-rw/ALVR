@@ -2,7 +2,6 @@
 name = "alvr_sockets"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 
@@ -11,6 +10,7 @@ trace-performance = ["profiling/profile-with-tracy"]
 
 [dependencies]
 alvr_common.workspace = true
+alvr_packets.workspace = true
 alvr_session.workspace = true
 
 bincode = { version = "2", features = ["serde"] }

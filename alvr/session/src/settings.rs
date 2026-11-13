@@ -42,7 +42,7 @@ pub enum FrameSize {
 }
 
 #[repr(u32)]
-#[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(SettingsSchema, Serialize, Deserialize, Clone, Copy, PartialEq)]
 pub enum EncoderQualityPreset {
     Quality = 0,
     Balanced = 1,
@@ -50,7 +50,7 @@ pub enum EncoderQualityPreset {
 }
 
 #[repr(u32)]
-#[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(SettingsSchema, Serialize, Deserialize, Clone, Copy, PartialEq)]
 pub enum EncoderQualityPresetNvidia {
     P1 = 1,
     P2 = 2,
@@ -62,7 +62,7 @@ pub enum EncoderQualityPresetNvidia {
 }
 
 #[repr(u32)]
-#[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(SettingsSchema, Serialize, Deserialize, Clone, Copy, PartialEq)]
 pub enum NvencTuningPreset {
     HighQuality = 1,
     LowLatency = 2,
@@ -71,7 +71,7 @@ pub enum NvencTuningPreset {
 }
 
 #[repr(u32)]
-#[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(SettingsSchema, Serialize, Deserialize, Clone, Copy, PartialEq)]
 pub enum NvencMultiPass {
     Disabled = 0,
     #[schema(strings(display_name = "1/4 resolution"))]
@@ -80,7 +80,7 @@ pub enum NvencMultiPass {
 }
 
 #[repr(u32)]
-#[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(SettingsSchema, Serialize, Deserialize, Clone, Copy, PartialEq)]
 pub enum NvencAdaptiveQuantizationMode {
     Disabled = 0,
     Spatial = 1,
@@ -88,7 +88,7 @@ pub enum NvencAdaptiveQuantizationMode {
 }
 
 #[repr(u8)]
-#[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(SettingsSchema, Serialize, Deserialize, Clone, Copy, PartialEq)]
 #[schema(gui = "button_group")]
 pub enum RateControlMode {
     #[schema(strings(display_name = "CBR"))]
@@ -98,7 +98,7 @@ pub enum RateControlMode {
 }
 
 #[repr(u8)]
-#[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(SettingsSchema, Serialize, Deserialize, Clone, Copy, PartialEq)]
 #[schema(gui = "button_group")]
 pub enum EntropyCoding {
     #[schema(strings(display_name = "CAVLC"))]
@@ -460,35 +460,26 @@ pub struct FoveatedEncodingConfig {
     #[schema(strings(help = "Force enable on smartphone clients"))]
     pub force_enable: bool,
 
-    #[schema(strings(display_name = "Center region width"))]
+    #[schema(strings(
+        display_name = "Center region size",
+        help = "Width and height, in X/Y order"
+    ))]
     #[schema(gui(slider(min = 0.0, max = 1.0, step = 0.01)))]
     #[schema(flag = "steamvr-restart")]
-    pub center_size_x: f32,
+    pub center_size: [f32; 2],
 
-    #[schema(strings(display_name = "Center region height"))]
-    #[schema(gui(slider(min = 0.0, max = 1.0, step = 0.01)))]
-    #[schema(flag = "steamvr-restart")]
-    pub center_size_y: f32,
-
-    #[schema(strings(display_name = "Center shift X"))]
+    #[schema(strings(
+        display_name = "Center shift",
+        help = "Horizontal and vertical shift, in X/Y order"
+    ))]
     #[schema(gui(slider(min = -1.0, max = 1.0, step = 0.01)))]
     #[schema(flag = "steamvr-restart")]
-    pub center_shift_x: f32,
+    pub center_shift: [f32; 2],
 
-    #[schema(strings(display_name = "Center shift Y"))]
-    #[schema(gui(slider(min = -1.0, max = 1.0, step = 0.01)))]
-    #[schema(flag = "steamvr-restart")]
-    pub center_shift_y: f32,
-
-    #[schema(strings(display_name = "Horizontal edge ratio"))]
+    #[schema(strings(help = "Horizontal and vertical compression ratios, in X/Y order"))]
     #[schema(gui(slider(min = 1.0, max = 10.0, step = 1.0)))]
     #[schema(flag = "steamvr-restart")]
-    pub edge_ratio_x: f32,
-
-    #[schema(strings(display_name = "Vertical edge ratio"))]
-    #[schema(gui(slider(min = 1.0, max = 10.0, step = 1.0)))]
-    #[schema(flag = "steamvr-restart")]
-    pub edge_ratio_y: f32,
+    pub edge_ratio: [f32; 2],
 }
 
 #[repr(C)]
@@ -1561,6 +1552,15 @@ TCP: Slower than UDP, but more stable. Pick this if you experience video or audi
     ))]
     pub allow_untrusted_http: bool,
 
+    #[schema(flag = "steamvr-restart")]
+    #[schema(strings(
+        display_name = "Allow remote dashboard access",
+        help = "Serve the dashboard on all network interfaces instead of localhost only. \
+                Anyone who can reach this machine can then control ALVR, as the web server \
+                has no authentication."
+    ))]
+    pub allow_remote_dashboard: bool,
+
     #[schema(strings(
         help = r#"If the client, server or the network discarded one packet, discard packets until a IDR packet is found."#
     ))]
@@ -2018,12 +2018,18 @@ pub fn session_settings_default() -> SettingsDefault {
                 content: FoveatedEncodingConfigDefault {
                     gui_collapsed: true,
                     force_enable: false,
-                    center_size_x: 0.45,
-                    center_size_y: 0.4,
-                    center_shift_x: 0.4,
-                    center_shift_y: 0.1,
-                    edge_ratio_x: 4.,
-                    edge_ratio_y: 5.,
+                    center_size: ArrayDefault {
+                        gui_collapsed: false,
+                        content: [0.45, 0.4],
+                    },
+                    center_shift: ArrayDefault {
+                        gui_collapsed: false,
+                        content: [0.4, 0.1],
+                    },
+                    edge_ratio: ArrayDefault {
+                        gui_collapsed: false,
+                        content: [4., 5.],
+                    },
                 },
             },
             clientside_foveation: SwitchDefault {
@@ -2349,6 +2355,7 @@ pub fn session_settings_default() -> SettingsDefault {
             enable_on_connect_script: false,
             enable_on_disconnect_script: false,
             allow_untrusted_http: false,
+            allow_remote_dashboard: false,
             packet_size: 1400,
             statistics_history_size: 256,
         },

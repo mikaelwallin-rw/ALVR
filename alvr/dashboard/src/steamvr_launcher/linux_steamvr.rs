@@ -7,10 +7,10 @@ use alvr_common::{debug, error, info, warn};
 use sysinfo::Process;
 
 pub fn launch_steamvr_with_steam() {
-    Command::new("steam")
-        .args(["steam://rungameid/250820"])
-        .spawn()
-        .ok();
+    if let Err(e) = super::spawn_and_reap(Command::new("steam").args(["steam://rungameid/250820"]))
+    {
+        error!("Failed to launch SteamVR through Steam: {e}");
+    }
 }
 
 pub fn terminate_process(process: &Process) {
@@ -63,11 +63,16 @@ enum DeviceInfo {
 }
 
 pub fn linux_hardware_checks() {
-    let wgpu_adapters = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::VULKAN,
-        ..Default::default()
-    })
-    .enumerate_adapters(wgpu::Backends::VULKAN);
+    let wgpu_adapters = pollster::block_on(
+        wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            flags: Default::default(),
+            memory_budget_thresholds: Default::default(),
+            backend_options: Default::default(),
+            display: Default::default(),
+        })
+        .enumerate_adapters(wgpu::Backends::VULKAN),
+    );
     let device_infos = wgpu_adapters
         .iter()
         .filter(|adapter| {

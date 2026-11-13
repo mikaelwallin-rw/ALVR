@@ -1,8 +1,8 @@
 use crate::{
     ConnectionContext, FILESYSTEM_LAYOUT, SESSION_MANAGER, ServerCoreEvent,
+    ServerNegotiatedStreamingConfig,
     bitrate::BitrateManager,
     camera_frames,
-    hand_gestures::HandGestureManager,
     input_mapping::ButtonMappingManager,
     native_quads::NativeQuadsReader,
     screen_video::ScreenVideoReader,
@@ -13,9 +13,9 @@ use crate::{
 };
 use alvr_adb::{WiredConnection, WiredConnectionStatus};
 use alvr_common::{
-    AnyhowToCon, BUTTON_INFO, CONTROLLER_PROFILE_INFO, ConResult, ConnectionError, ConnectionState,
-    LifecycleState, QUEST_CONTROLLER_PROFILE_PATH, RelaxedAtomic, con_bail, dbg_connection, debug,
-    error,
+    AlvrFoveatedEncodingParams, AnyhowToCon, BUTTON_INFO, CONTROLLER_PROFILE_INFO, ConResult,
+    ConnectionError, ConnectionState, LifecycleState, QUEST_CONTROLLER_PROFILE_PATH, RelaxedAtomic,
+    con_bail, dbg_connection, debug, error,
     glam::{UVec2, Vec2},
     info,
     parking_lot::{Condvar, Mutex, RwLock},
@@ -25,21 +25,22 @@ use alvr_common::{
 use alvr_events::{AdbEvent, ButtonEvent, EventType};
 use alvr_packets::{
     AUDIO, CameraEye, CameraFramesConfig, ClientConnectionResult, ClientConnectionsAction,
-    ClientControlPacket, ClientStatistics, HAPTICS, NativeQuad, NegotiatedStreamingConfig,
+    ClientControlPacket, ClientNegotiatedStreamingConfig, ClientStatistics, HAPTICS, NativeQuad,
     NegotiatedStreamingConfigExt, RealTimeConfig, SCREEN_VIDEO, STATISTICS,
     ScreenVideoPacketHeader, ServerControlPacket, StreamConfigPacket, TRACKING, TrackingData,
     VIDEO, VideoPacketHeader,
 };
 use alvr_session::{
-    BodyTrackingSinkConfig, CodecType, ControllersEmulationMode, FrameSize, H264Profile,
-    OpenvrConfig, SessionConfig, SocketProtocol,
+    BodyTrackingSinkConfig, CodecType, ControllersEmulationMode, FrameSize, H264Profile, Settings,
+    SocketProtocol, SteamvrHmdInitConfig,
 };
 use alvr_sockets::{
-    CONTROL_PORT, KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, PeerType, ProtoControlSocket,
-    StreamSocketBuilder, WIRED_CLIENT_HOSTNAME,
+    CONTROL_PORT, KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, ProtoControlSocket, SocketConnection,
+    StreamSocketConfig, WIRED_CLIENT_HOSTNAME,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, hash_map::DefaultHasher},
+    hash::{Hash, Hasher},
     net::{IpAddr, Ipv4Addr},
     process::Command,
     sync::{
@@ -89,19 +90,16 @@ fn is_streaming(client_hostname: &str) -> bool {
         .is_some_and(|c| c.connection_state == ConnectionState::Streaming)
 }
 
-pub fn contruct_openvr_config(session: &SessionConfig) -> OpenvrConfig {
-    let old_config = session.openvr_config.clone();
-    let settings = session.to_settings();
-
+pub fn compute_restart_settings_hash(
+    steamvr_hmd_init_config: &SteamvrHmdInitConfig,
+    settings: &Settings,
+) -> u64 {
     let mut controller_is_tracker = false;
     let mut controller_profile = 0;
     let mut use_separate_hand_trackers = false;
     let controllers_enabled = if let Switch::Enabled(config) = &settings.headset.controllers {
         controller_is_tracker =
             matches!(config.emulation_mode, ControllersEmulationMode::ViveTracker);
-        // These numbers don't mean anything, they're just for triggering SteamVR resets.
-        // Gaps are included in the numbering to make adding other controllers
-        // a bit easier though.
         controller_profile = match config.emulation_mode {
             ControllersEmulationMode::RiftSTouch => 0,
             ControllersEmulationMode::Quest1Touch => 1,
@@ -119,7 +117,6 @@ pub fn contruct_openvr_config(session: &SessionConfig) -> OpenvrConfig {
             .hand_skeleton
             .as_option()
             .is_some_and(|c| c.steamvr_input_2_0);
-
         true
     } else {
         false
@@ -128,13 +125,12 @@ pub fn contruct_openvr_config(session: &SessionConfig) -> OpenvrConfig {
     let body_tracking_vive_enabled =
         if let Switch::Enabled(config) = &settings.headset.body_tracking {
             matches!(config.sink, BodyTrackingSinkConfig::FakeViveTracker)
-        } else if let Switch::Enabled(config) = settings.headset.multimodal_tracking {
+        } else if let Switch::Enabled(config) = &settings.headset.multimodal_tracking {
             config.detached_controllers_steamvr_sink
         } else {
             false
         };
 
-    // Should be true if using full body tracking
     let body_tracking_has_legs = settings
         .headset
         .body_tracking
@@ -142,32 +138,29 @@ pub fn contruct_openvr_config(session: &SessionConfig) -> OpenvrConfig {
         .map(|c| c.sources.meta.prefer_full_body)
         .unwrap_or(false);
 
-    let mut foveation_center_size_x = 0.0;
-    let mut foveation_center_size_y = 0.0;
-    let mut foveation_center_shift_x = 0.0;
-    let mut foveation_center_shift_y = 0.0;
-    let mut foveation_edge_ratio_x = 0.0;
-    let mut foveation_edge_ratio_y = 0.0;
-    let enable_foveated_encoding = if let Switch::Enabled(config) = settings.video.foveated_encoding
+    let mut foveation_center_size_x = 0.0_f32;
+    let mut foveation_center_size_y = 0.0_f32;
+    let mut foveation_center_shift_x = 0.0_f32;
+    let mut foveation_center_shift_y = 0.0_f32;
+    let mut foveation_edge_ratio_x = 0.0_f32;
+    let mut foveation_edge_ratio_y = 0.0_f32;
+    let enable_foveated_encoding =
+        if let Switch::Enabled(config) = &settings.video.foveated_encoding {
+            [foveation_center_size_x, foveation_center_size_y] = config.center_size;
+            [foveation_center_shift_x, foveation_center_shift_y] = config.center_shift;
+            [foveation_edge_ratio_x, foveation_edge_ratio_y] = config.edge_ratio;
+            true
+        } else {
+            false
+        };
+
+    let mut brightness = 0.0_f32;
+    let mut contrast = 0.0_f32;
+    let mut saturation = 0.0_f32;
+    let mut gamma = 0.0_f32;
+    let mut sharpening = 0.0_f32;
+    let enable_color_correction = if let Switch::Enabled(config) = &settings.video.color_correction
     {
-        foveation_center_size_x = config.center_size_x;
-        foveation_center_size_y = config.center_size_y;
-        foveation_center_shift_x = config.center_shift_x;
-        foveation_center_shift_y = config.center_shift_y;
-        foveation_edge_ratio_x = config.edge_ratio_x;
-        foveation_edge_ratio_y = config.edge_ratio_y;
-
-        true
-    } else {
-        false
-    };
-
-    let mut brightness = 0.0;
-    let mut contrast = 0.0;
-    let mut saturation = 0.0;
-    let mut gamma = 0.0;
-    let mut sharpening = 0.0;
-    let enable_color_correction = if let Switch::Enabled(config) = settings.video.color_correction {
         brightness = config.brightness;
         contrast = config.contrast;
         saturation = config.saturation;
@@ -178,88 +171,111 @@ pub fn contruct_openvr_config(session: &SessionConfig) -> OpenvrConfig {
         false
     };
 
-    let nvenc_overrides = settings.video.encoder_config.nvenc;
-    let amf_controls = settings.video.encoder_config.amf;
-    let hdr_controls = settings.video.encoder_config.hdr;
+    let nvenc = &settings.video.encoder_config.nvenc;
+    let amf = &settings.video.encoder_config.amf;
+    let hdr = &settings.video.encoder_config.hdr;
+    let enc = &settings.video.encoder_config;
+    let dbg = &settings.extra.logging.debug_groups;
 
-    OpenvrConfig {
-        tracking_ref_only: settings.headset.tracking_ref_only,
-        enable_vive_tracker_proxy: settings.headset.enable_vive_tracker_proxy,
-        minimum_idr_interval_ms: settings.connection.minimum_idr_interval_ms,
-        adapter_index: settings.video.adapter_index,
-        codec: settings.video.preferred_codec as _,
-        h264_profile: settings.video.encoder_config.h264_profile as u32,
-        rate_control_mode: settings.video.encoder_config.rate_control_mode as u32,
-        filler_data: settings.video.encoder_config.filler_data,
-        entropy_coding: settings.video.encoder_config.entropy_coding as u32,
-        force_hdr_srgb_correction: hdr_controls.force_hdr_srgb_correction,
-        clamp_hdr_extended_range: hdr_controls.clamp_hdr_extended_range,
-        enable_amf_pre_analysis: amf_controls.enable_pre_analysis,
-        enable_vbaq: settings.video.encoder_config.enable_vbaq,
-        enable_amf_hmqb: amf_controls.enable_hmqb,
-        use_amf_preproc: amf_controls.use_preproc,
-        amf_preproc_sigma: amf_controls.preproc_sigma,
-        amf_preproc_tor: amf_controls.preproc_tor,
-        nvenc_quality_preset: nvenc_overrides.quality_preset as u32,
-        encoder_quality_preset: settings.video.encoder_config.quality_preset as u32,
-        force_sw_encoding: settings
-            .video
-            .encoder_config
-            .software
-            .force_software_encoding,
-        sw_thread_count: settings.video.encoder_config.software.thread_count,
-        controllers_enabled,
-        controller_is_tracker,
-        body_tracking_vive_enabled,
-        body_tracking_has_legs,
-        enable_foveated_encoding,
-        foveation_center_size_x,
-        foveation_center_size_y,
-        foveation_center_shift_x,
-        foveation_center_shift_y,
-        foveation_edge_ratio_x,
-        foveation_edge_ratio_y,
-        enable_color_correction,
-        brightness,
-        contrast,
-        saturation,
-        gamma,
-        sharpening,
-        linux_async_compute: settings.extra.patches.linux_async_compute,
-        linux_async_reprojection: settings.extra.patches.linux_async_reprojection,
-        nvenc_tuning_preset: nvenc_overrides.tuning_preset as u32,
-        nvenc_multi_pass: nvenc_overrides.multi_pass as u32,
-        nvenc_adaptive_quantization_mode: nvenc_overrides.adaptive_quantization_mode as u32,
-        nvenc_low_delay_key_frame_scale: nvenc_overrides.low_delay_key_frame_scale,
-        nvenc_refresh_rate: nvenc_overrides.refresh_rate,
-        enable_intra_refresh: nvenc_overrides.enable_intra_refresh,
-        intra_refresh_period: nvenc_overrides.intra_refresh_period,
-        intra_refresh_count: nvenc_overrides.intra_refresh_count,
-        max_num_ref_frames: nvenc_overrides.max_num_ref_frames,
-        gop_length: nvenc_overrides.gop_length,
-        p_frame_strategy: nvenc_overrides.p_frame_strategy,
-        nvenc_rate_control_mode: nvenc_overrides.rate_control_mode,
-        rc_buffer_size: nvenc_overrides.rc_buffer_size,
-        rc_initial_delay: nvenc_overrides.rc_initial_delay,
-        rc_max_bitrate: nvenc_overrides.rc_max_bitrate,
-        rc_average_bitrate: nvenc_overrides.rc_average_bitrate,
-        nvenc_enable_weighted_prediction: nvenc_overrides.enable_weighted_prediction,
-        capture_frame_dir: settings.extra.capture.capture_frame_dir,
-        amd_bitrate_corruption_fix: settings.video.bitrate.image_corruption_fix,
-        use_separate_hand_trackers,
-        _controller_profile: controller_profile,
-        _server_impl_debug: settings.extra.logging.debug_groups.server_impl,
-        _client_impl_debug: settings.extra.logging.debug_groups.client_impl,
-        _server_core_debug: settings.extra.logging.debug_groups.server_core,
-        _client_core_debug: settings.extra.logging.debug_groups.client_core,
-        _connection_debug: settings.extra.logging.debug_groups.connection,
-        _sockets_debug: settings.extra.logging.debug_groups.sockets,
-        _server_gfx_debug: settings.extra.logging.debug_groups.server_gfx,
-        _client_gfx_debug: settings.extra.logging.debug_groups.client_gfx,
-        _encoder_debug: settings.extra.logging.debug_groups.encoder,
-        _decoder_debug: settings.extra.logging.debug_groups.decoder,
-        ..old_config
-    }
+    let mut h = DefaultHasher::new();
+
+    // Negotiated fields (persisted in SteamvrHmdInitConfig)
+    steamvr_hmd_init_config.eye_resolution_width.hash(&mut h);
+    steamvr_hmd_init_config.eye_resolution_height.hash(&mut h);
+    steamvr_hmd_init_config
+        .target_eye_resolution_width
+        .hash(&mut h);
+    steamvr_hmd_init_config
+        .target_eye_resolution_height
+        .hash(&mut h);
+    steamvr_hmd_init_config.refresh_rate.hash(&mut h);
+    // Pre-init settings fields (read directly from settings)
+    settings.video.adapter_index.hash(&mut h);
+    settings.headset.tracking_ref_only.hash(&mut h);
+    settings.headset.enable_vive_tracker_proxy.hash(&mut h);
+    settings.extra.patches.linux_async_compute.hash(&mut h);
+    settings.extra.patches.linux_async_reprojection.hash(&mut h);
+    // Encoder / codec
+    (settings.video.preferred_codec as u8).hash(&mut h);
+    (enc.h264_profile as u32).hash(&mut h);
+    (enc.rate_control_mode as u32).hash(&mut h);
+    enc.filler_data.hash(&mut h);
+    (enc.entropy_coding as u32).hash(&mut h);
+    (enc.quality_preset as u32).hash(&mut h);
+    enc.enable_vbaq.hash(&mut h);
+    enc.use_10bit.hash(&mut h);
+    enc.encoding_gamma.map(f32::to_bits).hash(&mut h);
+    enc.software.force_software_encoding.hash(&mut h);
+    enc.software.thread_count.hash(&mut h);
+    // HDR
+    hdr.enable.hash(&mut h);
+    hdr.force_hdr_srgb_correction.hash(&mut h);
+    hdr.clamp_hdr_extended_range.hash(&mut h);
+    // AMF
+    amf.enable_pre_analysis.hash(&mut h);
+    amf.enable_hmqb.hash(&mut h);
+    amf.use_preproc.hash(&mut h);
+    amf.preproc_sigma.hash(&mut h);
+    amf.preproc_tor.hash(&mut h);
+    // NVENC
+    (nvenc.quality_preset as u32).hash(&mut h);
+    (nvenc.tuning_preset as u32).hash(&mut h);
+    (nvenc.multi_pass as u32).hash(&mut h);
+    (nvenc.adaptive_quantization_mode as u32).hash(&mut h);
+    nvenc.low_delay_key_frame_scale.hash(&mut h);
+    nvenc.refresh_rate.hash(&mut h);
+    nvenc.enable_intra_refresh.hash(&mut h);
+    nvenc.intra_refresh_period.hash(&mut h);
+    nvenc.intra_refresh_count.hash(&mut h);
+    nvenc.max_num_ref_frames.hash(&mut h);
+    nvenc.gop_length.hash(&mut h);
+    nvenc.p_frame_strategy.hash(&mut h);
+    nvenc.rate_control_mode.hash(&mut h);
+    nvenc.rc_buffer_size.hash(&mut h);
+    nvenc.rc_initial_delay.hash(&mut h);
+    nvenc.rc_max_bitrate.hash(&mut h);
+    nvenc.rc_average_bitrate.hash(&mut h);
+    nvenc.enable_weighted_prediction.hash(&mut h);
+    // Foveated encoding
+    enable_foveated_encoding.hash(&mut h);
+    foveation_center_size_x.to_bits().hash(&mut h);
+    foveation_center_size_y.to_bits().hash(&mut h);
+    foveation_center_shift_x.to_bits().hash(&mut h);
+    foveation_center_shift_y.to_bits().hash(&mut h);
+    foveation_edge_ratio_x.to_bits().hash(&mut h);
+    foveation_edge_ratio_y.to_bits().hash(&mut h);
+    // Color correction
+    enable_color_correction.hash(&mut h);
+    brightness.to_bits().hash(&mut h);
+    contrast.to_bits().hash(&mut h);
+    saturation.to_bits().hash(&mut h);
+    gamma.to_bits().hash(&mut h);
+    sharpening.to_bits().hash(&mut h);
+    // Controllers
+    controllers_enabled.hash(&mut h);
+    controller_is_tracker.hash(&mut h);
+    controller_profile.hash(&mut h);
+    use_separate_hand_trackers.hash(&mut h);
+    // Body tracking
+    body_tracking_vive_enabled.hash(&mut h);
+    body_tracking_has_legs.hash(&mut h);
+    // Misc
+    settings.connection.minimum_idr_interval_ms.hash(&mut h);
+    settings.extra.capture.capture_frame_dir.hash(&mut h);
+    settings.video.bitrate.image_corruption_fix.hash(&mut h);
+    // Debug groups
+    dbg.server_impl.hash(&mut h);
+    dbg.client_impl.hash(&mut h);
+    dbg.server_core.hash(&mut h);
+    dbg.client_core.hash(&mut h);
+    dbg.connection.hash(&mut h);
+    dbg.sockets.hash(&mut h);
+    dbg.server_gfx.hash(&mut h);
+    dbg.client_gfx.hash(&mut h);
+    dbg.encoder.hash(&mut h);
+    dbg.decoder.hash(&mut h);
+
+    h.finish()
 }
 
 // Alternate connection trials with manual IPs and clients discovered on the local network
@@ -521,9 +537,9 @@ fn try_connect(
 ) -> ConResult {
     dbg_connection!("try_connect: Finding client and creating control socket");
 
-    let (proto_socket, client_ip) = ProtoControlSocket::connect_to(
+    let (socket, client_ip, connection_result) = alvr_sockets::connect_to_client(
+        client_ips.keys().cloned().collect(),
         Duration::from_secs(1),
-        PeerType::AnyClient(client_ips.keys().cloned().collect()),
     )?;
 
     let Some(client_hostname) = client_ips.remove(&client_ip) else {
@@ -564,7 +580,8 @@ fn try_connect(
             if let Err(e) = connection_pipeline(
                 Arc::clone(&ctx),
                 lifecycle_state,
-                proto_socket,
+                socket,
+                connection_result,
                 client_hostname.clone(),
                 client_ip,
             ) {
@@ -592,7 +609,8 @@ fn try_connect(
 fn connection_pipeline(
     ctx: Arc<ConnectionContext>,
     lifecycle_state: Arc<RwLock<LifecycleState>>,
-    mut proto_socket: ProtoControlSocket,
+    socket: ProtoControlSocket,
+    connection_result: ClientConnectionResult,
     client_hostname: String,
     client_ip: IpAddr,
 ) -> ConResult {
@@ -612,21 +630,6 @@ fn connection_pipeline(
         client_hostname.clone(),
         ClientConnectionsAction::UpdateCurrentIp(Some(client_ip)),
     );
-
-    let disconnect_notif = Arc::new(Condvar::new());
-
-    dbg_connection!("connection_pipeline: Getting client status packet");
-    let connection_result = match proto_socket.recv(HANDSHAKE_ACTION_TIMEOUT) {
-        Ok(r) => r,
-        Err(ConnectionError::TryAgain(e)) => {
-            debug!(
-                "Failed to recive client connection packet. This is normal for USB connection.\n{e}"
-            );
-
-            return Ok(());
-        }
-        Err(e) => return Err(e),
-    };
 
     let maybe_streaming_caps =
         if let ClientConnectionResult::ConnectionAccepted(info) = connection_result {
@@ -654,8 +657,6 @@ fn connection_pipeline(
     let Some(streaming_caps) = maybe_streaming_caps else {
         con_bail!("Only streaming clients are supported for now");
     };
-
-    dbg_connection!("connection_pipeline: setting up negotiated streaming config");
 
     let initial_settings = session_manager_lock.settings().clone();
 
@@ -743,18 +744,88 @@ fn connection_pipeline(
         warn!("Chosen refresh rate not supported. Using {fps}Hz");
     }
 
-    let enable_foveated_encoding =
-        if let Switch::Enabled(config) = &initial_settings.video.foveated_encoding {
-            let enable = streaming_caps.foveated_encoding || config.force_enable;
+    let foveated_encoding = if let Switch::Enabled(config) =
+        &initial_settings.video.foveated_encoding
+    {
+        if streaming_caps.foveated_encoding || config.force_enable {
+            let mut params = AlvrFoveatedEncodingParams {
+                edge_ratio: config.edge_ratio,
+                ..Default::default()
+            };
 
-            if !enable {
-                warn!("Foveated encoding is not supported by the client.");
+            for (axis, resolution) in transcoding_view_resolution
+                .to_array()
+                .into_iter()
+                .enumerate()
+            {
+                let resolution = resolution as f32;
+                // # Safety: `axis` comes from a two-element resolution array, and each
+                // configuration array also contains exactly two axes.
+                let (center_size, center_shift, edge_ratio) = (
+                    config.center_size[axis],
+                    config.center_shift[axis],
+                    config.edge_ratio[axis],
+                );
+                let edge_size = resolution - center_size * resolution;
+
+                // Preserve the existing C++ encoder's operation order and double intermediates.
+                let center_size = (1.0
+                    - (edge_size as f64 / (edge_ratio as f64 * 2.0)).ceil()
+                        * (edge_ratio as f64 * 2.0)
+                        / resolution as f64) as f32;
+                let edge_size = resolution - center_size * resolution;
+                let center_shift = if !center_shift.is_finite()
+                    || !edge_size.is_finite()
+                    || !edge_ratio.is_finite()
+                    || edge_size <= 0.0
+                    || edge_ratio <= 0.0
+                {
+                    0.0
+                } else {
+                    let step = edge_ratio * 2.0 / edge_size;
+                    if !step.is_finite() || step >= 1.0 {
+                        0.0
+                    } else {
+                        // Reserve one alignment step on each edge to avoid singular inverse coefficients.
+                        // Do not replace this with division by `step`: f32 rounding can change the ceiling.
+                        let aligned = (center_shift * edge_size / (edge_ratio * 2.0)).ceil()
+                            * (edge_ratio * 2.0)
+                            / edge_size;
+
+                        aligned.clamp(-1.0 + step, 1.0 - step)
+                    }
+                };
+
+                let scale =
+                    (center_size as f64 + (1.0 - center_size as f64) / edge_ratio as f64) as f32;
+                let optimized_resolution = scale * resolution;
+                let encoded_resolution = (optimized_resolution / 32.0).ceil() as u32 * 32;
+
+                // # Safety: `axis` is 0 or 1; all output axis arrays and the eye array have length 2.
+                (
+                    params.encoded_view_resolution[axis],
+                    params.view_ratio[axis],
+                    params.center_size[axis],
+                    params.center_shifts[0][axis],
+                    params.center_shifts[1][axis],
+                ) = (
+                    encoded_resolution,
+                    optimized_resolution / encoded_resolution as f32,
+                    center_size,
+                    center_shift,
+                    center_shift,
+                );
             }
 
-            enable
+            Some(params)
         } else {
-            false
-        };
+            warn!("Foveated encoding is not supported by the client.");
+
+            None
+        }
+    } else {
+        None
+    };
 
     let encoder_profile = if initial_settings.video.encoder_config.h264_profile == H264Profile::High
     {
@@ -850,11 +921,11 @@ fn connection_pipeline(
     dbg_connection!("connection_pipeline: send streaming config");
     let stream_config_packet = StreamConfigPacket::new(
         session_manager_lock.session(),
-        NegotiatedStreamingConfig {
+        ClientNegotiatedStreamingConfig {
             view_resolution: transcoding_view_resolution,
             refresh_rate_hint: fps,
             game_audio_sample_rate,
-            enable_foveated_encoding,
+            foveated_encoding,
             encoding_gamma,
             enable_hdr,
             wired,
@@ -863,42 +934,52 @@ fn connection_pipeline(
         .with_ext(NegotiatedStreamingConfigExt {}),
     )
     .to_con()?;
-    proto_socket.send(&stream_config_packet).to_con()?;
 
-    let (mut control_sender, mut control_receiver) =
-        proto_socket.split(STREAMING_RECV_TIMEOUT).to_con()?;
+    let new_steamvr_hmd_init_config = SteamvrHmdInitConfig {
+        eye_resolution_width: transcoding_view_resolution.x,
+        eye_resolution_height: transcoding_view_resolution.y,
+        target_eye_resolution_width: emulated_headset_view_resolution.x,
+        target_eye_resolution_height: emulated_headset_view_resolution.y,
+        refresh_rate: fps as _,
+    };
+    let new_hash = compute_restart_settings_hash(&new_steamvr_hmd_init_config, &initial_settings);
+    if session_manager_lock.session().restart_settings_hash != new_hash {
+        let mut session = session_manager_lock.session_mut();
+        session.steamvr_hmd_init_config = new_steamvr_hmd_init_config;
+        session.restart_settings_hash = new_hash;
 
-    let mut new_openvr_config = contruct_openvr_config(session_manager_lock.session());
-    new_openvr_config.eye_resolution_width = transcoding_view_resolution.x;
-    new_openvr_config.eye_resolution_height = transcoding_view_resolution.y;
-    new_openvr_config.target_eye_resolution_width = emulated_headset_view_resolution.x;
-    new_openvr_config.target_eye_resolution_height = emulated_headset_view_resolution.y;
-    new_openvr_config.refresh_rate = fps as _;
-    new_openvr_config.enable_foveated_encoding = enable_foveated_encoding;
-    new_openvr_config.h264_profile = encoder_profile as _;
-    new_openvr_config.use_10bit_encoder = enable_10_bits_encoding;
-    new_openvr_config.enable_hdr = enable_hdr;
-    new_openvr_config.encoding_gamma = encoding_gamma;
-    new_openvr_config.codec = codec as _;
-
-    if session_manager_lock.session().openvr_config != new_openvr_config {
-        session_manager_lock.session_mut().openvr_config = new_openvr_config;
-
-        control_sender.send(&ServerControlPacket::Restarting).ok();
+        alvr_sockets::send_restart_signal(socket, stream_config_packet)?;
 
         crate::notify_restart_driver();
+
+        *lifecycle_state.write() = LifecycleState::ShuttingDown;
+
+        return Ok(());
     }
 
-    dbg_connection!("connection_pipeline: Send StartStream packet");
-    control_sender
-        .send(&ServerControlPacket::StartStream)
-        .to_con()?;
+    let stream_protocol = if wired {
+        SocketProtocol::Tcp
+    } else {
+        initial_settings.connection.stream_protocol
+    };
 
-    let signal = control_receiver.recv(HANDSHAKE_ACTION_TIMEOUT)?;
-    if !matches!(signal, ClientControlPacket::StreamReady) {
-        con_bail!("Got unexpected packet waiting for stream ack");
-    }
-    dbg_connection!("connection_pipeline: Got StreamReady packet");
+    dbg_connection!("connection_pipeline: Finishing handshake");
+    let mut socket = SocketConnection::from_client_connection(
+        socket,
+        HANDSHAKE_ACTION_TIMEOUT,
+        stream_config_packet,
+        StreamSocketConfig {
+            protocol: stream_protocol,
+            port: initial_settings.connection.stream_port,
+            buffer_config: initial_settings.connection.server_buffer_config,
+            max_packet_size: initial_settings.connection.packet_size as _,
+            dscp: initial_settings.connection.dscp,
+        },
+    )?;
+
+    dbg_connection!("connection_pipeline: Handshake successful, spawning threads");
+
+    let disconnect_notif = Arc::new(Condvar::new());
 
     *ctx.statistics_manager.write() = Some(StatisticsManager::new(
         initial_settings.connection.statistics_history_size,
@@ -909,38 +990,25 @@ fn connection_pipeline(
             0.0
         },
     ));
-
     *ctx.bitrate_manager.lock() =
         BitrateManager::new(initial_settings.video.bitrate.history_size, fps);
+    *ctx.tracking_manager.write() =
+        TrackingManager::new(initial_settings.connection.statistics_history_size);
 
-    let stream_protocol = if wired {
-        SocketProtocol::Tcp
-    } else {
-        initial_settings.connection.stream_protocol
-    };
+    let control_sender = Arc::new(Mutex::new(socket.request_reliable_stream()?));
+    let mut video_sender = socket.request_unreliable_stream(VIDEO);
+    let game_audio_sender: alvr_sockets::StreamSender<()> = socket.request_unreliable_stream(AUDIO);
+    let haptics_sender = socket.request_unreliable_stream(HAPTICS);
 
-    dbg_connection!("connection_pipeline: StreamSocket connect_to_client");
-    let mut stream_socket = StreamSocketBuilder::connect_to_client(
-        HANDSHAKE_ACTION_TIMEOUT,
-        client_ip,
-        initial_settings.connection.stream_port,
-        stream_protocol,
-        initial_settings.connection.dscp,
-        initial_settings.connection.server_buffer_config,
-        initial_settings.connection.packet_size as _,
-    )?;
-
-    let mut video_sender = stream_socket.request_stream(VIDEO);
     let mut screen_video_sender =
-        stream_socket.request_stream::<ScreenVideoPacketHeader>(SCREEN_VIDEO);
-    let game_audio_sender: alvr_sockets::StreamSender<()> = stream_socket.request_stream(AUDIO);
+        socket.request_unreliable_stream::<ScreenVideoPacketHeader>(SCREEN_VIDEO);
+    let mut control_receiver = socket.subscribe_to_reliable_stream()?;
     let mut microphone_receiver: alvr_sockets::StreamReceiver<()> =
-        stream_socket.subscribe_to_stream(AUDIO, MAX_UNREAD_PACKETS);
+        socket.subscribe_to_unreliable_stream(AUDIO, MAX_UNREAD_PACKETS);
     let tracking_receiver =
-        stream_socket.subscribe_to_stream::<TrackingData>(TRACKING, MAX_UNREAD_PACKETS);
-    let haptics_sender = stream_socket.request_stream(HAPTICS);
+        socket.subscribe_to_unreliable_stream::<TrackingData>(TRACKING, MAX_UNREAD_PACKETS);
     let mut statics_receiver =
-        stream_socket.subscribe_to_stream::<ClientStatistics>(STATISTICS, MAX_UNREAD_PACKETS);
+        socket.subscribe_to_unreliable_stream::<ClientStatistics>(STATISTICS, MAX_UNREAD_PACKETS);
 
     let (video_channel_sender, video_channel_receiver) =
         std::sync::mpsc::sync_channel(initial_settings.connection.max_queued_server_video_frames);
@@ -975,7 +1043,7 @@ fn connection_pipeline(
         }
     });
 
-    #[cfg_attr(target_os = "linux", allow(unused_variables))]
+    #[cfg_attr(target_os = "linux", expect(unused_variables))]
     let game_audio_thread = if let Switch::Enabled(config) =
         initial_settings.audio.game_audio.clone()
     {
@@ -1128,23 +1196,14 @@ fn connection_pipeline(
         }
     };
 
-    *ctx.tracking_manager.write() =
-        TrackingManager::new(initial_settings.connection.statistics_history_size);
-    let hand_gesture_manager = Arc::new(Mutex::new(HandGestureManager::new()));
-
     let tracking_receive_thread = thread::spawn({
         let ctx = Arc::clone(&ctx);
-        let hand_gesture_manager = Arc::clone(&hand_gesture_manager);
         let initial_settings = initial_settings.clone();
         let client_hostname = client_hostname.clone();
         move || {
-            tracking::tracking_loop(
-                &ctx,
-                initial_settings,
-                hand_gesture_manager,
-                tracking_receiver,
-                || is_streaming(&client_hostname),
-            );
+            tracking::tracking_loop(&ctx, initial_settings, tracking_receiver, || {
+                is_streaming(&client_hostname)
+            });
         }
     });
 
@@ -1182,8 +1241,6 @@ fn connection_pipeline(
             }
         }
     });
-
-    let control_sender = Arc::new(Mutex::new(control_sender));
 
     // Scene mode from the overlay app's native quads block (written by the screen thread): a
     // scene app (V3, full VR) is presenting, so passthrough and chroma key are turned off
@@ -1630,7 +1687,7 @@ fn connection_pipeline(
         let client_hostname = client_hostname.clone();
         move || {
             while is_streaming(&client_hostname) {
-                match stream_socket.recv() {
+                match socket.recv_poll() {
                     Ok(()) => (),
                     Err(ConnectionError::TryAgain(_)) => continue,
                     Err(e) => {
@@ -1663,22 +1720,19 @@ fn connection_pipeline(
         }
     });
 
-    {
-        if initial_settings.connection.enable_on_connect_script {
-            let on_connect_script = FILESYSTEM_LAYOUT.get().map(|l| l.connect_script()).unwrap();
-            info!(
-                "Running on connect script (connect): {}",
-                on_connect_script.display()
-            );
-            if let Err(e) = Command::new(&on_connect_script)
-                .env("ACTION", "connect")
-                .spawn()
-            {
-                warn!("Failed to run connect script: {e}");
-            }
+    if initial_settings.connection.enable_on_connect_script {
+        let on_connect_script = FILESYSTEM_LAYOUT.get().map(|l| l.connect_script()).unwrap();
+        info!(
+            "Running on connect script (connect): {}",
+            on_connect_script.display()
+        );
+        if let Err(e) = Command::new(&on_connect_script)
+            .env("ACTION", "connect")
+            .spawn()
+        {
+            warn!("Failed to run connect script: {e}");
         }
     }
-
     if initial_settings.extra.capture.startup_video_recording {
         info!("Creating recording file");
         crate::create_recording_file(&ctx, session_manager_lock.settings());
@@ -1690,10 +1744,22 @@ fn connection_pipeline(
     );
 
     ctx.events_sender
-        .send(ServerCoreEvent::ClientConnected)
+        .send(ServerCoreEvent::ClientConnected(
+            ServerNegotiatedStreamingConfig {
+                transcoding_view_resolution,
+                emulated_headset_view_resolution: transcoding_view_resolution,
+                refresh_rate: fps as _,
+                foveated_encoding,
+                codec,
+                h264_profile: encoder_profile,
+                use_10bit_encoder: enable_10_bits_encoding,
+                encoding_gamma,
+                enable_hdr,
+            },
+        ))
         .ok();
 
-    dbg_connection!("connection_pipeline: handshake finished; unlocking streams");
+    dbg_connection!("connection_pipeline: Threads initialized; unlocking streams");
     alvr_common::wait_rwlock(&disconnect_notif, &mut session_manager_lock);
     dbg_connection!("connection_pipeline: Begin connection shutdown");
 

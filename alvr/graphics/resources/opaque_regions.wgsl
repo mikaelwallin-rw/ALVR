@@ -5,7 +5,7 @@
 struct PushConstant {
     reprojection_transform: mat4x4f,
 }
-var<push_constant> pc: PushConstant;
+var<immediate> pc: PushConstant;
 
 struct VertexOutput {
     @builtin(position) position: vec4f,

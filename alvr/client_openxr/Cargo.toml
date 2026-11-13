@@ -2,7 +2,6 @@
 name = "alvr_client_openxr"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 
@@ -18,7 +17,7 @@ alvr_session.workspace = true
 alvr_system_info.workspace = true
 
 jni = "0.22"
-glow = "0.16"
+glow = "0.17.0" # Same version as alvr_graphics (wgpu)
 jpeg-encoder = "0.7"
 openxr = "0.21"
 png = "0.17"
