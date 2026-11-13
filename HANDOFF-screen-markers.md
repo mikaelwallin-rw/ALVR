@@ -6,6 +6,43 @@ is `D:\wkspaces\ScreenVR\TASKS.md`. **The ScreenVR <-> ALVR interface (shared me
 files, compatibility) is described ONLY in `D:\wkspaces\ScreenVR\docs\AlvrInterface.md`.**
 
 Sections below "Deployed (2026-11-11)" are dated history; where they disagree, the newer section wins.
+The cleanup of 2026-11-13 (next section) removed most debug switches and workarounds described in that
+history.
+
+## Cleanup 2026-11-13 (committed locally, NOT deployed)
+
+Cleanup plan `D:\wkspaces\ScreenVR\docs\CleanupPlan-2026-11-11.md` section 4, ALVR steps 4, 5 and 6, one
+commit each (so step 6 can be dropped). Background: this code was written around SecureMR's wrong camera pose;
+since 2026-11-11 PICO's own camera extrinsics are used and none of the workarounds is needed.
+
+- **Step 4 (client only, the APK can be installed alone):**
+  - Camera extrinsics: PICO's capture-library set is the only table (`CAMERA_EXTRINSICS` in
+    `camera_frames.rs`, keyed by `Build.PRODUCT`). Removed: the hand-eye fitted set (values kept as a comment),
+    `screenvr_camera_extrinsics.txt`, and the fallback to SecureMR's own camera pose. **Unknown headset model:
+    no camera frames** and one error line per camera pass (`CAMERA_EXTRINSICS UNKNOWN MODEL: ...`). One
+    `CAMERA_EXTRINSICS model=... left (...) | right (...)` line per pass. `CAMPOSE_DIAG` removed;
+    `CAMPOSE_DIFF` (SecureMR's pose minus ours) once per pass. Reading the extrinsics per headset at runtime
+    is a separate, later task.
+  - Removed: the `XR_PICO_camera_image` probe (`camera_image_probe.rs`, `screenvr_camera_probe.txt`; it had
+    been committed in `5be46d3f`), the projected passthrough prototype (`passthrough_fb.rs` is upstream again,
+    `XR_FB_triangle_mesh` no longer requested), and the switches `screenvr_display_time.txt`,
+    `screenvr_quad_settings.txt`, `screenvr_stall.txt`, `screenvr_stream_wait.txt`,
+    `screenvr_stream_unused.txt`, `screenvr_key_probe.txt` (the key colour probe itself stays),
+    `screenvr_projected_passthrough.txt`, `screenvr_fake_hands.txt`, and the `screenvr_hands.txt` keys
+    `fingers`, `girth`, `display_transform`. Tools `campose_analyze.py`, `campose_passes.py` removed
+    (`motion_test.py` stays).
+  - Kept as they are: `thickness`/`scale` in `screenvr_hands.txt`, `screenvr_hands_scale.txt`,
+    `screenvr_hands_msaa.txt` (user decision 2026-11-11: drawn hand size stays), `screenvr_video_path.txt`,
+    `screenvr_loading*.txt`, `screenvr_refmarkers.txt` (displayed-view check of new models). The crash-loop
+    guard stays; it can no longer change the camera pose (no switch affects the camera frames).
+
+### Headset switch files after the cleanup (`/sdcard/Android/data/alvr.client.dev/files`; table in AlvrInterface.md)
+
+Read every second (`debug_switches.rs`): `screenvr_video_path.txt`, `screenvr_hands_scale.txt`,
+`screenvr_hands_msaa.txt`, `screenvr_hands.txt` (`thickness`, `scale`), `screenvr_loading.txt`,
+`screenvr_loading_preview.txt`, `screenvr_refmarkers.txt`. Written by the client:
+`screenvr_switches_applied.txt` (crash-loop guard), `screenvr_stage.txt` (stage identity state; product
+state), `screenvr_tracking_diag.log` (+ `.1`).
 
 ## Commits (on `feature/screen-markers`, NOT pushed)
 
@@ -47,22 +84,14 @@ licence).
   (diagnostics build, before 1367d3f0), `.bak-b51e35d1` (PICO default), `.bak-146b41f6`, `.bak-41853163`,
   `.bak-0cb31ce8`. Candidates kept: `alvr_client.apk.candidate-*`, `driver_candidate_*`.
 
-### Headset switch files (`/sdcard/Android/data/alvr.client.dev/files`; table in AlvrInterface.md)
-
-Read every second (`debug_switches.rs`): `screenvr_display_time.txt`, `screenvr_quad_settings.txt`,
-`screenvr_video_path.txt`, `screenvr_stall.txt`, `screenvr_stream_wait.txt`, `screenvr_stream_unused.txt`,
-`screenvr_hands_scale.txt`, `screenvr_hands_msaa.txt`, `screenvr_key_probe.txt`, `screenvr_loading.txt`,
-`screenvr_loading_preview.txt`, `screenvr_projected_passthrough.txt`, `screenvr_hands.txt`,
-`screenvr_refmarkers.txt`, `screenvr_fake_hands.txt`, `screenvr_camera_probe.txt` (test only),
-`screenvr_camera_extrinsics.txt` (`fit` = legacy A/B). Written by the client: `screenvr_switches_applied.txt`
-(crash-loop guard), `screenvr_stage.txt` (stage identity state; product state), `screenvr_tracking_diag.log`
-(+ `.1`; pull with `adb pull /sdcard/Android/data/alvr.client.dev/files/screenvr_tracking_diag.log`).
+Headset switch files as deployed on 2026-11-11: see the cleanup section above for the ones that remain.
+Tracking diagnostics: `adb pull /sdcard/Android/data/alvr.client.dev/files/screenvr_tracking_diag.log`.
 
 ### Superseded findings (kept below as history; do not act on them)
 
 - The hand-eye **fitted** extrinsics (`CAMERA_EXTRINSICS`, "Key finding" section) are known wrong (SecureMR
   camera pose ~40 mm too high / ~34 mm too far back, wrong roll sign): they were a cause of the misalignment.
-  Default is PICO's own set; `fit` is A/B only.
+  PICO's own set is the only set since the 2026-11-13 cleanup.
 - **Stage identity and the persistent anchor are unreliable** as "STAGE moved" evidence on PICO: the anchor
   moves with a re-created origin and the identity said "unchanged" through every re-creation.
 - **The tracking origin is re-created at the head whenever head position tracking is lost and comes back**
@@ -131,10 +160,9 @@ Spec + assets: `client_openxr/loading_assets/` (loading-spec.txt v1 copied from 
 - sRGB: swapchains are SRGB8_ALPHA8 → brand bytes uploaded unchanged (unit test); UNORM fallback
   linearizes. On-display values still to check on the stand (screencap of the Ocean background).
 - Key colour check: unchanged decisions; the 16×16 readback now happens right after the staging copy,
-  before the stream pass is queued (the stall waits for the copy only). Switch
-  `screenvr_key_probe.txt` = `off` (measurement only: magenta is shown again) and log
-  `Key probe on|off: N frames ..., stream render() mean/max us` every 5 s; stand script
-  `scratchpad\loading\measure_probe.sh` (60 s on/off × 3 with PxrMetric).
+  before the stream pass is queued (the stall waits for the copy only). Log
+  `Key probe: N frames ..., stream render() mean/max us` every 5 s while probing (the `off` switch was
+  removed 2026-11-13).
 
 ### Displayed-view calibration: stand proof (18:02–18:09, APK 0cb31ce8 + driver c5401609)
 
@@ -213,7 +241,7 @@ Spec + assets: `client_openxr/loading_assets/` (loading-spec.txt v1 copied from 
   a real finger); the mesh tip ends at the INDEX_TIP joint (0.5 mm beyond it). Tracked wrist→middle tip
   18.0–19.1 cm (logs), mesh 17.9 cm. Real fingertips extend beyond the drawn ones.
 
-### Installed 14:51:21: APK 0b651677 = cd0b03d2 + projected passthrough PROTOTYPE (switch, default off)
+### Installed 14:51:21: APK 0b651677 = cd0b03d2 + projected passthrough PROTOTYPE (switch, default off; prototype REMOVED 2026-11-13)
 
 - Rollback: `alvr_client.apk.bak-cd0b03d2` (no prototype). `.bak-a0553304` = first prototype build
   with the passthrough-breaking bug below (do not use).
@@ -408,8 +436,8 @@ Spec + assets: `client_openxr/loading_assets/` (loading-spec.txt v1 copied from 
     fingertips, 0.1 rad margin); logged as `Native hands: in view`.
   - Ring of 3 skinned vertex buffers (it made no measurable difference, but it avoids rewriting a
     buffer that may still be in use).
-  - The synthetic test hand (`screenvr_fake_hands.txt`) is now placed 35 cm in front of the head,
-    in view.
+  - The synthetic test hand (`screenvr_fake_hands.txt`, removed 2026-11-13) was placed 35 cm in front
+    of the head, in view.
   - Measured on the stand (hand in view, GPU busy at a fixed 456–492 MHz; no hand = 64 %):
     0.5/4x 82–86 % (≈ +2.4 ms); 0.7/2x 84 %; 0.5/2x 79 %; 0.35/2x 74 %; 0.7/1x 72 %; 0.5/1x
     70–71 % (≈ +0.7 ms).
@@ -444,7 +472,7 @@ Spec + assets: `client_openxr/loading_assets/` (loading-spec.txt v1 copied from 
     (statistics and server pacing unchanged). When the flag clears, the next frame renders the
     stream again (no IDR wait).
   - Logs: server `Stream unused flag on|off`, client `Stream unused: skipping|rendering the stream`.
-  - Switch: `screenvr_stream_unused.txt` = `ignore` renders the stream anyway.
+  - Switch `screenvr_stream_unused.txt` = `ignore` (removed 2026-11-13) rendered the stream anyway.
   - Measured on the stand (zero copy, no hand): app GPU 6.78 → 0.74 ms, compositor 5.53 → 4.45 ms,
     GPU busy 85 → 66 %, late frames 28 → 1 per second.
   - With the synthetic hand, GPU busy drops 94 → 84 % (zero copy) and 96 → 83 % (mipmapped). App
@@ -483,8 +511,8 @@ Spec + assets: `client_openxr/loading_assets/` (loading-spec.txt v1 copied from 
   - Crash-loop guard in `debug_switches.rs`: non-default switches write
     `screenvr_switches_applied.txt`; a start less than 60 s after the same switches were applied
     ignores the files (logged) until they change. Tested.
-  - TEST-ONLY switch `screenvr_fake_hands.txt` = 1: draws a synthetic left hand so that the hands
-    uploads run on an unworn headset.
+  - TEST-ONLY switch `screenvr_fake_hands.txt` = 1 (removed 2026-11-13): drew a synthetic left hand so
+    that the hands uploads ran on an unworn headset.
   - Soak test: mipmapped + synthetic hand for about 6 min, no crash, GL error 0. Mipmapped screens
     are upright and the colours match zero copy (screencap).
   - Rollback: `alvr_client.apk.bak-cd0cd6a2`.
@@ -503,16 +531,11 @@ Spec + assets: `client_openxr/loading_assets/` (loading-spec.txt v1 copied from 
 ### Debug switches in the client (2026-11-10, uncommitted, `client_openxr/src/native_quads.rs`)
 
 These are files in the app's external files dir, polled once a second. No reconnect is needed, and
-every flip is logged. Git Bash: `export MSYS_NO_PATHCONV=1`.
-- **Display time A/B** (the "screens swim" investigation):
-  - On: `adb shell "echo predicted > /sdcard/Android/data/alvr.client.dev/files/screenvr_display_time.txt"`
-  - Off: `adb shell rm -f /sdcard/Android/data/alvr.client.dev/files/screenvr_display_time.txt`
-  - While native quads exist, ON makes `xrEndFrame` use `frame_state.predicted_display_time` instead
-    of the stream frame's timestamp (upstream behaviour).
-  - Log: `Native quads: display time mode PREDICTED|STREAM`, and once a second
-    `stream timestamp - predicted display time: min/mean/max`.
-  - Main stream: if PICO derives the projection layer's render pose from displayTime, ON makes the
-    stream itself swim. Do not leave it on for V3 unchecked.
+every flip is logged. Git Bash: `export MSYS_NO_PATHCONV=1`. The display time, quad settings, stall and
+stream wait switches below were removed on 2026-11-13; only the video path switch remains.
+- **Display time A/B** (the "screens swim" investigation; switch `screenvr_display_time.txt` removed):
+  `predicted` made `xrEndFrame` use `frame_state.predicted_display_time` instead of the stream frame's
+  timestamp (upstream behaviour) while native quads existed.
 - **Newest candidate, BUILT, NOT INSTALLED: APK cd0cd6a2** =
   `C:\Tenstar\VR\Pico\alvr\alvr_client.apk.candidate-cd0cd6a2`. It is adc49f8d plus:
   - A new switch, `screenvr_stream_wait.txt` = fraction of the frame interval the render loop waits
@@ -733,28 +756,22 @@ Git Bash: `export MSYS_NO_PATHCONV=1` before adb commands with `/sdcard/...` pat
 - Fix: `stage_from_camera = stage_from_view(capture time) · view_from_camera[eye]` with extrinsics from a
   table keyed by Android product name: `CAMERA_EXTRINSICS` in `alvr/client_openxr/src/camera_frames.rs`.
   - Only `"PICO 4 Ultra Enterprise"` is in it (ALVR's `Platform` maps this headset to `PicoUnknown`).
-  - Left (-3.215, +3.904, -3.495) cm, right (+3.197, +3.816, -3.514) cm, rotation roll -0.79°,
-    pitch +0.66°, baseline 64.1 mm. Stable to 0.1 mm across both regimes (hand-eye fit, 0.2 mm residual).
-  - Other models fall back to the SecureMR pose, with a warning in logcat.
+  - The values here (hand-eye fit) were replaced by PICO's own extrinsics on 2026-11-11; the fit is gone
+    since 2026-11-13. Other models get no camera frames (error line in logcat), not the SecureMR pose.
 - Monitoring: once per camera pass the client logs
   `CAMPOSE_DIFF eye=Left securemr - extrinsics: position (x, y, z) cm (|d| cm), rotation r deg`.
-  ~0 cm = LOCALs agree; ~8.7 cm = the mismatch is back (harmless now, but worth noting).
+  With PICO's set it shows SecureMR's own pose error (~5 cm) plus any LOCAL mismatch (~8.7 cm).
 
 ## Diagnostics
 
 - **Logcat**: the Pico main buffer rotates in seconds. Stream it to a file before the event:
   `adb -s PA94Y0MGJ9180002G logcat -T 1 > logcat.txt` (keep it running; reinstalling the APK can kill it).
-- **Log tags**: `CAMPOSE_DIAG` (raw poses, first 10 frames of each camera pass), `CAMPOSE_DIFF`,
+- **Log tags**: `CAMERA_EXTRINSICS` (model and values, once per camera pass), `CAMPOSE_DIFF`,
   `Camera frames:`, `Native quads:`, `XR_DIAG` (extensions at session start). Server side
   (`C:\Tenstar\VR\Pico\alvr\pc\session_log.txt`): `Tracking extras:`, `Native quads:`,
   `Camera frames request sent`.
-- **Scripts** (`tools/screen_markers/`, need numpy):
-  - `python campose_passes.py campose_analyze.py logcat.txt`: per CAMPOSE_DIAG line, the camera position
-    in VIEW (cm). Worn and correct: (-3.2, +3.9, -3.5) for the left eye. Only meaningful when the LOCALs
-    agree (it trusts the app's LOCAL).
-  - `python campose_analyze.py logcat.txt`: per eye, H1 (constant C?) and H2 hand-eye fit (needs head
-    rotation in the pass). H2 recovers view_from_camera and SecureMR's LOCAL in STAGE regardless of the
-    mismatch; this is how the bug was found.
+- **Scripts** (`tools/screen_markers/`): `motion_test.py` (quad vs real motion, see above). The CAMPOSE
+  hand-eye tools were removed on 2026-11-13 (with `CAMPOSE_DIAG`); they are in git history (`13faa49c`).
 
 ## Contracts
 

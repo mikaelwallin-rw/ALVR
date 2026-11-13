@@ -252,8 +252,6 @@ pub fn entry_point() {
     selected_exts.fb_foveation = true;
     selected_exts.fb_foveation_configuration = true;
     selected_exts.fb_passthrough = true;
-    // Projected passthrough prototype (screenvr_projected_passthrough.txt)
-    selected_exts.fb_triangle_mesh = true;
     selected_exts.fb_swapchain_update_state = true;
     selected_exts.htc_facial_tracking = true;
     selected_exts.htc_passthrough = true;
@@ -269,16 +267,6 @@ pub fn entry_point() {
     selected_exts.meta_body_tracking_full_body = true;
     selected_exts.meta_simultaneous_hands_and_controllers = true;
     selected_exts.meta_detached_controllers = true;
-    // DEBUG SWITCH screenvr_camera_probe.txt (TEST ONLY): XR_PICO_camera_image is requested only
-    // when the switch file exists at start-up, so that without it the instance is unchanged
-    // (extra_extensions/camera_image_probe.rs)
-    let mut camera_image_ext = extra_extensions::CameraImageExtensionState {
-        requested: debug_switches::camera_probe_requested_at_startup(),
-        ..Default::default()
-    };
-    if camera_image_ext.requested {
-        camera_image_ext.offered_version = extra_extensions::camera_image_extension_version(&xr_entry);
-    }
     selected_exts.other = [
         META_BODY_TRACKING_FIDELITY_EXTENSION_NAME,
         BD_MOTION_TRACKING_EXTENSION_NAME,
@@ -300,24 +288,15 @@ pub fn entry_point() {
         .into_iter()
             .map(|s| format!("{s}\0").into_bytes()),
     )
-    .chain(
-        camera_image_ext
-            .requested
-            .then(|| format!("{}\0", extra_extensions::CAMERA_IMAGE_EXTENSION_NAME).into_bytes()),
-    )
     .collect();
 
     selected_exts = selected_exts.intersection(&available_exts);
-    camera_image_ext.enabled = selected_exts
-        .other
-        .iter()
-        .any(|name| extra_extensions::is_camera_image_extension(name));
 
     let available_layers = xr_entry.enumerate_layers().unwrap();
     info!("OpenXR available layers: {available_layers:#?}");
 
-    let create_instance = |extensions: &xr::ExtensionSet| {
-        xr_entry.create_instance(
+    let xr_instance = xr_entry
+        .create_instance(
             &xr::ApplicationInfo {
                 application_name: "ALVR Client",
                 application_version: 0,
@@ -325,23 +304,10 @@ pub fn entry_point() {
                 engine_version: 0,
                 api_version: openxr_version,
             },
-            extensions,
+            &selected_exts,
             &[],
         )
-    };
-    let mut instance_result = create_instance(&selected_exts);
-    // The test-only camera extension must never keep the app from starting: retry without it
-    if let Err(e) = &instance_result
-        && camera_image_ext.enabled
-    {
-        camera_image_ext.instance_error = Some(*e);
-        camera_image_ext.enabled = false;
-        selected_exts
-            .other
-            .retain(|name| !extra_extensions::is_camera_image_extension(name));
-        instance_result = create_instance(&selected_exts);
-    }
-    let xr_instance = instance_result.unwrap();
+        .unwrap();
 
     let other_exts = selected_exts
         .other
@@ -372,8 +338,6 @@ pub fn entry_point() {
     let graphics_context = Rc::new(GraphicsContext::new_gl());
 
     let mut last_lobby_message = String::new();
-    // DEBUG SWITCH screenvr_camera_probe.txt: once per app start
-    let mut camera_probe_started = false;
 
     'session_loop: loop {
         let xr_system = xr_instance
@@ -404,9 +368,6 @@ pub fn entry_point() {
         }
         for name in &other_exts {
             info!("XR_DIAG extension enabled (other): {name}");
-        }
-        if camera_image_ext.requested {
-            extra_extensions::log_camera_image_extension(&camera_image_ext);
         }
 
         let views_config = xr_instance
@@ -501,7 +462,6 @@ pub fn entry_point() {
         let mut native_quads = NativeQuadLayers::default();
         let mut native_hands = None::<NativeHands>;
         let mut screen_video = ScreenVideoStreams::new(default_view_resolution.x);
-        let mut last_debug_stall = None::<Instant>;
         // Overlay app's flag (RealTimeConfig.ext_str): nothing of its own is in the stream
         let mut stream_unused_flag = false;
         let mut stream_skipped = false;
@@ -605,16 +565,6 @@ pub fn entry_point() {
             if !session_running {
                 thread::sleep(Duration::from_millis(100));
                 continue;
-            }
-
-            // DEBUG SWITCH screenvr_camera_probe.txt (TEST ONLY): one-shot log of PICO's camera
-            // extrinsics/intrinsics, on its own thread (extra_extensions/camera_image_probe.rs)
-            if !camera_probe_started
-                && camera_image_ext.requested
-                && crate::debug_switches::get().camera_probe
-            {
-                camera_probe_started = true;
-                extra_extensions::spawn_camera_probe(xr_session.clone(), camera_image_ext);
             }
 
             while let Some(event) = core_context.poll_event() {
@@ -826,14 +776,13 @@ pub fn entry_point() {
             }
 
             // todo: allow rendering lobby and stream layers at the same time and add cross fade
-            // Stream unused (overlay app's flag, unless the debug switch says to ignore it): no stream
-            // pass and no stream layer; the loop paces on xrWaitFrame alone
+            // Stream unused (overlay app's flag): no stream pass and no stream layer; the loop paces
+            // on xrWaitFrame alone
             // Never skipped while a scene app owns the view or is loading: its frames must be probed
             let skip_stream = stream_unused_flag
                 && !scene_mode_flag
                 && !scene_loading_flag
-                && stream_context.is_some()
-                && !crate::debug_switches::get().ignore_stream_unused;
+                && stream_context.is_some();
             if skip_stream != stream_skipped {
                 info!(
                     "Stream unused: {} the stream",
@@ -846,22 +795,13 @@ pub fn entry_point() {
                 .map(StreamContext::view_reference_space);
             let streaming = stream_context.is_some();
             let (layer, display_time, key_probe) = if let Some(stream) = &mut stream_context {
-                stream.set_key_probe(
-                    loading_output.is_some_and(|output| output.probe),
-                    !crate::debug_switches::get().key_probe_off,
-                );
+                stream.set_key_probe(loading_output.is_some_and(|output| output.probe));
                 if skip_stream {
                     stream.skip_frame(vsync_time);
                     (None, vsync_time, None)
                 } else {
                     let (layer, display_time, key_probe) =
                         stream.render(frame_interval, vsync_time);
-                    // DEBUG SWITCH screenvr_key_probe.txt "off": every frame counts as content
-                    let key_probe = if crate::debug_switches::get().key_probe_off {
-                        Some(0.0)
-                    } else {
-                        key_probe
-                    };
                     (Some(layer), display_time, key_probe)
                 }
             } else {
@@ -938,37 +878,6 @@ pub fn entry_point() {
                 }
             }
 
-            native_quads.poll_debug_switches(&xr_session);
-            // PROTOTYPE: passthrough projected onto the native quads' rectangles (debug switch)
-            let mut passthrough_recreate = false;
-            if let (Some(passthrough), Some(space)) = (&mut passthrough_layer, &native_quads_space)
-            {
-                let rects = crate::debug_switches::get()
-                    .projected_passthrough_margin
-                    .map(|margin| native_quads.rects(margin));
-                if passthrough.set_projection(
-                    &xr_instance,
-                    space,
-                    to_xr_time(vsync_time),
-                    rects.as_deref(),
-                ) {
-                    // Destroying only the projected layer breaks PICO's passthrough: the whole
-                    // passthrough is dropped here and created again below
-                    passthrough_recreate = true;
-                }
-            }
-            if passthrough_recreate {
-                // The old passthrough object must be gone before a new one is created
-                drop(passthrough_layer.take());
-                passthrough_layer = PassthroughLayer::new(&xr_session, platform).ok();
-            }
-            // Upstream: the stream frame's timestamp. Debug switch: the predicted display time.
-            let display_time = if native_quads_space.is_some() {
-                native_quads.frame_display_time(display_time, vsync_time)
-            } else {
-                display_time
-            };
-
             let projection_layer = layer.as_ref().map(|layer| layer.build());
             let quad_layers = native_quads_space
                 .as_deref()
@@ -983,9 +892,6 @@ pub fn entry_point() {
                 Vec::with_capacity(5 + quad_layers.len());
             if let Some(passthrough_layer) = &passthrough_layer {
                 layers.push(passthrough_layer);
-                if let Some(projected) = passthrough_layer.projected_layer() {
-                    layers.push(projected);
-                }
             }
             if let Some(projection_layer) = &projection_layer {
                 layers.push(projection_layer);
@@ -1010,18 +916,6 @@ pub fn entry_point() {
             // Hands on top of everything
             if let Some(hands_layer) = &hands_layer {
                 layers.push(hands_layer);
-            }
-
-            // DEBUG SWITCH screenvr_stall.txt: a late frame on purpose (debug_switches.rs)
-            if let Some((stall, period)) = crate::debug_switches::get().stall
-                && last_debug_stall.is_none_or(|instant: Instant| instant.elapsed() >= period)
-            {
-                info!(
-                    "Debug stall: render thread sleeps {} ms before xrEndFrame",
-                    stall.as_millis()
-                );
-                thread::sleep(stall);
-                last_debug_stall = Some(Instant::now());
             }
 
             graphics_context.make_current();

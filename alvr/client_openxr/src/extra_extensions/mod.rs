@@ -1,6 +1,5 @@
 mod body_tracking_bd;
 mod body_tracking_fb;
-mod camera_image_probe;
 mod eye_gaze_interaction;
 mod eye_tracking_social;
 mod face_tracking2_fb;
@@ -16,7 +15,6 @@ mod spatial_marker_tracking;
 
 pub use body_tracking_bd::*;
 pub use body_tracking_fb::*;
-pub use camera_image_probe::*;
 pub use eye_gaze_interaction::*;
 pub use eye_tracking_social::*;
 pub use face_tracking2_fb::*;

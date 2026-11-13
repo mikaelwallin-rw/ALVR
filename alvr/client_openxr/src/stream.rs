@@ -116,10 +116,9 @@ pub struct StreamContext {
     // The last chroma key configured (scene mode sends no passthrough): what key colour frames look
     // like. None until one is configured: magenta is assumed.
     last_key_config: Option<PassthroughMode>,
-    // Key colour probing of each new frame (loading_screen.rs), and its result for the last render()
+    // Key colour probing of each new frame while the loading screen wants it (loading_screen.rs),
+    // and its result for the last render()
     key_probe_enabled: bool,
-    // The loading screen wants the probe (render() timing is logged, probe on or off by switch)
-    key_probe_wanted: bool,
     key_probe: Option<f32>,
     // (window start, probes, total, max) for the cost log
     key_probe_timing: (Instant, u32, Duration, Duration),
@@ -279,7 +278,6 @@ impl StreamContext {
                 _ => None,
             },
             key_probe_enabled: false,
-            key_probe_wanted: false,
             key_probe: None,
             key_probe_timing: (Instant::now(), 0, Duration::ZERO, Duration::ZERO),
             config,
@@ -415,15 +413,10 @@ impl StreamContext {
         Arc::clone(&self.hands_selected)
     }
 
-    /// Probe each new frame for the key colour during render() (synchronous tiny readback); the
-    /// result is render()'s third value
-    /// `wanted`: the loading screen needs it; `enabled`: not switched off (screenvr_key_probe.txt)
-    pub fn set_key_probe(&mut self, wanted: bool, enabled: bool) {
-        self.key_probe_wanted = wanted;
-        self.key_probe_enabled = wanted && enabled;
-        if !enabled {
-            self.key_probe = None;
-        }
+    /// Probe each new frame for the key colour during render() (synchronous tiny readback) while
+    /// the loading screen needs it; the result is render()'s third value
+    pub fn set_key_probe(&mut self, wanted: bool) {
+        self.key_probe_enabled = wanted;
     }
 
     pub fn view_reference_space(&self) -> Arc<xr::Space> {
@@ -477,10 +470,7 @@ impl StreamContext {
         let xr_vsync_time = xr::Time::from_nanos(vsync_time.as_nanos() as _);
         let frame_poll_deadline = Instant::now()
             + Duration::from_secs_f32(
-                frame_interval.as_secs_f32()
-                    * crate::debug_switches::get()
-                        .stream_wait
-                        .unwrap_or(DECODER_MAX_TIMEOUT_MULTIPLIER),
+                frame_interval.as_secs_f32() * DECODER_MAX_TIMEOUT_MULTIPLIER,
             );
         let mut frame_result = None;
         if let Some((_, source)) = &mut self.decoder {
@@ -630,11 +620,11 @@ impl StreamContext {
                     .map_or_else(magenta_chroma_direction, key_chroma_direction)
             }),
         );
-        // render() time with a new frame, probe on vs off (A/B by screenvr_key_probe.txt): the
-        // difference is the synchronous readback's render-thread cost
+        // render() time with a new frame while probing: includes the synchronous readback's
+        // render-thread cost
         let probe_elapsed = probe_start.elapsed();
         self.key_probe = key_fraction;
-        if self.key_probe_wanted && !buffer_ptr.is_null() {
+        if self.key_probe_enabled && !buffer_ptr.is_null() {
             // Cost log (stand measurement): the readback is synchronous, render-thread time
             let (window_start, count, total, max) = &mut self.key_probe_timing;
             *count += 1;
@@ -642,8 +632,7 @@ impl StreamContext {
             *max = (*max).max(probe_elapsed);
             if window_start.elapsed() >= Duration::from_secs(5) {
                 info!(
-                    "Key probe {}: {count} frames in {:.1} s, stream render() mean {} us, max {}                      us per frame (16x16 RGBA readback, synchronous)",
-                    if self.key_probe_enabled { "on" } else { "off" },
+                    "Key probe: {count} frames in {:.1} s, stream render() mean {} us, max {}                      us per frame (16x16 RGBA readback, synchronous)",
                     window_start.elapsed().as_secs_f32(),
                     total.as_micros() / u128::from(*count),
                     max.as_micros()

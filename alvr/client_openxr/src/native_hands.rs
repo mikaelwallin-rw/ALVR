@@ -31,17 +31,13 @@ const IN_VIEW_MARGIN_RAD: f32 = 0.1;
 // XR_EXT_hand_tracking joints: wrist, then the middle finger metacarpal..tip
 const MIDDLE_FINGER_CHAIN: [usize; 6] = [1, 11, 12, 13, 14, 15];
 
-// Live hand shape (debug switch screenvr_hands.txt)
+// Drawn hand size, live (debug switch screenvr_hands.txt)
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ShapeSettings {
+    // Girth perpendicular to the bones (1 = the mesh)
     thickness: f32,
+    // Uniform scale about the wrist (moves the fingertips)
     scale: f32,
-    // Finger bone length factor
-    fingers: f32,
-    // Overlay app's hand display transform applied (A/B switch display_transform=off)
-    display_transform: bool,
-    // Girth per joint from the tracked joint radii (relative to the mesh's own)
-    from_radii: bool,
 }
 
 impl Default for ShapeSettings {
@@ -49,9 +45,6 @@ impl Default for ShapeSettings {
         Self {
             thickness: 1.0,
             scale: 1.0,
-            fingers: 1.0,
-            display_transform: true,
-            from_radii: false,
         }
     }
 }
@@ -74,32 +67,15 @@ impl ShapeSettings {
             match key.trim() {
                 "thickness" => settings.thickness = number(settings.thickness, 0.5, 3.0),
                 "scale" => settings.scale = number(settings.scale, 0.8, 1.3),
-                "fingers" => settings.fingers = number(settings.fingers, 0.9, 1.3),
-                "girth" => settings.from_radii = value == "radii",
-                "display_transform" => settings.display_transform = value != "off",
                 _ => (),
             }
         }
         settings
     }
 
-    fn shape(
-        &self,
-        tracked_radii: Option<&[f32; HAND_JOINT_COUNT]>,
-        mesh_radii: &[f32; HAND_JOINT_COUNT],
-        fingers: f32,
-    ) -> HandShape {
-        let girth = std::array::from_fn(|joint| {
-            let ratio = match tracked_radii {
-                Some(radii) if self.from_radii && mesh_radii[joint] > 0.0 && radii[joint] > 0.0 => {
-                    (radii[joint] / mesh_radii[joint]).clamp(0.5, 2.5)
-                }
-                _ => 1.0,
-            };
-            self.thickness * ratio
-        });
+    fn shape(&self, fingers: f32) -> HandShape {
         HandShape {
-            girth,
+            girth: [self.thickness; HAND_JOINT_COUNT],
             length: finger_length_factors(fingers),
             scale: self.scale,
         }
@@ -257,7 +233,8 @@ impl NativeHands {
         HandShapeInfo {
             thickness: self.shape_settings.thickness,
             scale: self.shape_settings.scale,
-            fingers: self.shape_settings.fingers,
+            // The finger length switch is gone: only the overlay app's correction changes it
+            fingers: 1.0,
             finger_correction: self.applied_correction,
             correction_sequence: self.correction.map_or(0, |correction| correction.sequence),
         }
@@ -328,7 +305,7 @@ impl NativeHands {
             })
         };
         let radii = located.map(|hand| hand.map(|(_, radii)| radii));
-        let mut hands = located.map(|hand| hand.map(|(joints, _)| joints));
+        let hands = located.map(|hand| hand.map(|(joints, _)| joints));
 
         // Debug switch screenvr_hands.txt: hand shape, live
         let shape_text = crate::debug_switches::get().hands_shape;
@@ -336,26 +313,6 @@ impl NativeHands {
             self.shape_settings = ShapeSettings::parse(&shape_text);
             info!("Native hands: shape {:?}", self.shape_settings);
             self.shape_text = shape_text;
-        }
-
-        // TEST ONLY (debug switch screenvr_fake_hands.txt): a synthetic left hand in front of the
-        // STAGE origin, so that the per-frame uploads run on an unworn headset
-        if hands.iter().all(Option::is_none)
-            && crate::debug_switches::get().fake_hands
-            && let Ok((_, views)) = self.xr_session.locate_views(
-                xr::ViewConfigurationType::PRIMARY_STEREO,
-                xr_time,
-                stage_space,
-            )
-            && let Some(view) = views.first()
-        {
-            // 35 cm in front of and 12 cm below the left eye, at arm's length
-            let head = crate::from_xr_pose(view.pose);
-            let anchor = head.position + head.orientation * Vec3::new(0.05, -0.12, -0.35);
-            hands[0] = Some(self.renderer.mesh_joint_positions(0).map(|position| Pose {
-                orientation: head.orientation,
-                position: anchor + head.orientation * position,
-            }));
         }
 
         let visible = [hands[0].is_some(), hands[1].is_some()];
@@ -440,8 +397,8 @@ impl NativeHands {
             swapchain.wait_image(xr::Duration::INFINITE).ok();
         }
 
-        // Finger length: own setting times the overlay app's correction near the touchscreen. Only
-        // the DRAWN joints change; the joints reported to the server are the raw tracked ones.
+        // Finger length: the overlay app's correction near the touchscreen. Only the DRAWN joints
+        // change; the joints reported to the server are the raw tracked ones.
         let fingers = [0, 1].map(|idx| {
             let correction = match (&self.correction, &hands[idx]) {
                 (Some(correction), Some(joints)) => {
@@ -450,16 +407,14 @@ impl NativeHands {
                 _ => 1.0,
             };
             self.applied_correction[idx] = correction;
-            self.shape_settings.fingers * correction
+            correction
         });
         // Then the overlay app's display transform, weighted by the raw index tip's distance from
         // the published touch display (sizes scale with it)
         let now = Instant::now();
         let display = [0, 1].map(|idx| match &hands[idx] {
-            Some(joints) if self.shape_settings.display_transform => {
-                self.display.for_hand(joints[10].position, now)
-            }
-            _ => crate::hand_display::DisplayTransform::IDENTITY,
+            Some(joints) => self.display.for_hand(joints[10].position, now),
+            None => crate::hand_display::DisplayTransform::IDENTITY,
         });
         let drawn = [0, 1].map(|idx| {
             hands[idx].map(|joints| {
@@ -482,11 +437,7 @@ impl NativeHands {
             }),
             drawn,
             [0, 1].map(|idx| {
-                let mut shape = self.shape_settings.shape(
-                    radii[idx].as_ref(),
-                    &self.renderer.mesh_joint_radii(idx),
-                    fingers[idx],
-                );
+                let mut shape = self.shape_settings.shape(fingers[idx]);
                 let size = display[idx].scale;
                 shape.girth = shape.girth.map(|girth| girth * size);
                 shape.length = shape.length.map(|length| length * size);

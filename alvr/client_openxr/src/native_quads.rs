@@ -23,7 +23,6 @@ use std::{
     mem,
     num::NonZeroU32,
     path::Path,
-    ptr,
     time::{Duration, Instant},
 };
 
@@ -131,22 +130,11 @@ impl QuadLayer {
 // Pose/size-only updates are frequent (trim, live driverFromStage): logged as a count
 const IN_PLACE_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
-// Debug switches (debug_switches.rs): display time mode and the video quads' layer settings
-const DEBUG_SWITCHES_POLL_INTERVAL: Duration = Duration::from_secs(1);
-
 #[derive(Default)]
 pub struct NativeQuadLayers {
     layers: Vec<QuadLayer>,
     in_place_updates: u32,
     last_in_place_log: Option<Instant>,
-    // Chained to the video quad layers; None = not offered by the runtime or disabled
-    video_layer_settings: Option<xr::sys::CompositionLayerSettingsFB>,
-    layer_settings_flags: Option<u64>,
-    predicted_display_time: bool,
-    last_debug_switches_poll: Option<Instant>,
-    // Stream frame timestamp minus predicted display time, ms, since the last log
-    display_time_gaps: Vec<f32>,
-    last_display_time_log: Option<Instant>,
 }
 
 // Same chessboard texture: only the pose, size or video stream changed
@@ -248,59 +236,6 @@ impl NativeQuadLayers {
         );
     }
 
-    // Once per frame, before build(): polls the debug switch files
-    pub fn poll_debug_switches(&mut self, xr_session: &xr::Session<xr::OpenGlEs>) {
-        if self
-            .last_debug_switches_poll
-            .is_some_and(|instant| instant.elapsed() < DEBUG_SWITCHES_POLL_INTERVAL)
-        {
-            return;
-        }
-        self.last_debug_switches_poll = Some(Instant::now());
-
-        let switches = crate::debug_switches::get();
-        let predicted = switches.predicted_display_time;
-        if predicted != self.predicted_display_time {
-            self.predicted_display_time = predicted;
-            info!(
-                "Native quads: display time mode {}",
-                if predicted {
-                    "PREDICTED (xrEndFrame with the runtime's predicted display time)"
-                } else {
-                    "STREAM (xrEndFrame with the stream frame's timestamp, upstream)"
-                }
-            );
-        }
-
-        let flags = switches.quad_settings_flags;
-        if self.layer_settings_flags == Some(flags) {
-            return;
-        }
-        self.layer_settings_flags = Some(flags);
-
-        let offered = xr_session
-            .instance()
-            .exts()
-            .fb_composition_layer_settings
-            .is_some();
-        self.video_layer_settings =
-            (offered && flags != 0).then(|| xr::sys::CompositionLayerSettingsFB {
-                ty: xr::StructureType::COMPOSITION_LAYER_SETTINGS_FB,
-                next: std::ptr::null(),
-                layer_flags: xr::CompositionLayerSettingsFlagsFB::from_raw(flags),
-            });
-        info!(
-            "Native quads: video layer settings flags {flags:#x} ({})",
-            if !offered {
-                "XR_FB_composition_layer_settings not enabled, ignored"
-            } else if flags == 0 {
-                "off"
-            } else {
-                "chained to the video quads"
-            }
-        );
-    }
-
     /// Position and width of the quads that show a video stream (for the decode path choice)
     pub fn video_quad_geometry(&self) -> Vec<VideoQuadGeometry> {
         self.layers
@@ -310,18 +245,6 @@ impl NativeQuadLayers {
                 stream_id: layer.quad.video_stream_id,
                 position: layer.quad.pose.position,
                 width: layer.quad.width,
-            })
-            .collect()
-    }
-
-    /// The quads' rectangles (target poses), each grown by `margin` metres on every side
-    pub fn rects(&self, margin: f32) -> Vec<crate::extra_extensions::ProjectionRect> {
-        self.layers
-            .iter()
-            .map(|layer| crate::extra_extensions::ProjectionRect {
-                pose: layer.quad.pose,
-                width: layer.quad.width + 2.0 * margin,
-                height: layer.quad.height + 2.0 * margin,
             })
             .collect()
     }
@@ -357,7 +280,7 @@ impl NativeQuadLayers {
                     ),
                 };
 
-                let layer = xr::CompositionLayerQuad::new()
+                xr::CompositionLayerQuad::new()
                     .layer_flags(flags)
                     .space(stage_space)
                     .eye_visibility(xr::EyeVisibility::BOTH)
@@ -374,64 +297,9 @@ impl NativeQuadLayers {
                             }),
                     )
                     .pose(crate::to_xr_pose(pose))
-                    .size(xr::Extent2Df { width, height });
-
-                match (&video, &self.video_layer_settings) {
-                    (Some(_), Some(settings)) => unsafe {
-                        // # Safety: the settings live in self, which outlives the layer ('a)
-                        xr::CompositionLayerQuad::from_raw(xr::sys::CompositionLayerQuad {
-                            next: ptr::from_ref(settings).cast(),
-                            ..layer.into_raw()
-                        })
-                    },
-                    _ => layer,
-                }
+                    .size(xr::Extent2Df { width, height })
             })
             .collect()
-    }
-
-    /// The display time for xrEndFrame. DEBUG SWITCH (A/B for "screens swim"): the runtime's
-    /// predicted display time instead of the stream frame's timestamp while native quads are
-    /// shown. Also logs, once a second while quads are shown, how far the stream frame's timestamp
-    /// is from the predicted display time.
-    pub fn frame_display_time(&mut self, stream_time: Duration, predicted: Duration) -> Duration {
-        if self.layers.is_empty() {
-            self.display_time_gaps.clear();
-            return stream_time;
-        }
-
-        // Positive: the stream frame's timestamp is later than the predicted display time
-        let gap_ms = (stream_time.as_secs_f64() - predicted.as_secs_f64()) * 1000.0;
-        self.display_time_gaps.push(gap_ms as f32);
-        if self
-            .last_display_time_log
-            .is_none_or(|instant| instant.elapsed() >= Duration::from_secs(1))
-        {
-            let gaps = &self.display_time_gaps;
-            let min = gaps.iter().copied().fold(f32::INFINITY, f32::min);
-            let max = gaps.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mean = gaps.iter().sum::<f32>() / gaps.len() as f32;
-            let repeated = gaps.iter().filter(|&&gap| gap == 0.0).count();
-            info!(
-                "Native quads: stream timestamp - predicted display time: min {min:.1} mean \
-                 {mean:.1} max {max:.1} ms over {} frames ({repeated} without a new stream \
-                 frame), xrEndFrame uses {}",
-                gaps.len(),
-                if self.predicted_display_time {
-                    "PREDICTED"
-                } else {
-                    "STREAM"
-                }
-            );
-            self.display_time_gaps.clear();
-            self.last_display_time_log = Some(Instant::now());
-        }
-
-        if self.predicted_display_time {
-            predicted
-        } else {
-            stream_time
-        }
     }
 }
 
