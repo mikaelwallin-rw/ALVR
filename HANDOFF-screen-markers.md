@@ -121,7 +121,7 @@ the merge branch, so it pairs with any `merge/upstream-2026-11` driver/APK):
 - `alvr_streamer_windows\ALVR Dashboard.exe` sha256 `d757ae9f284e964977215790c33d2ae31fb3d1267605fe576dbab8f565e74282`
 - `alvr_client_android\alvr_client_android.apk` sha256 `f9dcb26ec31a2a3461639e3f6bf624ac8df1772ae71ae72e35f9dae5cc4e368f`
 
-### Late pickup and asynchronous key probe (2026-11-13 evening, commits `d8db5d2f` + the late pickup commit, NOT deployed)
+### Late pickup and asynchronous key probe (2026-11-13 evening, commits `d8db5d2f` + `d542d8a6`; late pickup default OFF since the follow-up commit)
 
 Source: `D:\wkspaces\ScreenVR\docs\StreamingProfile-2026-11-13.md` A.2 to A.4 and D #1/#2: PICO wakes the render loop
 12.5 ms before its compositor latches the frame (std 0.44), the loop needs about 7 ms of it, so the picked frame
@@ -173,9 +173,10 @@ waiting A, after waiting B (mean x us, max y us), one loop later C; stream rende
 - Server (`server_core`): controller unchanged (it now aims frames at "deadline - target"); `connection.rs`
   announces `late_pickup:<safety ms>:<target ms>` (`alvr_packets::late_pickup_token` / `parse_late_pickup`) next
   to `phase_sync`; `statistics.rs` logs the reference change and the late pickup values.
-- Setting: `session_settings.video.phase_sync.content.late_pickup` = `{"enabled": true, "content":
-  {"safety_margin_ms": 1.0}}` (Switch, default **on**, slider 0 to 4 ms; read at connection start). A
-  `session.json` without the key gets the default (on). Off = phase sync exactly as before (no token).
+- Setting: `session_settings.video.phase_sync.content.late_pickup` = `{"enabled": false, "content":
+  {"safety_margin_ms": 1.0}}` (Switch, **default off** since the live test below; it was on in `d542d8a6`; slider
+  0 to 4 ms; read at connection start). A `session.json` without the key gets the default. Off = phase sync
+  exactly as before (no token). EXPERIMENTAL.
 
 Compatibility (protocol id unchanged `21-dev14.screenvr.1`):
 - New driver + old APK (`f9dcb26e`): the old client ignores the token (exact-match parsing), sends v1, picks as
@@ -214,6 +215,67 @@ Release build of the working tree = the late pickup commit (`C:\wkspaces\ALVR_ph
 - `alvr_streamer_windows\alvr_server\bin\win64\driver_alvr_server.dll` sha256 `57089d452a22625b7211fd249b8d86ccfc2e2e81c4beeaa6ea25327076b8f2d6` (changed: deploy with the APK for late pickup)
 - `alvr_streamer_windows\ALVR Dashboard.exe` sha256 `7788566cadf039426880a07e738b579a77ba67fe6ee4b52975d3a74f4a5db916` (settings schema: the new switch)
 - `alvr_client_android\alvr_client_android.apk` sha256 `62799b3bc8008d144041f3ac1d6c977b79096660ad72d3dc0bb4364c5e0e2140`
+
+### Live result 2026-11-13 night: key probe yes, late pickup no (default now OFF)
+
+Rig: PICO 4 Ultra Enterprise, driver `57089d45` + APK `62799b3b`, HEVC 100 Mbps 3584x1792, phase sync target 2.0,
+60 to 120 s per run inside V3 (measured by the coordinator).
+
+| | total ms | client fps | server status per 10 s | client compositor |
+|---|---|---|---|---|
+| before this build | 56.5 | | | 2.8 ms |
+| late pickup OFF (2 runs) | 52.7 / 53.3 | 89.1 / 89.6 | missed 0 to 2 | 1.19 ms |
+| late pickup ON (2 runs) | 52.7 / 52.65 | 88.1 / 82.4 | loops ~910, frames 849 to 895, late 7 to 51, missed 15 to 63, dropped 15 to 63 (3 to 7 % of loops repeat a frame); target raised to 4.0 and stayed | |
+
+Client line with ON: `mean wake + 4.1 ms; taken at the deadline 40 to 473, waited past a stale frame 34 to 81;
+pick to GPU done 7.0 ms; back-off 0.0; after the latch estimate 0`. So frames miss the DEADLINE (the arrival
+side), not the latch (the GPU side); each miss repeats a frame, and the server's back-off to target 4.0 moves the
+arrival back to where it was without late pickup.
+
+The asynchronous key probe alone gives 3 to 4 ms (client compositor 2.8 -> 1.19 ms, and the vsync queue follows
+because the render thread no longer stalls); it stays.
+
+Why the deadline is missed so often (reading of code + numbers, not yet traced):
+1. **The wait window lost its tolerance for late frames.** Without late pickup the reference is the poll start
+   (about wake + 1) but the loop keeps waiting until poll + half a frame (about wake + 6.5): a frame up to 5.5 ms
+   late is still shown in its loop ("waited for", no repeat). With late pickup the reference IS the hard cutoff
+   (wake + 4.1): only the target margin (2 ms) is left for arrival jitter. Late pickup moved the reference later by
+   about 3 ms but the end of the window EARLIER by about 2.4 ms.
+2. **Arrival jitter is larger than 2 ms.** Arrival = PC phase + encoder + network + decode: encoder p5 7.9 / p95
+   13.7 ms (GPU queueing behind V3), network p95 3.1, decoder p95 9.3 against a mean of 7.6 (profile doc C). The
+   decoder queue used to absorb that (-0.56 / -0.54 correlations); a 2 ms margin cannot. The server's back-off
+   (missed > 2 %) then raises the target to its 4 ms cap, which is where the gain goes.
+3. Smaller contributors: frames that arrive as several network packets complete later than their first byte
+   suggests (not a separate effect, part of the jitter); the 0.25 ms poll adds up to 0.25 ms (plus sleep
+   overshoot) after the deadline-adjacent arrival, so frames within ~0.3 ms of the deadline count as late; the
+   "held stale frame" rule does not cause misses but makes each miss visible as a repeat (the late frame is shown
+   one loop later instead of being dropped), which is the intended "no one-behind state" behaviour.
+4. Unexplained: client fps 88.1 / 82.4 with ON although no frame finished after the latch estimate. Possibly
+   PICO's real cutoff is earlier than "GPU done" (e.g. it needs `xrEndFrame` some time before the latch, or the
+   latch for a frame submitted late moves), or loops that wait to the deadline and then render push `xrEndFrame`
+   past what PICO accepts for that vsync. Needs Perfetto (`xrEndFrame` vs `Frame N` latch, PxrMetric `FrmLate`).
+
+What to change before trying again:
+- Fix the bottleneck first: arrival jitter (PC GPU queueing, `Capture-PcTrace.ps1`, profile doc D #4; decoder
+  dequeue D #6). Late pickup can only pay off by about (old window end - safe cutoff) minus the arrival spread.
+- Keep a tolerance window past the reference: report against `deadline - W` with W = the measured arrival spread
+  (e.g. p95 - p50 of the client's own arrival times, learnt), and still wait until the hard deadline; the server
+  target then stays at 2 ms instead of backing off to 4.
+- Make the hard cutoff later instead of the reference: pick to GPU done measured 7.0 ms, so with the measured
+  latch (wake + 12.5) the cutoff could be about wake + 4.5 to 5.0; the old window (wake + 6.5) is already past it,
+  which is the 1 % late latch of today. A cleaner variant of plain phase sync: wait until min(poll + half a frame,
+  safe cutoff) and keep the poll start as the reference.
+- Wake the loop on frame arrival (decoder thread condvar) instead of 0.25 ms polls.
+- Explain the fps drop with Perfetto before any new attempt.
+
+Deploy note: the rig's `session.json` has `late_pickup.enabled` = false explicitly, so the deployed driver
+`57089d45` / APK `62799b3b` already behave as "default off"; no redeploy is needed for this change. The default
+only matters for a `session.json` without the key (fleet seed, fresh installs).
+Rebuilt streamer of the default-off commit (`C:\wkspaces\ALVR_phase\build\`; the APK is unchanged and not
+rebuilt: the client follows the server's token, never its own settings default):
+- `driver_alvr_server.dll` sha256 `400c93661cd15da1dfd9a97ee4a507c1f259ccb87ac5150ff1a156cbb1bfd039`
+- `ALVR Dashboard.exe` sha256 `ec4f0e080badf6a6402c72baea2fdebb7e94cec7e31bdd276ca0f1d05e80575a`
+- APK stays `62799b3bc8008d144041f3ac1d6c977b79096660ad72d3dc0bb4364c5e0e2140`
 
 ### Not known yet (needs the rig)
 

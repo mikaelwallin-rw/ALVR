@@ -797,7 +797,7 @@ pub struct PhaseSyncConfig {
     pub target_margin_ms: f32,
 
     #[schema(strings(
-        help = r"The headset picks the stream frame as late as its render + submit still finishes before the headset's compositor takes the frame (a deadline from the render loop's wake-up, learnt from the measured GPU completion of its own frames), instead of right after the wake-up; the server then aims frames just before that deadline. Saves a few ms of latency. Backs off by itself when frames finish too late. Needs a client that knows it; off = phase sync as before."
+        help = r"The headset picks the stream frame as late as its render + submit still finishes before the headset's compositor takes the frame (a deadline from the render loop's wake-up, learnt from the measured GPU completion of its own frames), instead of right after the wake-up; the server then aims frames just before that deadline. EXPERIMENTAL, default off: on the PICO 4 Ultra (2026-11-13) it saved no latency, because frames that arrive after the deadline repeat the previous frame (3 to 7 % of loops) and the server then raises its target margin to 4 ms, which cancels the later pickup. Needs a client that knows it; off = phase sync as before."
     ))]
     pub late_pickup: Switch<LatePickupConfig>,
 }
@@ -1895,8 +1895,9 @@ pub fn session_settings_default() -> SettingsDefault {
                 enabled: true,
                 content: PhaseSyncConfigDefault {
                     target_margin_ms: 2.0,
+                    // Experimental: no gain measured on the rig (HANDOFF-screen-markers.md)
                     late_pickup: SwitchDefault {
-                        enabled: true,
+                        enabled: false,
                         content: LatePickupConfigDefault {
                             safety_margin_ms: 1.0,
                         },
