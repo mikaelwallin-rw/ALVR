@@ -9,6 +9,115 @@ Sections below "Deployed (2026-11-11)" are dated history; where they disagree, t
 The cleanup of 2026-11-13 (next section) removed most debug switches and workarounds described in that
 history.
 
+## Upstream merge 2026-11-13 (branch `merge/upstream-2026-11`, worktree `C:\wkspaces\ALVR_upstream`, NOT deployed)
+
+Built on `f93c2e3b` (= `feature/screen-markers` = `master`). Two commits:
+
+- `8d99753b` **AV1 for the PICO 4 Ultra Enterprise.** PICO patches `android.os.Build` on this headset:
+  MANUFACTURER `Pico`, MODEL `A94Y0` (`sys.pxr.product.model`; the server log's stage identity prints it as
+  `product "A94Y0"`), DEVICE `sparrow`, PRODUCT `PICO 4 Ultra Enterprise` (`sys.pxr.product.name`; the camera
+  extrinsics table is keyed by it and works). Upstream only matched `"PICO 4 Ultra"`, so the headset was
+  `PicoUnknown` and never reported AV1. Now `"PICO 4 Ultra" | "PICO 4 Ultra Enterprise"` -> `Pico4Ultra`
+  (same XR2 Gen 2, same PICO4S controller profile as `PicoUnknown` had; only AV1 and the dashboard display name
+  "Pico 4 Ultra" change). The PICO 4 Enterprise (`"PICO 4 Enterprise"`) stays `Pico4Enterprise` without AV1.
+  Table = `alvr_system_info::platform_from_android_build()` (unit tests), AV1 list = `Platform::supports_av1_decoding()`.
+  The server still falls back to HEVC with `AV1 encoding is not supported by the client.` (`connection.rs`).
+  AV1 is only used when `video.preferred_codec` is `AV1`: the fleet seed has `H264`, the dev rig `Hevc`.
+- `4d994d4b` **Merge of `upstream/main` (`62e0fc3d`, 2026-11-09).**
+
+### main vs master upstream
+
+`upstream/main` is the default branch since "Switch default branch to `main`" (2026-11-05). It is a curated
+re-application of `master` (merge-base `d9f2b19d`): most master commits are re-committed with the same patch
+(e.g. the crash fix is `e9b8e3ac` on master, `45f07415` on main; same for reap children, per-eye foveation centers, ...). Only on master (NOT merged):
+docker build scripts, "Refactor Settings: Rust-owned construction" (#3306; main has its own "initialize C++
+settings from Rust" `d664476f` instead), Linux direct mode, Vulkan layer fix, eye-tracked foveation (#3394), OSC
+gaze (#3402). Only on main: the main-branch switch, wgpu 29.0.4, the wgsl immediate workaround (#3452).
+
+### What came in
+
+Driver-unload crash fix `45f07415` (#3333), reap spawned SteamVR children `1e8e7f9a` (#3363, a Linux concern),
+slow-activating tracked devices `a93b1724` (#3448), AMF double free `47e0373a` (AMD only; this PC is NVIDIA RTX
+4070), OpenVR SDK 1.16.8 -> 2.15.6 (submodule `openvr` -> `0924064`; run `git submodule update --init` in a new
+checkout), unified socket abstraction (#3321), C++ settings from Rust, runtime per-eye foveation centers
+(#3385/#3388, new `VideoPacketHeader.foveation_center_shifts`), web server bound to localhost by default (#3364,
+new setting `connection.allow_remote_dashboard`), ffmpeg 8.1 (only with `--gpl`), wgpu 29.0.4, Rust 1.97.1
+(`rust-toolchain.toml`; rustup fetches it), Vulkan headers fetched by `prepare-deps`.
+
+**vrserver crash at shutdown** (`c0000005` in `d3d11.dll_unloaded`, 7 times on 2026-11-13, SteamVR 2.15.6, NVIDIA):
+`45f07415` is the plausible fix. Before it, `HmdDriverFactory` started the runtime and the driver's event-loop and
+idle-init threads were never joined: `ShutdownRuntime` only dropped the context, so SteamVR could unload
+`driver_alvr_server.dll` (and with it the last reference to `d3d11.dll`) while the event loop thread was still
+tearing down streaming (`DeinitializeStreaming`: encoder/D3D11 objects). A thread inside d3d11 code after the unload
+faults exactly as `d3d11.dll_unloaded`. After the fix `shutdown_driver` joins both threads and heavy init moved to
+`InitializeRuntime` (called from `DriverProvider::Init`, so a factory probe by steam.exe starts nothing). The fork's
+own server threads (tracking extras heartbeat: joined in `Drop`; connection threads incl. the screen thread: joined
+by `connection_pipeline`) end before that join. Not proven: needs the restart test below.
+
+### Version
+
+`21.0.0-dev14.screenvr.1` (upstream `21.0.0-dev14` + fork suffix; protocol id `21-dev14.screenvr.1`). Driver,
+dashboard and APK carry it (checked in the binaries) and must be installed together: any older driver/APK pair
+is refused at the handshake (`VideoPacketHeader` changed upstream too). First start after the update: new client
+hostname, dashboard clears trusted clients and opens the setup wizard (same as the dev13 -> dev13.screenvr.1 step).
+
+### Conflicts and resolutions
+
+| File | Resolution |
+|---|---|
+| `Cargo.toml` | version `21.0.0-dev14.screenvr.1`; upstream dropped `rust-version` |
+| `Cargo.lock` | upstream's, cargo re-added the fork's dependencies |
+| `server_core/Cargo.toml` | upstream's `sysinfo` features + fork's `zune-jpeg`, `jpeg-encoder` (dev), `windows` |
+| `client_core/c_api.rs` | `StreamRenderer::render` gets upstream's foveation centers, then the fork's opaque regions + key probe args |
+| `client_core/connection.rs` | constants united; upstream `video_frame_metadata_queue` + new fork `opaque_regions_queue` (same timestamps, same history size) replacing the fork's `GlobalViewParamsEntry` |
+| `client_core/lib.rs` | upstream `report_compositor_start -> Option<VideoFrameMetadata>`; it also updates the fork's `last_good_opaque_regions` from the regions queue (`last_frame_opaque_regions()` unchanged) |
+| `client_openxr/stream.rs` | upstream `last_good_video_frame_metadata` + fork opaque-region fields; one helper used by `render` and the fork's `skip_frame`; render args as above; `StreamConfig` -> upstream `ClientStreamConfig` |
+| `graphics/resources/stream.wgsl` | fork shader on upstream's `Immediate` block (first declaration, #3452; fork `ck_edge` in place of `_align`) and foveation uniform (binding 2); fork opaque regions uniform moved to **binding 3** |
+| `graphics/src/stream.rs` | fork renderer (pipeline variants, stencil classes, key probe) rebuilt on wgpu 29 + upstream's foveation uniform buffer; `EncodedPixelMap` is now per eye, built from the foveation uniforms and rebuilt when the runtime centers change |
+| `server_core/connection.rs` | imports united (`ClientNegotiatedStreamingConfig`); screen video sender = `socket.request_unreliable_stream(SCREEN_VIDEO)` on the unified socket; fork's scene_mode / stream_unused / scene_loading kept; upstream's control sender |
+| `server_core/lib.rs`, `tracking/mod.rs` | imports united |
+| `server_openvr/cpp/alvr_server/alvr_server.cpp` | fork's hand-selection `RequestDriverResync` kept; `Settings::Instance().` -> upstream `Settings_Instance()->` (also at the fork's `use_separate` log line) |
+| `session/src/lib.rs` | fork's trusted `client.wired` default on upstream's `SessionConfig` (`steamvr_hmd_init_config`) |
+
+Ported without a textual conflict: `graphics/src/hands.rs`, `opaque_regions.rs` and their shaders to wgpu 29
+(`var<immediate>`, `set_immediates`, `immediate_size`, `multiview_mask`, `depth_slice`, `Option` depth state; the
+hands shader's immediate block moved first); the opaque-regions foveation test now builds
+`AlvrFoveatedEncodingParams`; `client_openxr` `glow` 0.16 -> 0.17 (same as wgpu, else two `glow::Context` types).
+Fork socket hardening (write timeouts, EOF guards in `control_socket.rs`, `stream_socket/tcp.rs`) merged unchanged.
+Contracts unchanged: tracking extras v6 (3552 bytes), request block (276), native quads, screen video,
+`SVDA`/`SVTS`/`SVCS`, camera frames, opaque regions, HSV chroma key.
+
+### Settings (a `session.json` of today, loaded with the merged code: dev `C:\TenstarDev\...\session.json` and the fleet seed)
+
+Both load without error. Lost/renamed (fall back to defaults):
+- `session_settings.video.foveated_encoding.content.{center_size_x,center_size_y,center_shift_x,center_shift_y,edge_ratio_x,edge_ratio_y}`
+  -> arrays `center_size`, `center_shift`, `edge_ratio` (`{"gui_collapsed": false, "content": [x, y]}`). No
+  migration upstream. Fleet seed uses the defaults (0.45/0.4, 0.4/0.1, 4/5): no change. **Dev rig has
+  center_size 0.6/0.6, edge_ratio 2/2: these become 0.45/0.4 and 4/5 unless `session.json` is edited.**
+- `openvr_config` (whole block) -> `steamvr_hmd_init_config` (5 resolution/refresh fields, written at connect) and
+  `restart_settings_hash`. Internal, nothing to carry over.
+Added: `session_settings.connection.allow_remote_dashboard` (default false: dashboard web server on localhost only).
+Fork settings unchanged. The seed's `server_version` must become `21.0.0-dev14.screenvr.1`.
+
+### Build and test (this worktree)
+
+`cargo test` ok for `alvr_packets`, `alvr_session`, `alvr_sockets`, `alvr_system_info` (3 new), `alvr_graphics` (5),
+`alvr_client_core`, `alvr_client_openxr` (35), `alvr_server_core --lib` (12); `cargo check -p alvr_client_openxr
+--target aarch64-linux-android` clean; clippy: no warnings in touched files (7 in untouched `tracking_state.rs`,
+`screen_video.rs`). New worktree needs once: `git submodule update --init openvr`, `cargo xtask prepare-deps
+--platform windows --ci`, `cargo xtask prepare-deps --platform android --ci`.
+
+### Outside ALVR
+
+- ScreenVR: no code change (contracts unchanged).
+- Installer seed `session_seed.json`: `server_version` -> `21.0.0-dev14.screenvr.1`; optionally rename the six
+  foveation keys to the arrays (values are the defaults anyway); `openvr_config` can stay (ignored).
+- `D:\wkspaces\ScreenVR\docs\AlvrInterface.md` lines to update: 559 (fork version in "Hand correction ... removed"
+  stays historical), 640-643 (protocol id statement: still true), **644-648 "Fork versions"**: add
+  `21.0.0-dev14.screenvr.1` (upstream merge 2026-11-13, protocol id `21-dev14.screenvr.1`, `VideoPacketHeader`
+  gained upstream's `foveation_center_shifts`), 649-650 (fork vs upstream incompatibility: still true).
+- Dev rig `session.json`: foveation arrays as above, re-trust the headset after the version change.
+
 ## Cleanup 2026-11-13 (committed locally, NOT deployed)
 
 Cleanup plan `D:\wkspaces\ScreenVR\docs\CleanupPlan-2026-11-11.md` section 4, ALVR steps 4, 5 and 6, one
