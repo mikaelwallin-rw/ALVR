@@ -10,17 +10,16 @@
 //   and unchanged before and after the copy.
 // - `heartbeat_ms` (GetTickCount64) is refreshed at least every 100 ms. Older than 1000 ms = absent.
 // - Driver space = TrackingUniverseRawAndUncalibrated = recenter(client STAGE).
-// - Version 4: hands[2] (raw tracked joints, driver space) and how the client draws them; request
-//   version 3: automatic hand correction, forwarded to the client as HandCorrection; request
-//   version 4: hand display transform, forwarded as HandDisplay (inactive while the request block
-//   is stale or older).
+// - Version 4: hands[2] (raw tracked joints, driver space) and how the client draws them. Request
+//   versions 3 and 4 (hand correction, hand display transform) are no longer read: their fields
+//   are reserved (ScreenVR writes them as zero); the layout and size stay.
 // - Version 3: STAGE identity (changes only when the physical STAGE moves), the persistent anchor
 //   and the headset model, from the client's StageInfo reports. Request version 2: anchor commands,
 //   forwarded to the client as AnchorRequest.
 
 use alvr_common::{Pose, glam::Mat3};
 #[cfg(not(windows))]
-use alvr_packets::{AnchorRequest, HandCorrection, HandDisplay, HandShapeInfo, StageInfo};
+use alvr_packets::{AnchorRequest, HandShapeInfo, StageInfo};
 use std::{
     sync::{
         Arc,
@@ -51,8 +50,8 @@ pub(crate) fn to_matrix(pose: Pose) -> [[f32; 4]; 3] {
 #[cfg(windows)]
 pub use windows_impl::{
     TRACKING_EXTRAS_WRITER, anchor_request, bump_stage_epoch, camera_frames_request,
-    hand_correction, hand_display, recenter_counter, report_hand_shape, report_stage_info,
-    report_tracking, report_tracking_state, stage_epoch, tracking_epoch_for,
+    recenter_counter, report_hand_shape, report_stage_info, report_tracking, report_tracking_state,
+    stage_epoch, tracking_epoch_for,
 };
 
 /// Joints of a hand skeleton (XR_EXT_hand_tracking order, 26), driver space
@@ -218,18 +217,6 @@ pub fn report_tracking(
 #[cfg(not(windows))]
 pub fn report_hand_shape(_info: HandShapeInfo) {}
 
-// The overlay's latest hand correction (sequence != 0)
-#[cfg(not(windows))]
-pub fn hand_correction() -> Option<HandCorrection> {
-    None
-}
-
-// The overlay's hand display transform (inactive when stale)
-#[cfg(not(windows))]
-pub fn hand_display() -> Option<HandDisplay> {
-    None
-}
-
 // Camera frames requested by the overlay: Some(use the right camera)
 #[cfg(not(windows))]
 pub fn camera_frames_request() -> Option<bool> {
@@ -299,9 +286,7 @@ mod windows_impl {
         parking_lot::Mutex,
         warn,
     };
-    use alvr_packets::{
-        AnchorRequest, AnchorRequestKind, HandCorrection, HandDisplay, HandShapeInfo, StageInfo,
-    };
+    use alvr_packets::{AnchorRequest, AnchorRequestKind, HandShapeInfo, StageInfo};
     use std::{
         mem, ptr,
         sync::atomic::{self, AtomicU32, Ordering},
@@ -331,9 +316,6 @@ mod windows_impl {
     // Oldest request block accepted; version 2 appends the anchor request
     const REQUEST_VERSION: u32 = 1;
     const REQUEST_VERSION_ANCHOR: u32 = 2;
-    const REQUEST_VERSION_HAND_CORRECTION: u32 = 3;
-    const REQUEST_VERSION_HAND_DISPLAY: u32 = 4;
-    const HAND_DISPLAY_ACTIVE_BIT: u32 = 1;
     // XR_EXT_hand_tracking joints published per hand: wrist, palm, index proximal..tip, thumb tip,
     // middle tip (RawHand order)
     const PUBLISHED_HAND_JOINTS: [usize; 8] = [1, 0, 7, 8, 9, 10, 5, 15];
@@ -472,20 +454,10 @@ mod windows_impl {
         anchor_request: u32,
         anchor_request_sequence: u32,
         anchor_request_pose: [[f32; 4]; 3],
-        // Request version 3 (zeroed for older blocks, see read_request())
-        hand_finger_scale: [f32; 2],
-        hand_correction_sequence: u32,
-        hand_near_meters: f32,
-        hand_correction_plane: [[f32; 4]; 3],
-        // Request version 4 (zeroed for older blocks, see read_request())
-        hand_display_sequence: u32,
-        hand_display_flags: u32,
-        hand_display_transform: [[f32; 4]; 3],
-        hand_display_scale: f32,
-        hand_display_quad_pose: [[f32; 4]; 3],
-        hand_display_quad_size: [f32; 2],
-        hand_display_full_meters: f32,
-        hand_display_falloff_meters: f32,
+        // Request versions 3 (hand correction, 64 bytes) and 4 (hand display transform, 124 bytes):
+        // no longer read; ScreenVR writes them as zero
+        reserved_v3: [u32; 16],
+        reserved_v4: [u32; 31],
     }
 
     const _: () = assert!(mem::size_of::<RawFingertip>() == 64);
@@ -502,8 +474,8 @@ mod windows_impl {
     const _: () = assert!(mem::size_of::<RawExtrasBlock>() == 3400);
     const _: () = assert!(mem::offset_of!(RawExtrasBlock, stage_identity) == 2264);
     const _: () = assert!(mem::offset_of!(RawRequestBlock, anchor_request) == 32);
-    const _: () = assert!(mem::offset_of!(RawRequestBlock, hand_finger_scale) == 88);
-    const _: () = assert!(mem::offset_of!(RawRequestBlock, hand_display_sequence) == 152);
+    const _: () = assert!(mem::offset_of!(RawRequestBlock, reserved_v3) == 88);
+    const _: () = assert!(mem::offset_of!(RawRequestBlock, reserved_v4) == 152);
     const _: () = assert!(mem::size_of::<RawRequestBlock>() == 276);
 
     pub static TRACKING_EXTRAS_WRITER: Mutex<TrackingExtrasWriter> =
@@ -592,17 +564,6 @@ mod windows_impl {
         let mut writer = TRACKING_EXTRAS_WRITER.lock();
         writer.hand_shape = Some(info);
         writer.publish();
-    }
-
-    // The overlay's latest hand correction (sequence != 0)
-    pub fn hand_correction() -> Option<HandCorrection> {
-        TRACKING_EXTRAS_WRITER.lock().hand_correction
-    }
-
-    // The overlay's hand display transform: Some once a version 4 request block was seen; inactive
-    // while the block is stale or missing
-    pub fn hand_display() -> Option<HandDisplay> {
-        TRACKING_EXTRAS_WRITER.lock().hand_display
     }
 
     // NUL-terminated UTF-8: at most 31 bytes, cut at a character boundary
@@ -697,8 +658,6 @@ mod windows_impl {
         // Per hand: receive time and the raw skeleton (driver space)
         hands: [Option<(u64, HandJoints)>; 2],
         hand_shape: Option<HandShapeInfo>,
-        hand_correction: Option<HandCorrection>,
-        hand_display: Option<HandDisplay>,
         tracking: ServerTrackingEpoch,
     }
 
@@ -726,8 +685,6 @@ mod windows_impl {
                 anchor_request: None,
                 hands: [None, None],
                 hand_shape: None,
-                hand_correction: None,
-                hand_display: None,
                 tracking: ServerTrackingEpoch::new(),
             }
         }
@@ -805,57 +762,6 @@ mod windows_impl {
         pub fn refresh(&mut self) {
             let request = self.read_request();
             let request_flags = request.map_or(0, |r| r.request_markers);
-
-            if let Some(request) = request
-                && request.hand_correction_sequence != 0
-                && self
-                    .hand_correction
-                    .is_none_or(|last| last.sequence != request.hand_correction_sequence)
-            {
-                let correction = HandCorrection {
-                    sequence: request.hand_correction_sequence,
-                    finger_scale: request.hand_finger_scale,
-                    near_meters: request.hand_near_meters,
-                    plane: from_matrix(request.hand_correction_plane),
-                };
-                info!("Tracking extras: hand correction {correction:?}");
-                self.hand_correction = Some(correction);
-            }
-
-            // Hand display transform: as requested, or inactive while the block is stale/older
-            match request.filter(|r| r.version >= REQUEST_VERSION_HAND_DISPLAY) {
-                Some(request) => {
-                    let display = HandDisplay {
-                        sequence: request.hand_display_sequence,
-                        active: request.hand_display_flags & HAND_DISPLAY_ACTIVE_BIT != 0,
-                        transform: from_matrix(request.hand_display_transform),
-                        scale: request.hand_display_scale,
-                        quad_pose: from_matrix(request.hand_display_quad_pose),
-                        quad_size: request.hand_display_quad_size,
-                        full_meters: request.hand_display_full_meters,
-                        falloff_meters: request.hand_display_falloff_meters,
-                    };
-                    if self.hand_display.is_none_or(|last| {
-                        last.sequence != display.sequence || last.active != display.active
-                    }) {
-                        if self
-                            .hand_display
-                            .is_none_or(|last| last.active != display.active)
-                        {
-                            info!("Tracking extras: hand display transform {display:?}");
-                        }
-                        self.hand_display = Some(display);
-                    }
-                }
-                None => {
-                    if let Some(display) = &mut self.hand_display
-                        && display.active
-                    {
-                        info!("Tracking extras: hand display transform inactive (request stale)");
-                        display.active = false;
-                    }
-                }
-            }
 
             // Kept until replaced: a stale request block does not cancel a pending anchor request
             if let Some(request) = request
@@ -1122,16 +1028,6 @@ mod windows_impl {
             if block.version < REQUEST_VERSION_ANCHOR {
                 block.anchor_request = 0;
                 block.anchor_request_sequence = 0;
-            }
-            if block.version < REQUEST_VERSION_HAND_DISPLAY {
-                block.hand_display_sequence = 0;
-                block.hand_display_flags = 0;
-            }
-            if block.version < REQUEST_VERSION_HAND_CORRECTION {
-                block.hand_finger_scale = [1.0; 2];
-                block.hand_correction_sequence = 0;
-                block.hand_near_meters = 0.0;
-                block.hand_correction_plane = to_matrix(Pose::IDENTITY);
             }
 
             // The mapping is kept open even while stale: as long as this handle exists, a restarted

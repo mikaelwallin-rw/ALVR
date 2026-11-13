@@ -35,6 +35,15 @@ since 2026-11-11 PICO's own camera extrinsics are used and none of the workaroun
     `screenvr_hands_msaa.txt` (user decision 2026-11-11: drawn hand size stays), `screenvr_video_path.txt`,
     `screenvr_loading*.txt`, `screenvr_refmarkers.txt` (displayed-view check of new models). The crash-loop
     guard stays; it can no longer change the camera pose (no switch affects the camera frames).
+- **Step 5 (driver and APK each work with the other's old or new version):** hand correction (request v3)
+  and hand display transform (request v4) removed. The server no longer reads those request fields
+  (`reserved_v3`/`reserved_v4`, layout and the 276-byte size unchanged) and no longer sends the
+  `HandCorrection` / `HandDisplay` packets; the client ignores them if an older server sends them
+  (`client_core` drops them, the `ClientCoreEvent` variants are gone). Removed: `hand_display.rs`, the finger
+  correction in `native_hands.rs`, `lengthen_fingers` / `finger_length_factors` / `HandShape::length` in
+  `graphics/src/hands.rs` (and their test). The hands are drawn as tracked with `thickness`/`scale`. The
+  `HandShape` report and the extras v4 `hands[]` stay: `drawFingers` and `drawFingerCorrection` are now
+  always 1, `drawCorrectionSequence` 0. The packet variants stay until step 6.
 
 ### Headset switch files after the cleanup (`/sdcard/Android/data/alvr.client.dev/files`; table in AlvrInterface.md)
 
@@ -214,6 +223,7 @@ Spec + assets: `client_openxr/loading_assets/` (loading-spec.txt v1 copied from 
 
 ### Candidates APK b420a911 + driver c5401609 (NOT installed; install TOGETHER: new packets)
 
+- (Hand correction and display transform below were removed on 2026-11-13; `hands[]` and `HandShape` stay.)
 - Contract (ScreenVR `VrTrackingExtras.h`): extras v4 `VrTrackedHand hands[2]` (raw tracked wrist,
   palm, index proximal..tip, thumb tip, middle tip in driver space, server receive time, and the
   client's drawing factors); request v3 hand finger correction (`handFingerScale[2]`, sequence,

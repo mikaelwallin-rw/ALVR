@@ -265,9 +265,7 @@ fn client_thread(
                 | ClientCoreEvent::RealTimeConfig(_)
                 | ClientCoreEvent::CameraFrames(_)
                 | ClientCoreEvent::NativeQuads(_)
-                | ClientCoreEvent::AnchorRequest(_)
-                | ClientCoreEvent::HandCorrection(_)
-                | ClientCoreEvent::HandDisplay(_) => (),
+                | ClientCoreEvent::AnchorRequest(_) => (),
             }
 
             output_sender.send(window_output.clone()).ok();

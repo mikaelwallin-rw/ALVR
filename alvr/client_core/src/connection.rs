@@ -681,16 +681,11 @@ fn connection_pipeline(
                             .lock()
                             .push_back(ClientCoreEvent::AnchorRequest(request));
                     }
-                    Ok(ServerControlPacket::HandCorrection(correction)) => {
-                        event_queue
-                            .lock()
-                            .push_back(ClientCoreEvent::HandCorrection(correction));
-                    }
-                    Ok(ServerControlPacket::HandDisplay(display)) => {
-                        event_queue
-                            .lock()
-                            .push_back(ClientCoreEvent::HandDisplay(display));
-                    }
+                    // No longer applied (cleanup 2026-11-13); an older server may still send them
+                    Ok(
+                        ServerControlPacket::HandCorrection(_)
+                        | ServerControlPacket::HandDisplay(_),
+                    ) => {}
                     Ok(ServerControlPacket::StartStream) => {
                         error!("Unexpected StartStream paceket");
                     }

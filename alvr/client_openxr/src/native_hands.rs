@@ -12,12 +12,10 @@ use alvr_common::{
     warn,
 };
 use alvr_graphics::{
-    GraphicsContext, HAND_JOINT_COUNT, HandShape, HandsRenderer, HandsViewParams,
-    finger_length_factors, gl_format_to_wgpu, lengthen_fingers,
+    GraphicsContext, HAND_JOINT_COUNT, HandShape, HandsRenderer, HandsViewParams, gl_format_to_wgpu,
 };
-use alvr_packets::{HandCorrection, HandDisplay, HandShapeInfo};
+use alvr_packets::HandShapeInfo;
 use openxr as xr;
-use std::time::Instant;
 use std::{rc::Rc, time::Duration};
 
 // Defaults of the hands layer: resolution relative to the stream view resolution, and MSAA sample
@@ -73,28 +71,12 @@ impl ShapeSettings {
         settings
     }
 
-    fn shape(&self, fingers: f32) -> HandShape {
+    fn shape(&self) -> HandShape {
         HandShape {
             girth: [self.thickness; HAND_JOINT_COUNT],
-            length: finger_length_factors(fingers),
             scale: self.scale,
         }
     }
-}
-
-// Overlay app correction factor for one hand: full within half `near_meters` of the plane, fading
-// (smoothstep) to none at `near_meters`
-fn correction_factor(correction: &HandCorrection, hand: usize, index_tip: Vec3) -> f32 {
-    let scale = correction.finger_scale[hand];
-    if !scale.is_finite() || correction.near_meters <= 0.0 {
-        return 1.0;
-    }
-    let normal = correction.plane.orientation * Vec3::Z;
-    let distance = normal.dot(index_tip - correction.plane.position).abs();
-    let near = correction.near_meters;
-    let t = ((near - distance) / (near * 0.5)).clamp(0.0, 1.0);
-    let t = t * t * (3.0 - 2.0 * t);
-    1.0 + (scale.clamp(0.8, 1.5) - 1.0) * t
 }
 
 // Sum of the bone lengths from the wrist to the middle finger tip
@@ -120,10 +102,6 @@ pub struct NativeHands {
     in_view_log_state: Option<bool>,
     shape_text: String,
     shape_settings: ShapeSettings,
-    // Overlay app's automatic correction, and what was applied in the last frame
-    correction: Option<HandCorrection>,
-    applied_correction: [f32; 2],
-    display: crate::hand_display::HandDisplayState,
     // View poses and FoVs of the last rendered frame, None when no hand was drawn
     rendered_views: Option<[xr::View; 2]>,
     visible_log_state: [bool; 2],
@@ -150,9 +128,6 @@ impl NativeHands {
             in_view_log_state: None,
             shape_text: String::new(),
             shape_settings: ShapeSettings::default(),
-            correction: None,
-            applied_correction: [1.0; 2],
-            display: crate::hand_display::HandDisplayState::default(),
             rendered_views: None,
             visible_log_state: [false; 2],
         })
@@ -216,27 +191,15 @@ impl NativeHands {
         }
     }
 
-    /// The overlay app's automatic hand correction (latest replaces earlier)
-    pub fn set_correction(&mut self, correction: HandCorrection) {
-        info!("Native hands: correction {correction:?}");
-        self.correction = Some(correction);
-    }
-
-    /// The overlay app's hand display transform (glides from the current one)
-    pub fn set_display(&mut self, display: HandDisplay) {
-        info!("Native hands: display transform {display:?}");
-        self.display.set(display, Instant::now());
-    }
-
     /// What the hands are drawn with (reported to the server for the overlay app)
     pub fn shape_info(&self) -> HandShapeInfo {
         HandShapeInfo {
             thickness: self.shape_settings.thickness,
             scale: self.shape_settings.scale,
-            // The finger length switch is gone: only the overlay app's correction changes it
+            // Fingers are drawn as tracked (no length switch, no overlay app correction)
             fingers: 1.0,
-            finger_correction: self.applied_correction,
-            correction_sequence: self.correction.map_or(0, |correction| correction.sequence),
+            finger_correction: [1.0; 2],
+            correction_sequence: 0,
         }
     }
 
@@ -397,36 +360,6 @@ impl NativeHands {
             swapchain.wait_image(xr::Duration::INFINITE).ok();
         }
 
-        // Finger length: the overlay app's correction near the touchscreen. Only the DRAWN joints
-        // change; the joints reported to the server are the raw tracked ones.
-        let fingers = [0, 1].map(|idx| {
-            let correction = match (&self.correction, &hands[idx]) {
-                (Some(correction), Some(joints)) => {
-                    correction_factor(correction, idx, joints[10].position)
-                }
-                _ => 1.0,
-            };
-            self.applied_correction[idx] = correction;
-            correction
-        });
-        // Then the overlay app's display transform, weighted by the raw index tip's distance from
-        // the published touch display (sizes scale with it)
-        let now = Instant::now();
-        let display = [0, 1].map(|idx| match &hands[idx] {
-            Some(joints) => self.display.for_hand(joints[10].position, now),
-            None => crate::hand_display::DisplayTransform::IDENTITY,
-        });
-        let drawn = [0, 1].map(|idx| {
-            hands[idx].map(|joints| {
-                let joints = if (fingers[idx] - 1.0).abs() > 1e-4 {
-                    lengthen_fingers(&joints, fingers[idx])
-                } else {
-                    joints
-                };
-                joints.map(|joint| display[idx].apply_pose(joint))
-            })
-        });
-
         self.renderer.render(
             [0, 1].map(|idx| HandsViewParams {
                 swapchain_index: swapchain_indices[idx],
@@ -435,14 +368,8 @@ impl NativeHands {
                     fov: crate::from_xr_fov(views[idx].fov),
                 },
             }),
-            drawn,
-            [0, 1].map(|idx| {
-                let mut shape = self.shape_settings.shape(fingers[idx]);
-                let size = display[idx].scale;
-                shape.girth = shape.girth.map(|girth| girth * size);
-                shape.length = shape.length.map(|length| length * size);
-                shape
-            }),
+            hands,
+            [self.shape_settings.shape(); 2],
         );
 
         for swapchain in &mut self.swapchains {

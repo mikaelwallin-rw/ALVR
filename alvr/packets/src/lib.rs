@@ -232,6 +232,8 @@ pub enum ServerControlPacket {
     NativeQuads(Vec<NativeQuad>),
     // Overlay app's persistent anchor command (create/replace or forget)
     AnchorRequest(AnchorRequest),
+    // NO LONGER SENT (cleanup 2026-11-13, stage 1): kept only so that this server and an older
+    // client still decode each other's packets; removed together with a protocol version bump.
     // Overlay app's automatic hand correction (lengthened drawn fingers near the touchscreen)
     HandCorrection(HandCorrection),
     // Overlay app's hand display transform (drawn hands into the passthrough-consistent frame)
@@ -283,12 +285,11 @@ pub struct HandShapeInfo {
     pub thickness: f32,
     /// Uniform scale about the wrist
     pub scale: f32,
-    /// Finger length factor from the client's own settings
+    /// Finger length factor: always 1 since the 2026-11-13 cleanup (fingers drawn as tracked)
     pub fingers: f32,
-    /// Overlay app correction currently applied per hand (left, right; 1 = none), on top of
-    /// `fingers`
+    /// Overlay app finger correction per hand (left, right): always 1 since the 2026-11-13 cleanup
     pub finger_correction: [f32; 2],
-    /// Sequence of the last HandCorrection received (0 = none)
+    /// Sequence of the last hand correction applied: always 0 since the 2026-11-13 cleanup
     pub correction_sequence: u32,
 }
 

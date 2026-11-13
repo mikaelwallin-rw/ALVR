@@ -26,8 +26,8 @@ use alvr_common::{
 };
 use alvr_packets::{
     AnchorRequest, BatteryInfo, ButtonEntry, CameraFrame, CameraFramesConfig, ClientControlPacket,
-    HandCorrection, HandDisplay, HandShapeInfo, NativeQuad, OpaqueRegion, RealTimeConfig,
-    ScreenVideoPacketHeader, StageInfo, StreamConfig, TrackingData,
+    HandShapeInfo, NativeQuad, OpaqueRegion, RealTimeConfig, ScreenVideoPacketHeader, StageInfo,
+    StreamConfig, TrackingData,
 };
 use alvr_session::CodecType;
 use alvr_system_info::Platform;
@@ -64,10 +64,6 @@ pub enum ClientCoreEvent {
     NativeQuads(Vec<NativeQuad>),
     // Overlay app's persistent anchor command
     AnchorRequest(AnchorRequest),
-    // Overlay app's automatic hand correction
-    HandCorrection(HandCorrection),
-    // Overlay app's hand display transform
-    HandDisplay(HandDisplay),
 }
 
 // Note: this struct may change without breaking network protocol changes
@@ -324,7 +320,9 @@ impl ClientCoreContext {
     /// Tagged payloads (e.g. alvr_packets::TrackingStateReport) that any server can ignore
     pub fn send_reserved_buffer(&self, bytes: Vec<u8>) {
         if let Some(sender) = &mut *self.connection_context.control_sender.lock() {
-            sender.send(&ClientControlPacket::ReservedBuffer(bytes)).ok();
+            sender
+                .send(&ClientControlPacket::ReservedBuffer(bytes))
+                .ok();
         }
     }
 

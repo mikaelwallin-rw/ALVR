@@ -4,7 +4,6 @@ mod debug_switches;
 mod extra_extensions;
 mod gl_state;
 mod graphics;
-mod hand_display;
 mod input_diagnostics;
 mod interaction;
 mod loading_screen;
@@ -286,7 +285,7 @@ pub fn entry_point() {
             tracking_diag::VIRTUAL_BOUNDARY_EXTENSION_NAME,
         ]
         .into_iter()
-            .map(|s| format!("{s}\0").into_bytes()),
+        .map(|s| format!("{s}\0").into_bytes()),
     )
     .collect();
 
@@ -473,9 +472,7 @@ pub fn entry_point() {
         let mut loading_guard = loading_screen::LoadingGuard::default();
         let mut loading_screen = None::<loading_screen::LoadingScreen>;
         let mut loading_output = None::<loading_screen::GuardOutput>;
-        // Overlay app's hand correction (kept across stream restarts) and the last reported shape
-        let mut hand_correction = None::<alvr_packets::HandCorrection>;
-        let mut hand_display = None::<alvr_packets::HandDisplay>;
+        // The last reported hand shape
         let mut last_hand_shape_sent = None::<(String, Instant)>;
         let mut ref_markers = ref_markers::RefMarkers::new(&graphics_context);
         let mut stage_identity = stage_identity::StageIdentity::new(&xr_session);
@@ -603,14 +600,6 @@ pub fn entry_point() {
                             &graphics_context,
                             context.target_view_resolution(),
                         );
-                        if let (Some(hands), Some(correction)) =
-                            (&mut native_hands, hand_correction)
-                        {
-                            hands.set_correction(correction);
-                        }
-                        if let (Some(hands), Some(display)) = (&mut native_hands, hand_display) {
-                            hands.set_display(display);
-                        }
                         stream_context = Some(context);
 
                         core_context.send_proximity_state(headset_is_worn);
@@ -670,18 +659,6 @@ pub fn entry_point() {
                     }
                     ClientCoreEvent::AnchorRequest(request) => {
                         stage_identity.on_anchor_request(request);
-                    }
-                    ClientCoreEvent::HandDisplay(display) => {
-                        hand_display = Some(display);
-                        if let Some(hands) = &mut native_hands {
-                            hands.set_display(display);
-                        }
-                    }
-                    ClientCoreEvent::HandCorrection(correction) => {
-                        hand_correction = Some(correction);
-                        if let Some(hands) = &mut native_hands {
-                            hands.set_correction(correction);
-                        }
                     }
                     ClientCoreEvent::RealTimeConfig(config) => {
                         let has_token =

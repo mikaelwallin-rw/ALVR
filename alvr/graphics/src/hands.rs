@@ -11,7 +11,7 @@
 // -Z runs along the bone) scaled per joint, so fingertip and joint POSITIONS stay exactly where
 // tracking puts them; scale = uniform about the wrist (moves the fingertips, off by default).
 // The mesh's own girth per joint (median distance of the vertices it dominates from the bone
-// axis) is measured at load, so the tracked XR_EXT_hand_tracking joint radii can drive it.
+// axis) is measured at load and logged next to the tracked XR_EXT_hand_tracking joint radii.
 
 use super::{GraphicsContext, MAX_PUSH_CONSTANTS_SIZE};
 use alvr_common::{
@@ -87,9 +87,6 @@ struct MeshVertex {
 pub struct HandShape {
     /// Girth factor per joint (1 = the mesh as modelled), applied perpendicular to the bones
     pub girth: [f32; HAND_JOINT_COUNT],
-    /// Length factor per joint along its bone (joint-local Z): match it to how far the joints were
-    /// moved apart (finger lengthening, see lengthen_fingers()) so the segments stretch with them
-    pub length: [f32; HAND_JOINT_COUNT],
     /// Uniform scale about the wrist (1 = the tracked joint positions)
     pub scale: f32,
 }
@@ -98,47 +95,9 @@ impl Default for HandShape {
     fn default() -> Self {
         Self {
             girth: [1.0; HAND_JOINT_COUNT],
-            length: [1.0; HAND_JOINT_COUNT],
             scale: 1.0,
         }
     }
-}
-
-/// XR_EXT_hand_tracking finger chains, each from its knuckle (the base, which stays) to the tip:
-/// thumb, index, middle, ring, little
-pub const HAND_FINGER_CHAINS: [&[usize]; 5] = [
-    &[3, 4, 5],
-    &[7, 8, 9, 10],
-    &[12, 13, 14, 15],
-    &[17, 18, 19, 20],
-    &[22, 23, 24, 25],
-];
-
-/// Lengthens every finger bone by `factor` (palm, wrist, metacarpals and knuckles stay): each joint
-/// after a finger's knuckle moves outward along its finger, orientations unchanged
-pub fn lengthen_fingers(
-    joints: &[Pose; HAND_JOINT_COUNT],
-    factor: f32,
-) -> [Pose; HAND_JOINT_COUNT] {
-    let mut out = *joints;
-    for chain in HAND_FINGER_CHAINS {
-        let base = joints[chain[0]].position;
-        for &joint in &chain[1..] {
-            out[joint].position = base + (joints[joint].position - base) * factor;
-        }
-    }
-    out
-}
-
-/// HandShape::length for lengthen_fingers(factor): the finger joints (knuckle to tip) stretch
-pub fn finger_length_factors(factor: f32) -> [f32; HAND_JOINT_COUNT] {
-    let mut length = [1.0; HAND_JOINT_COUNT];
-    for chain in HAND_FINGER_CHAINS {
-        for &joint in chain {
-            length[joint] = factor;
-        }
-    }
-    length
 }
 
 struct HandMesh {
@@ -356,7 +315,7 @@ fn skin_matrices(
         let position = wrist + (joints[idx].position - wrist) * shape.scale;
         let girth = shape.girth[idx];
         Mat4::from_rotation_translation(joints[idx].orientation, position)
-            * Mat4::from_scale(Vec3::new(girth, girth, shape.length[idx]) * shape.scale)
+            * Mat4::from_scale(Vec3::new(girth, girth, 1.0) * shape.scale)
             * joint_from_mesh[idx]
     });
     let normals = points.map(|matrix| matrix.inverse().transpose());
@@ -650,61 +609,5 @@ mod tests {
         let (tip, _) = skin_vertex(&vertex(Vec3::ZERO, 10), &skin);
         let wrist = joints[1].position;
         assert!(tip.distance(wrist + (joints[10].position - wrist) * 1.1) < 1e-6);
-    }
-
-    // A straight hand along -Z (each joint's -Z towards the next), 2 cm bones
-    fn straight_hand() -> [Pose; HAND_JOINT_COUNT] {
-        std::array::from_fn(|idx| Pose {
-            orientation: Quat::IDENTITY,
-            position: Vec3::new(idx as f32 * 0.001, 0.0, -0.02 * idx as f32),
-        })
-    }
-
-    #[test]
-    fn lengthened_fingers_stay_connected_and_the_palm_stays() {
-        let joints = straight_hand();
-        let longer = lengthen_fingers(&joints, 1.2);
-        // Palm, wrist, metacarpals and knuckles unchanged
-        for joint in [0, 1, 2, 3, 6, 7, 11, 12, 16, 17, 21, 22] {
-            assert_eq!(
-                longer[joint].position, joints[joint].position,
-                "joint {joint}"
-            );
-        }
-        for chain in HAND_FINGER_CHAINS {
-            for pair in chain.windows(2) {
-                let before = joints[pair[1]].position - joints[pair[0]].position;
-                let after = longer[pair[1]].position - longer[pair[0]].position;
-                // Each bone 1.2 times as long, same direction: the chain stays connected
-                assert!((after - before * 1.2).length() < 1e-6, "{pair:?}");
-            }
-        }
-
-        // The mesh stretches with the joints: a vertex at the next joint in a joint's bind frame
-        // lands on the moved next joint
-        let joint_from_mesh: [Mat4; HAND_JOINT_COUNT] =
-            std::array::from_fn(|idx| Mat4::from_translation(-joints[idx].position));
-        let shape = HandShape {
-            length: finger_length_factors(1.2),
-            ..Default::default()
-        };
-        let skin = skin_matrices(&joint_from_mesh, &longer, &shape);
-        for chain in HAND_FINGER_CHAINS {
-            for pair in chain.windows(2) {
-                let vertex = MeshVertex {
-                    position: joints[pair[1]].position,
-                    normal: Vec3::Y,
-                    joints: [pair[0], 0, 0, 0],
-                    weights: [1.0, 0.0, 0.0, 0.0],
-                };
-                let (position, _) = skin_vertex(&vertex, &skin);
-                // Bone direction of the straight hand is not exactly -Z (x offset): compare along
-                // the bone only within the girth-free axis
-                let expected = longer[pair[0]].position
-                    + (joints[pair[1]].position - joints[pair[0]].position)
-                        * Vec3::new(1.0, 1.0, 1.2);
-                assert!(position.distance(expected) < 1e-6, "{pair:?}");
-            }
-        }
     }
 }

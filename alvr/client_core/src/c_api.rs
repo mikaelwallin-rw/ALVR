@@ -306,9 +306,7 @@ pub extern "C" fn alvr_poll_event(out_event: *mut AlvrEvent) -> bool {
             // Camera frames and native quads are only handled by the OpenXR client
             ClientCoreEvent::CameraFrames(_)
             | ClientCoreEvent::NativeQuads(_)
-            | ClientCoreEvent::AnchorRequest(_)
-            | ClientCoreEvent::HandCorrection(_)
-            | ClientCoreEvent::HandDisplay(_) => return false,
+            | ClientCoreEvent::AnchorRequest(_) => return false,
         };
 
         unsafe { *out_event = event };

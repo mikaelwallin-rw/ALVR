@@ -1343,8 +1343,6 @@ fn connection_pipeline(
             // Anchor request sequence last forwarded on this connection (the client dedups across
             // connections with its persisted served sequence)
             let mut sent_anchor_sequence = None::<u32>;
-            let mut sent_hand_correction = None::<u32>;
-            let mut sent_hand_display = None::<(u32, bool)>;
             let mut sent_frames = 0_u64;
             let mut bitrate_window_start = Instant::now();
             let mut bitrate_window_bytes = 0_usize;
@@ -1426,27 +1424,6 @@ fn connection_pipeline(
                     {
                         info!("Anchor request {} sent to the client", request.sequence);
                         sent_anchor_sequence = Some(request.sequence);
-                    }
-
-                    if let Some(correction) = tracking_extras::hand_correction()
-                        && sent_hand_correction != Some(correction.sequence)
-                        && control_sender
-                            .lock()
-                            .send(&ServerControlPacket::HandCorrection(correction))
-                            .is_ok()
-                    {
-                        info!("Hand correction {} sent to the client", correction.sequence);
-                        sent_hand_correction = Some(correction.sequence);
-                    }
-
-                    if let Some(display) = tracking_extras::hand_display()
-                        && sent_hand_display != Some((display.sequence, display.active))
-                        && control_sender
-                            .lock()
-                            .send(&ServerControlPacket::HandDisplay(display))
-                            .is_ok()
-                    {
-                        sent_hand_display = Some((display.sequence, display.active));
                     }
                 }
             }
