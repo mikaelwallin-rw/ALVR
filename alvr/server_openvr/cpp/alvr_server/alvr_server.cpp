@@ -93,6 +93,21 @@ public:
         InitializeRuntime(); // sets up rust logging/runtime, keep first
         Debug("DriverProvider::Init");
 
+#ifdef _WIN32
+        // vrserver.exe itself does not load d3d11.dll/dxgi.dll: this driver is their only
+        // importer, so unloading the driver at SteamVR shutdown also unloads them. The GPU
+        // user-mode driver (nvwgf2umx.dll) stays loaded and its worker threads (NVENC/device
+        // threads) can still call back into the D3D11 runtime after that, crashing vrserver
+        // with an access violation in "d3d11.dll_unloaded". Pin both modules so they stay
+        // mapped until the process exits.
+        for (auto name : { L"d3d11.dll", L"dxgi.dll" }) {
+            HMODULE pinned = nullptr;
+            if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, name, &pinned)) {
+                Warn("Could not pin %ls (error %lu)", name, GetLastError());
+            }
+        }
+#endif
+
         VR_INIT_SERVER_DRIVER_CONTEXT(pContext);
         InitDriverLog(vr::VRDriverLog());
 
