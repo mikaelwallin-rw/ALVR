@@ -72,6 +72,30 @@ Read every second (`debug_switches.rs`): `screenvr_video_path.txt`, `screenvr_ha
 `screenvr_switches_applied.txt` (crash-loop guard), `screenvr_stage.txt` (stage identity state; product
 state), `screenvr_tracking_diag.log` (+ `.1`).
 
+## Decode acknowledgement 2026-11-13 (committed locally on top of `30d49d06`, NOT deployed)
+
+The client tells ScreenVR what it decodes of each screen video stream, so that ScreenVR can show a screen as
+its SteamVR overlay when the headset does not decode it (renderer native). Contract and rules:
+`D:\wkspaces\ScreenVR\docs\AlvrInterface.md` (extras v6) and `docs/PhysicalPlacement.md` "Native renderer
+fallback".
+
+- Client (`screen_video.rs`): every 250 ms while streaming, `ScreenVideoDecodeReport` in a `ReservedBuffer`
+  (tag `SVDA`, `alvr/packets/src/tracking_state.rs`): random instance per `ScreenVideoStreams` (new at every
+  stream stop), per stream state (NoDecoder / Decoding / Failed), Referenced flag (a quad shows it), error
+  count, last decoded frame index (mapped back from the presentation time), frames decoded.
+- Server (`tracking_extras.rs`): extras **version 6** (3552 bytes, fits the one page of an older 3400-byte
+  section): `screenVideoReportFlags` (bit 0 Live = a report within 1000 ms), count, report time, instance,
+  4 entries. Log `Screen video decode: ...` on a new instance and every stream state change.
+- **No new packet variant, no version bump:** works with and without `30d49d06`. Any driver/APK pair that
+  connects today still connects; the feature is active only when both are new. Old driver + new APK: the
+  `SVDA` buffer is ignored. New driver + old APK: no reports, Live bit 0, ScreenVR unchanged.
+- Tests: `cargo test -p alvr_packets` (round trip), `-p alvr_server_core --lib` (v6 fields, live bit, log
+  lines), `-p alvr_client_openxr` (report order, frame index mapping); `cargo check -p alvr_client_openxr
+  --target aarch64-linux-android`. Not tested in a headset (the developer PICO had no ALVR installed).
+- Headset test: native renderer, look at the `Screen video decode:` lines in the server log and the
+  `Renderer: '<monitor>' ...` lines in ScreenVR's log; force a failure by a stream size the decoder refuses or
+  by stopping the decoder (no switch for that exists).
+
 ## Commits (on `feature/screen-markers`, NOT pushed)
 
 | Commit | What |
@@ -93,6 +117,7 @@ state), `screenvr_tracking_diag.log` (+ `.1`).
 | (this file) | docs commit on top |
 | `5fc521a4` | Client: SETTLED no longer waits forever for PICO's tracking-established event (deployed APK `ef584717`, 2026-11-12) |
 | `8417f853`, `240eb38d`, + step 6 | Cleanup 2026-11-13 (see "Cleanup 2026-11-13"), NOT deployed |
+| (decode ack commit) | Screen video decode acknowledgement, extras v6 (see "Decode acknowledgement 2026-11-13"), NOT deployed |
 
 Intermediate commits of 2026-11-11 were not build-tested one by one; `c3d3847d` is the deployed tree.
 Deliberately NOT committed: `CLAUDE.md`, `HANDOVER.md`, `resources/SM_Hand_*.FBX`,

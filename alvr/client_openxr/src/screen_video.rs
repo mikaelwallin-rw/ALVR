@@ -11,11 +11,19 @@
 // SWITCH file screenvr_video_path.txt in the app's external files dir, polled: "zero-copy",
 // "mipmapped" or "auto" (per stream, from the quad's texel density versus
 // the display's angular resolution at the current head distance, with hysteresis).
+// Decode acknowledgement: every 250 ms the decoders' state goes to the server
+// (ScreenVideoDecodeReport in a ReservedBuffer; the overlay app reads it from the tracking extras
+// v6), so that the overlay app can show a screen as its own overlay when this client does not
+// decode its stream.
 
 use alvr_client_core::ClientCoreContext;
 use alvr_common::glam::{UVec2, Vec3};
-use alvr_packets::ScreenVideoCodec;
+use alvr_packets::{
+    SCREEN_VIDEO_DECODE_MAX_STREAMS, SCREEN_VIDEO_DECODE_REFERENCED, ScreenVideoCodec,
+    ScreenVideoDecodeStatus, screen_video_decode_state,
+};
 use openxr as xr;
+use std::collections::VecDeque;
 
 /// Where a video stream's quad is, for the auto path choice (STAGE space)
 #[cfg_attr(
@@ -70,6 +78,61 @@ fn parameter_sets(data: &[u8], codec: ScreenVideoCodec) -> Option<&[u8]> {
         .map(|(_, offset)| offset)?;
 
     (first_vcl > 0).then(|| &data[..first_vcl])
+}
+
+// Decode report entries: the streams the quads show first (in quad order, flagged REFERENCED; a
+// shown stream without a decoder is listed as NO_DECODER), then the others by stream id
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn decode_report_streams(
+    mut known: Vec<ScreenVideoDecodeStatus>,
+    referenced: &[u32],
+) -> Vec<ScreenVideoDecodeStatus> {
+    for &stream_id in referenced {
+        if stream_id != 0 && !known.iter().any(|status| status.stream_id == stream_id) {
+            known.push(ScreenVideoDecodeStatus {
+                stream_id,
+                state: screen_video_decode_state::NO_DECODER,
+                ..Default::default()
+            });
+        }
+    }
+    for status in &mut known {
+        if referenced.contains(&status.stream_id) {
+            status.flags |= SCREEN_VIDEO_DECODE_REFERENCED;
+        }
+    }
+    known.sort_by_key(|status| {
+        (
+            referenced
+                .iter()
+                .position(|&id| id == status.stream_id)
+                .unwrap_or(usize::MAX),
+            status.stream_id,
+        )
+    });
+    known.truncate(SCREEN_VIDEO_DECODE_MAX_STREAMS);
+
+    known
+}
+
+// Frames queued into a decoder, by presentation time: (time us, frame index), oldest first.
+// Returns the frame index of the decoder output with presentation time `pts_us` and forgets it and
+// everything older (frames the decoder dropped).
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn take_decoded_frame(in_flight: &mut VecDeque<(u64, u64)>, pts_us: i64) -> Option<u64> {
+    let pts_us = u64::try_from(pts_us).ok()?;
+    let mut found = None;
+    while let Some(&(time_us, frame_index)) = in_flight.front() {
+        if time_us > pts_us {
+            break;
+        }
+        in_flight.pop_front();
+        if time_us == pts_us {
+            found = Some(frame_index);
+        }
+    }
+
+    found
 }
 
 #[cfg(not(target_os = "android"))]
@@ -485,6 +548,10 @@ void main() {
     const IDR_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(200);
     // Nominal presentation time step (the surface is shown as soon as a frame is released)
     const FRAME_TIME_US: u64 = 16_667;
+    // Decode report period (the overlay app treats reports older than 1 s as "no report")
+    const DECODE_REPORT_INTERVAL: Duration = Duration::from_millis(250);
+    // Frames queued into a decoder and not out yet, remembered for the decode report
+    const MAX_IN_FLIGHT: usize = 64;
 
     struct ScreenVideoStream {
         header: ScreenVideoPacketHeader,
@@ -492,7 +559,11 @@ void main() {
         decoder: MediaCodec,
         _window: NativeWindow,
         swapchain: xr::Swapchain<xr::OpenGlEs>,
-        pending: VecDeque<Vec<u8>>,
+        // Access units and their frame index
+        pending: VecDeque<(u64, Vec<u8>)>,
+        // Queued into the decoder: (presentation time us, frame index)
+        in_flight: VecDeque<(u64, u64)>,
+        last_decoded_frame_index: u64,
         waiting_keyframe: bool,
         decoded_frames: u64,
         // Frames released to the zero copy swapchain (it has content once > 0)
@@ -655,6 +726,8 @@ void main() {
                 _window: window,
                 swapchain,
                 pending: VecDeque::new(),
+                in_flight: VecDeque::new(),
+                last_decoded_frame_index: 0,
                 waiting_keyframe: false,
                 decoded_frames: 0,
                 zero_copy_frames: 0,
@@ -750,12 +823,12 @@ void main() {
                 self.request_idr(core_ctx);
                 return;
             }
-            self.pending.push_back(data);
+            self.pending.push_back((header.frame_index, data));
         }
 
         // Feeds pending access units and releases decoded frames to the surface
         fn pump(&mut self, core_ctx: &ClientCoreContext) {
-            while let Some(data) = self.pending.front() {
+            while let Some((frame_index, data)) = self.pending.front() {
                 match self.decoder.dequeue_input_buffer(Duration::ZERO) {
                     Ok(DequeuedInputBufferResult::Buffer(mut buffer)) => {
                         let target = buffer.buffer_mut();
@@ -780,10 +853,16 @@ void main() {
                         };
                         let len = data.len();
                         let time_us = self.queued_frames * FRAME_TIME_US;
+                        let frame_index = *frame_index;
                         if let Err(e) = self.decoder.queue_input_buffer(buffer, 0, len, time_us, 0)
                         {
                             warn!("Screen video: queue_input_buffer: {e}");
                             self.decoder_errors += 1;
+                        } else {
+                            if self.in_flight.len() >= MAX_IN_FLIGHT {
+                                self.in_flight.pop_front();
+                            }
+                            self.in_flight.push_back((time_us, frame_index));
                         }
                         self.queued_frames += 1;
                         self.pending.pop_front();
@@ -800,6 +879,7 @@ void main() {
             loop {
                 match self.decoder.dequeue_output_buffer(Duration::ZERO) {
                     Ok(DequeuedOutputBufferInfoResult::Buffer(buffer)) => {
+                        let pts_us = buffer.info().presentation_time_us();
                         if let Err(e) = self.decoder.release_output_buffer(buffer, true) {
                             warn!("Screen video: release_output_buffer: {e}");
                             self.decoder_errors += 1;
@@ -816,6 +896,9 @@ void main() {
                         }
                         self.decoded_frames += 1;
                         self.decoder_errors = 0;
+                        if let Some(frame_index) = take_decoded_frame(&mut self.in_flight, pts_us) {
+                            self.last_decoded_frame_index = frame_index;
+                        }
                     }
                     Ok(DequeuedOutputBufferInfoResult::TryAgainLater) => break,
                     Ok(event) => info!("Screen video: decoder event {event:?}"),
@@ -846,6 +929,26 @@ void main() {
         blit_program: Option<BlitProgram>,
         blit_program_failed: bool,
         logged_display_ppd: bool,
+        // Decode report: random per set of decoders, last time sent
+        instance: u64,
+        last_decode_report: Option<Instant>,
+    }
+
+    fn random_instance() -> u64 {
+        use std::hash::{BuildHasher, Hasher};
+        loop {
+            let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+            hasher.write_u128(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+            );
+            let value = hasher.finish();
+            if value != 0 {
+                return value;
+            }
+        }
     }
 
     impl ScreenVideoStreams {
@@ -860,6 +963,8 @@ void main() {
                 blit_program: None,
                 blit_program_failed: false,
                 logged_display_ppd: false,
+                instance: random_instance(),
+                last_decode_report: None,
             }
         }
 
@@ -1077,6 +1182,56 @@ void main() {
             let streams = &self.streams;
             self.missing_stream_idr_requests
                 .retain(|stream_id, _| !streams.contains_key(stream_id));
+
+            self.send_decode_report(core_ctx, quads);
+        }
+
+        // Every DECODE_REPORT_INTERVAL while rendering (also with no stream: the reports themselves
+        // tell the overlay app that this client reports decode state)
+        fn send_decode_report(
+            &mut self,
+            core_ctx: &ClientCoreContext,
+            quads: &[VideoQuadGeometry],
+        ) {
+            if self
+                .last_decode_report
+                .is_some_and(|instant| instant.elapsed() < DECODE_REPORT_INTERVAL)
+            {
+                return;
+            }
+            self.last_decode_report = Some(Instant::now());
+
+            let mut known: Vec<ScreenVideoDecodeStatus> = self
+                .streams
+                .iter()
+                .map(|(&stream_id, stream)| ScreenVideoDecodeStatus {
+                    stream_id,
+                    state: if stream.decoder_errors > MAX_DECODER_ERRORS {
+                        screen_video_decode_state::FAILED
+                    } else {
+                        screen_video_decode_state::DECODING
+                    },
+                    flags: 0,
+                    error_count: stream.decoder_errors,
+                    last_decoded_frame_index: stream.last_decoded_frame_index,
+                    frames_decoded: stream.decoded_frames,
+                })
+                .collect();
+            for &stream_id in self.failed_streams.keys() {
+                if !self.streams.contains_key(&stream_id) {
+                    known.push(ScreenVideoDecodeStatus {
+                        stream_id,
+                        state: screen_video_decode_state::FAILED,
+                        ..Default::default()
+                    });
+                }
+            }
+            let referenced: Vec<u32> = quads.iter().map(|quad| quad.stream_id).collect();
+            let report = alvr_packets::ScreenVideoDecodeReport {
+                client_instance: self.instance,
+                streams: decode_report_streams(known, &referenced),
+            };
+            core_ctx.send_reserved_buffer(report.encode());
         }
 
         fn request_missing_stream_idr(&mut self, core_ctx: &ClientCoreContext, stream_id: u32) {
@@ -1123,6 +1278,59 @@ void main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_report_lists_shown_streams_first() {
+        let decoding = |stream_id, last| ScreenVideoDecodeStatus {
+            stream_id,
+            state: screen_video_decode_state::DECODING,
+            last_decoded_frame_index: last,
+            ..Default::default()
+        };
+        let failed = ScreenVideoDecodeStatus {
+            stream_id: 30,
+            state: screen_video_decode_state::FAILED,
+            ..Default::default()
+        };
+        // Decoders for 10 (superseded, no quad) and 20; 30 failed; quads show 40 (no decoder yet),
+        // 20 and 30
+        let streams = decode_report_streams(
+            vec![decoding(10, 5), decoding(20, 7), failed],
+            &[40, 20, 30],
+        );
+        let ids: Vec<u32> = streams.iter().map(|status| status.stream_id).collect();
+        assert_eq!(ids, [40, 20, 30, 10]);
+        assert_eq!(streams[0].state, screen_video_decode_state::NO_DECODER);
+        assert_eq!(streams[0].flags, SCREEN_VIDEO_DECODE_REFERENCED);
+        assert_eq!(streams[1].last_decoded_frame_index, 7);
+        assert_eq!(streams[2].state, screen_video_decode_state::FAILED);
+        assert_eq!(streams[3].flags, 0);
+
+        // At most SCREEN_VIDEO_DECODE_MAX_STREAMS entries; no quad, no stream: an empty report
+        let many: Vec<_> = (1..=20).map(|id| decoding(id, 0)).collect();
+        assert_eq!(
+            decode_report_streams(many, &[]).len(),
+            SCREEN_VIDEO_DECODE_MAX_STREAMS
+        );
+        assert!(decode_report_streams(Vec::new(), &[]).is_empty());
+        // Stream id 0 (a quad without video) is not a stream
+        assert!(decode_report_streams(Vec::new(), &[0]).is_empty());
+    }
+
+    #[test]
+    fn decoded_frames_map_back_to_frame_indices() {
+        let mut in_flight: VecDeque<(u64, u64)> =
+            [(0, 11), (16_667, 12), (33_334, 15)].into_iter().collect();
+        assert_eq!(take_decoded_frame(&mut in_flight, 0), Some(11));
+        // The decoder dropped frame 12: its entry goes with the next output
+        assert_eq!(take_decoded_frame(&mut in_flight, 33_334), Some(15));
+        assert!(in_flight.is_empty());
+        // Unknown presentation time (nothing queued at that time): no frame index
+        let mut in_flight: VecDeque<(u64, u64)> = [(50_000, 3)].into_iter().collect();
+        assert_eq!(take_decoded_frame(&mut in_flight, 10), None);
+        assert_eq!(in_flight.len(), 1);
+        assert_eq!(take_decoded_frame(&mut in_flight, -1), None);
+    }
 
     #[test]
     fn finds_hevc_parameter_sets() {

@@ -13,6 +13,9 @@
 // - Version 4: hands[2] (raw tracked joints, driver space) and how the client draws them. Request
 //   versions 3 and 4 (hand correction, hand display transform) are no longer read: their fields
 //   are reserved (ScreenVR writes them as zero); the layout and size stay.
+// - Version 6: the client's screen video decode report (ReservedBuffer 'SVDA'): per stream the
+//   decoder state and the last decoded frame index, so that the overlay can fall back to its own
+//   overlay for a stream the headset does not decode. The live bit is the capability.
 // - Version 3: STAGE identity (changes only when the physical STAGE moves), the persistent anchor
 //   and the headset model, from the client's StageInfo reports. Request version 2: anchor commands,
 //   forwarded to the client as AnchorRequest.
@@ -50,8 +53,8 @@ pub(crate) fn to_matrix(pose: Pose) -> [[f32; 4]; 3] {
 #[cfg(windows)]
 pub use windows_impl::{
     TRACKING_EXTRAS_WRITER, anchor_request, bump_stage_epoch, camera_frames_request,
-    recenter_counter, report_hand_shape, report_stage_info, report_tracking, report_tracking_state,
-    stage_epoch, tracking_epoch_for,
+    recenter_counter, report_hand_shape, report_screen_video_decode, report_stage_info,
+    report_tracking, report_tracking_state, stage_epoch, tracking_epoch_for,
 };
 
 /// Joints of a hand skeleton (XR_EXT_hand_tracking order, 26), driver space
@@ -186,11 +189,16 @@ pub fn report_reserved_buffer(bytes: &[u8]) {
         report_tracking_state(report);
     } else if let Some(stamp) = alvr_packets::CameraTrackingStamp::decode(bytes) {
         crate::camera_frames::report_stamp(stamp);
+    } else if let Some(report) = alvr_packets::ScreenVideoDecodeReport::decode(bytes) {
+        report_screen_video_decode(report);
     }
 }
 
 #[cfg(not(windows))]
 pub fn report_tracking_state(_report: alvr_packets::TrackingStateReport) {}
+
+#[cfg(not(windows))]
+pub fn report_screen_video_decode(_report: alvr_packets::ScreenVideoDecodeReport) {}
 
 #[cfg(not(windows))]
 pub fn tracking_epoch_for(_client_instance: u64, _client_epoch: u32) -> u32 {
@@ -286,7 +294,9 @@ mod windows_impl {
         parking_lot::Mutex,
         warn,
     };
-    use alvr_packets::{AnchorRequest, AnchorRequestKind, HandShapeInfo, StageInfo};
+    use alvr_packets::{
+        AnchorRequest, AnchorRequestKind, HandShapeInfo, ScreenVideoDecodeReport, StageInfo,
+    };
     use std::{
         mem, ptr,
         sync::atomic::{self, AtomicU32, Ordering},
@@ -312,7 +322,12 @@ mod windows_impl {
     // name, version 4 the tracked hands: older readers only read the first 2256 / 2264 / 2456 bytes
     // Version 5: head tracking continuity (tracking epoch, head tracking flags, floor-height
     // STAGE changes); older readers only read the first 3304 bytes
-    const VERSION: u32 = 5;
+    // Version 6: screen video decode report; older readers only read the first 3400 bytes
+    const VERSION: u32 = 6;
+    // screenVideoReportFlags bit 0: a decode report arrived within STALE_MS (the capability)
+    const SCREEN_VIDEO_REPORT_LIVE: u32 = 1;
+    // = kVrScreenVideoDecodeMaxStreams (the overlay's stream slots)
+    const SCREEN_VIDEO_DECODE_STREAMS: usize = 4;
     // Oldest request block accepted; version 2 appends the anchor request
     const REQUEST_VERSION: u32 = 1;
     const REQUEST_VERSION_ANCHOR: u32 = 2;
@@ -405,6 +420,23 @@ mod windows_impl {
         stage_change_epoch: u32,
         stage_change_from_previous: [[f32; 4]; 3],
         tracking_report_ms: u64,
+        // Version 6
+        screen_video_report_flags: u32,
+        screen_video_stream_count: u32,
+        screen_video_report_ms: u64,
+        screen_video_client_instance: u64,
+        screen_video_streams: [RawScreenVideoDecode; SCREEN_VIDEO_DECODE_STREAMS],
+    }
+
+    #[repr(C, packed(4))]
+    #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+    struct RawScreenVideoDecode {
+        stream_id: u32,
+        state: u32,
+        flags: u32,
+        error_count: u32,
+        last_decoded_frame_index: u64,
+        frames_decoded: u64,
     }
 
     #[repr(C, packed(4))]
@@ -464,14 +496,21 @@ mod windows_impl {
     const _: () = assert!(mem::size_of::<RawMarker>() == 64);
     const _: () = assert!(
         mem::size_of::<RawExtrasBlock>()
-            == 24 + 48 + 2 * 64 + 8 + 64 * MAX_MARKERS + 8 + 192 + 2 * 424 + 96
+            == 24 + 48 + 2 * 64 + 8 + 64 * MAX_MARKERS + 8 + 192 + 2 * 424 + 96 + 24 + 32 * 4
     );
     const _: () = assert!(mem::size_of::<RawHand>() == 424);
     const _: () = assert!(mem::offset_of!(RawExtrasBlock, hands) == 2456);
     const _: () = assert!(mem::offset_of!(RawExtrasBlock, head_tracking_flags) == 3304);
     const _: () = assert!(mem::offset_of!(RawExtrasBlock, stage_change_from_previous) == 3344);
     const _: () = assert!(mem::offset_of!(RawExtrasBlock, tracking_report_ms) == 3392);
-    const _: () = assert!(mem::size_of::<RawExtrasBlock>() == 3400);
+    const _: () = assert!(mem::size_of::<RawScreenVideoDecode>() == 32);
+    const _: () = assert!(mem::offset_of!(RawExtrasBlock, screen_video_report_flags) == 3400);
+    const _: () = assert!(mem::offset_of!(RawExtrasBlock, screen_video_report_ms) == 3408);
+    const _: () = assert!(mem::offset_of!(RawExtrasBlock, screen_video_client_instance) == 3416);
+    const _: () = assert!(mem::offset_of!(RawExtrasBlock, screen_video_streams) == 3424);
+    const _: () = assert!(mem::size_of::<RawExtrasBlock>() == 3552);
+    // A section left by an older peer (3400 bytes) spans one page: the block must fit in it
+    const _: () = assert!(mem::size_of::<RawExtrasBlock>() <= 4096);
     const _: () = assert!(mem::offset_of!(RawExtrasBlock, stage_identity) == 2264);
     const _: () = assert!(mem::offset_of!(RawRequestBlock, anchor_request) == 32);
     const _: () = assert!(mem::offset_of!(RawRequestBlock, reserved_v3) == 88);
@@ -557,6 +596,93 @@ mod windows_impl {
             .lock()
             .tracking
             .epoch_for(client_instance, client_epoch)
+    }
+
+    // The client's screen video decode report (every 250 ms while it renders a stream)
+    pub fn report_screen_video_decode(report: ScreenVideoDecodeReport) {
+        let mut writer = TRACKING_EXTRAS_WRITER.lock();
+        let previous = writer.screen_video.as_ref().map(|(previous, _)| previous);
+        for line in screen_video_decode_changes(previous, &report) {
+            info!("Screen video decode: {line}");
+        }
+        writer.screen_video = Some((report, now_ms()));
+        writer.publish();
+    }
+
+    // Log lines for a new client instance and for every stream whose decoder state changed
+    fn screen_video_decode_changes(
+        previous: Option<&ScreenVideoDecodeReport>,
+        report: &ScreenVideoDecodeReport,
+    ) -> Vec<String> {
+        let mut lines = Vec::new();
+        let previous = previous.filter(|p| p.client_instance == report.client_instance);
+        if previous.is_none() {
+            lines.push(format!(
+                "reports from client instance {:016x}",
+                report.client_instance
+            ));
+        }
+        for status in &report.streams {
+            let before = previous
+                .and_then(|p| p.streams.iter().find(|s| s.stream_id == status.stream_id))
+                .map(|s| (s.state, s.flags));
+            if before != Some((status.state, status.flags)) {
+                lines.push(format!(
+                    "stream {} state {} flags {} (errors {}, last frame {}, {} decoded)",
+                    status.stream_id,
+                    status.state,
+                    status.flags,
+                    status.error_count,
+                    status.last_decoded_frame_index,
+                    status.frames_decoded
+                ));
+            }
+        }
+        lines
+    }
+
+    // Version 6 fields of the block
+    struct ScreenVideoFields {
+        flags: u32,
+        count: u32,
+        report_ms: u64,
+        client_instance: u64,
+        streams: [RawScreenVideoDecode; SCREEN_VIDEO_DECODE_STREAMS],
+    }
+
+    fn screen_video_fields(
+        report: Option<&(ScreenVideoDecodeReport, u64)>,
+        now_ms: u64,
+    ) -> ScreenVideoFields {
+        let mut fields = ScreenVideoFields {
+            flags: 0,
+            count: 0,
+            report_ms: 0,
+            client_instance: 0,
+            streams: [RawScreenVideoDecode::default(); SCREEN_VIDEO_DECODE_STREAMS],
+        };
+        let Some((report, report_ms)) = report else {
+            return fields;
+        };
+        if now_ms.saturating_sub(*report_ms) <= STALE_MS {
+            fields.flags = SCREEN_VIDEO_REPORT_LIVE;
+        }
+        // The client lists the streams its quads show first
+        for (raw, status) in fields.streams.iter_mut().zip(&report.streams) {
+            *raw = RawScreenVideoDecode {
+                stream_id: status.stream_id,
+                state: status.state,
+                flags: status.flags,
+                error_count: status.error_count,
+                last_decoded_frame_index: status.last_decoded_frame_index,
+                frames_decoded: status.frames_decoded,
+            };
+        }
+        fields.count = report.streams.len().min(SCREEN_VIDEO_DECODE_STREAMS) as u32;
+        fields.report_ms = *report_ms;
+        fields.client_instance = report.client_instance;
+
+        fields
     }
 
     // What the client applies when drawing the hands
@@ -659,6 +785,8 @@ mod windows_impl {
         hands: [Option<(u64, HandJoints)>; 2],
         hand_shape: Option<HandShapeInfo>,
         tracking: ServerTrackingEpoch,
+        // The client's latest screen video decode report and when it arrived (server ms)
+        screen_video: Option<(ScreenVideoDecodeReport, u64)>,
     }
 
     impl TrackingExtrasWriter {
@@ -686,6 +814,7 @@ mod windows_impl {
                 hands: [None, None],
                 hand_shape: None,
                 tracking: ServerTrackingEpoch::new(),
+                screen_video: None,
             }
         }
 
@@ -860,6 +989,7 @@ mod windows_impl {
                 sample_ms: state.sample_ms,
             });
 
+            let screen_video = screen_video_fields(self.screen_video.as_ref(), now);
             let block = RawExtrasBlock {
                 magic: EXTRAS_MAGIC,
                 version: VERSION,
@@ -899,6 +1029,11 @@ mod windows_impl {
                     self.tracking.stage_from_previous.unwrap_or(Pose::IDENTITY),
                 ),
                 tracking_report_ms: self.tracking.report_ms,
+                screen_video_report_flags: screen_video.flags,
+                screen_video_stream_count: screen_video.count,
+                screen_video_report_ms: screen_video.report_ms,
+                screen_video_client_instance: screen_video.client_instance,
+                screen_video_streams: screen_video.streams,
             };
             let shape = self.hand_shape;
             let hands = std::array::from_fn(|idx| {
@@ -1043,6 +1178,59 @@ mod windows_impl {
     mod tests {
         use super::*;
         use alvr_common::glam::{Quat, Vec3};
+
+        #[test]
+        fn screen_video_decode_report_is_published_with_the_live_bit() {
+            use alvr_packets::{
+                SCREEN_VIDEO_DECODE_REFERENCED, ScreenVideoDecodeStatus, screen_video_decode_state,
+            };
+
+            // No report since vrserver started: all zero (the overlay sees no capability)
+            let none = screen_video_fields(None, 5000);
+            assert_eq!((none.flags, none.count, none.client_instance), (0, 0, 0));
+
+            let status = |stream_id| ScreenVideoDecodeStatus {
+                stream_id,
+                state: screen_video_decode_state::DECODING,
+                flags: SCREEN_VIDEO_DECODE_REFERENCED,
+                error_count: 0,
+                last_decoded_frame_index: 100 + u64::from(stream_id),
+                frames_decoded: 50,
+            };
+            let report = ScreenVideoDecodeReport {
+                client_instance: 0xabc,
+                streams: (1..=6).map(status).collect(),
+            };
+            let fields = screen_video_fields(Some(&(report.clone(), 1000)), 1000 + STALE_MS);
+            assert_eq!(fields.flags, SCREEN_VIDEO_REPORT_LIVE);
+            // The first 4 entries (the client puts the streams its quads show first)
+            assert_eq!(fields.count, 4);
+            assert_eq!(fields.client_instance, 0xabc);
+            let first = fields.streams[0];
+            assert_eq!((first.stream_id, first.last_decoded_frame_index), (1, 101));
+            let last = fields.streams[3];
+            assert_eq!(last.stream_id, 4);
+
+            // Stale: the entries stay (for logs), the capability bit goes
+            let stale = screen_video_fields(Some(&(report.clone(), 1000)), 1001 + STALE_MS);
+            assert_eq!((stale.flags, stale.count), (0, 4));
+
+            // An empty report still says "this client reports decode state"
+            let empty = ScreenVideoDecodeReport {
+                client_instance: 1,
+                streams: Vec::new(),
+            };
+            let fields = screen_video_fields(Some(&(empty, 1000)), 1100);
+            assert_eq!((fields.flags, fields.count), (SCREEN_VIDEO_REPORT_LIVE, 0));
+
+            // Logged: a new instance, then only state changes
+            let lines = screen_video_decode_changes(None, &report);
+            assert_eq!(lines.len(), 7);
+            assert!(screen_video_decode_changes(Some(&report), &report).is_empty());
+            let mut failed = report.clone();
+            failed.streams[2].state = screen_video_decode_state::FAILED;
+            assert_eq!(screen_video_decode_changes(Some(&report), &failed).len(), 1);
+        }
 
         #[test]
         fn matrix_is_row_major_rotation_and_translation() {

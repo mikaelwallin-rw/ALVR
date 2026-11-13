@@ -1,5 +1,6 @@
-// Head tracking continuity, client -> server, carried in ClientControlPacket::ReservedBuffer so
-// that peers of different builds stay compatible: a server that does not know a payload ignores
+// Head tracking continuity and the screen video decode acknowledgement, client -> server,
+// carried in ClientControlPacket::ReservedBuffer so that peers of different builds stay
+// compatible: a server that does not know a payload ignores
 // the whole ReservedBuffer (as upstream and every earlier fork server do), and a server that gets
 // no report publishes "unknown". Payloads are tagged (4 bytes) and versioned (u16), little-endian;
 // a decoder accepts its version or newer (fields are only ever appended) and ignores trailing
@@ -12,8 +13,10 @@ use alvr_common::{
 
 pub const TRACKING_STATE_TAG: [u8; 4] = *b"SVTS";
 pub const CAMERA_STAMP_TAG: [u8; 4] = *b"SVCS";
+pub const SCREEN_VIDEO_DECODE_TAG: [u8; 4] = *b"SVDA";
 const TRACKING_STATE_VERSION: u16 = 1;
 const CAMERA_STAMP_VERSION: u16 = 1;
+const SCREEN_VIDEO_DECODE_VERSION: u16 = 1;
 
 /// Head tracking flags (TrackingStateReport::flags, CameraTrackingStamp::flags)
 pub const HEAD_POSITION_TRACKED: u32 = 1 << 0;
@@ -79,6 +82,50 @@ pub struct CameraTrackingStamp {
     pub client_epoch: u32,
     /// HEAD_* bits at capture time; HEAD_STAMP_KNOWN clear = no sample close to it
     pub flags: u32,
+}
+
+/// ScreenVideoDecodeStatus::state (values shared with ScreenVR's VrScreenVideoDecodeState)
+pub mod screen_video_decode_state {
+    /// No decoder (yet): waiting for a keyframe, or closed
+    pub const NO_DECODER: u32 = 0;
+    pub const DECODING: u32 = 1;
+    /// The decoder could not be created, or too many decoder errors in a row (recreated at the
+    /// next keyframe)
+    pub const FAILED: u32 = 2;
+}
+
+/// ScreenVideoDecodeStatus::flags: a native quad shows this stream now
+pub const SCREEN_VIDEO_DECODE_REFERENCED: u32 = 1 << 0;
+
+/// Entries in one report (the overlay app has 4 stream slots; superseded streams may still have a
+/// decoder for a while)
+pub const SCREEN_VIDEO_DECODE_MAX_STREAMS: usize = 8;
+
+/// What the client decodes of one screen video stream
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScreenVideoDecodeStatus {
+    pub stream_id: u32,
+    /// screen_video_decode_state::*
+    pub state: u32,
+    /// SCREEN_VIDEO_DECODE_REFERENCED
+    pub flags: u32,
+    /// Decoder errors in a row
+    pub error_count: u32,
+    /// ScreenVideoPacketHeader::frame_index of the last frame that came out of the decoder and was
+    /// released to the quad's surface (0 = none yet)
+    pub last_decoded_frame_index: u64,
+    /// Frames decoded by the current decoder of this stream
+    pub frames_decoded: u64,
+}
+
+/// Screen video decode acknowledgement: the client's decoders, sent every 250 ms while it renders a
+/// stream. That reports arrive at all is the capability (an older client never sends them).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScreenVideoDecodeReport {
+    /// Random per set of decoders (new per client process and whenever streaming stops)
+    pub client_instance: u64,
+    /// Streams shown by a quad first; at most SCREEN_VIDEO_DECODE_MAX_STREAMS
+    pub streams: Vec<ScreenVideoDecodeStatus>,
 }
 
 struct Writer(Vec<u8>);
@@ -197,6 +244,49 @@ impl CameraTrackingStamp {
     }
 }
 
+impl ScreenVideoDecodeReport {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new(SCREEN_VIDEO_DECODE_TAG, SCREEN_VIDEO_DECODE_VERSION);
+        w.u64(self.client_instance);
+        let count = self.streams.len().min(SCREEN_VIDEO_DECODE_MAX_STREAMS);
+        w.u32(count as u32);
+        for status in &self.streams[..count] {
+            w.u32(status.stream_id);
+            w.u32(status.state);
+            w.u32(status.flags);
+            w.u32(status.error_count);
+            w.u64(status.last_decoded_frame_index);
+            w.u64(status.frames_decoded);
+        }
+        w.0
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut r = open(bytes, SCREEN_VIDEO_DECODE_TAG, SCREEN_VIDEO_DECODE_VERSION)?;
+        let client_instance = r.u64()?;
+        let count = r.u32()? as usize;
+        if count > SCREEN_VIDEO_DECODE_MAX_STREAMS {
+            return None;
+        }
+        let mut streams = Vec::with_capacity(count);
+        for _ in 0..count {
+            streams.push(ScreenVideoDecodeStatus {
+                stream_id: r.u32()?,
+                state: r.u32()?,
+                flags: r.u32()?,
+                error_count: r.u32()?,
+                last_decoded_frame_index: r.u64()?,
+                frames_decoded: r.u64()?,
+            });
+        }
+
+        Some(Self {
+            client_instance,
+            streams,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,5 +326,59 @@ mod tests {
         };
         assert_eq!(CameraTrackingStamp::decode(&stamp.encode()), Some(stamp));
         assert_eq!(TrackingStateReport::decode(&stamp.encode()), None);
+    }
+
+    #[test]
+    fn screen_video_decode_report_round_trips() {
+        let report = ScreenVideoDecodeReport {
+            client_instance: 0xfeed_beef,
+            streams: vec![
+                ScreenVideoDecodeStatus {
+                    stream_id: 12,
+                    state: screen_video_decode_state::DECODING,
+                    flags: SCREEN_VIDEO_DECODE_REFERENCED,
+                    error_count: 0,
+                    last_decoded_frame_index: 4711,
+                    frames_decoded: 300,
+                },
+                ScreenVideoDecodeStatus {
+                    stream_id: 13,
+                    state: screen_video_decode_state::FAILED,
+                    ..Default::default()
+                },
+            ],
+        };
+        let bytes = report.encode();
+        assert_eq!(
+            ScreenVideoDecodeReport::decode(&bytes),
+            Some(report.clone())
+        );
+        // Other payloads are not decode reports and vice versa
+        assert_eq!(TrackingStateReport::decode(&bytes), None);
+        assert_eq!(CameraTrackingStamp::decode(&bytes), None);
+        // Trailing bytes of a newer version are ignored; truncated is refused
+        let mut longer = bytes.clone();
+        longer.extend_from_slice(&[9; 8]);
+        assert_eq!(ScreenVideoDecodeReport::decode(&longer), Some(report));
+        assert_eq!(
+            ScreenVideoDecodeReport::decode(&bytes[..bytes.len() - 1]),
+            None
+        );
+        // Empty report (no stream yet) still says "this client reports decode state"
+        let empty = ScreenVideoDecodeReport {
+            client_instance: 1,
+            streams: vec![],
+        };
+        assert_eq!(
+            ScreenVideoDecodeReport::decode(&empty.encode()),
+            Some(empty)
+        );
+        // More entries than allowed are cut when encoding
+        let many = ScreenVideoDecodeReport {
+            client_instance: 2,
+            streams: vec![ScreenVideoDecodeStatus::default(); SCREEN_VIDEO_DECODE_MAX_STREAMS + 3],
+        };
+        let decoded = ScreenVideoDecodeReport::decode(&many.encode()).unwrap();
+        assert_eq!(decoded.streams.len(), SCREEN_VIDEO_DECODE_MAX_STREAMS);
     }
 }
