@@ -115,6 +115,12 @@ clock offset), `-p alvr_client_core --lib` (4, reporter), `-p alvr_packets` (`PS
 `-p alvr_session`, `-p alvr_client_openxr` (35); `cargo check -p alvr_client_openxr --target aarch64-linux-android`,
 `cargo check -p alvr_server_openvr -p alvr_dashboard`; clippy: nothing in touched files.
 
+Release build of `b276c534` (`C:\wkspaces\ALVR_phase\build\`, version `21.0.0-dev14.screenvr.1`, same protocol as
+the merge branch, so it pairs with any `merge/upstream-2026-11` driver/APK):
+- `alvr_streamer_windows\alvr_server\bin\win64\driver_alvr_server.dll` sha256 `f641ca889f17a1d2cbdb0e9a6dc34aeead53e90c63c9b926e402ba88d4ad998e`
+- `alvr_streamer_windows\ALVR Dashboard.exe` sha256 `d757ae9f284e964977215790c33d2ae31fb3d1267605fe576dbab8f565e74282`
+- `alvr_client_android\alvr_client_android.apk` sha256 `f9dcb26ec31a2a3461639e3f6bf624ac8df1772ae71ae72e35f9dae5cc4e368f`
+
 ### Not known yet (needs the rig)
 
 - That SteamVR's compositor really follows the shifted `PostPresent` timing 1:1 (expected from the code; if not, the
