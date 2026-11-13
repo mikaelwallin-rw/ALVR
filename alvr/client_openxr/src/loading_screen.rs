@@ -11,6 +11,13 @@
 //   stream frame is probed on a sparse grid for the key colour, and the stream is only shown after
 //   CONTENT_FRAMES frames in a row without it. A key colour frame while the stream is shown cuts to
 //   the loading screen in the same frame (it is never presented).
+// - The probe is an asynchronous GPU readback (2026-11-13: the synchronous one stalled the render
+//   thread every frame in scene mode, 1.5 ms mean, 5.8 ms worst). Its result is collected late in
+//   the loop. LoadingGuard::needs_current_probe() says whether this frame's result can change what
+//   is shown in this frame: then the loop waits for it (as late as possible, so the GPU has
+//   usually finished); otherwise it is collected without waiting, or one loop later
+//   (GuardInputs::key_probe_earlier). A late result only ever belongs to a frame that was not
+//   shown: see needs_current_probe().
 //
 // Look (spec): the whole view opaque Tenstar Ocean (a large head-locked quad: a uniform colour looks
 // the same head- or world-locked), and a ring world-locked 2 m ahead, 5 degrees below eye level:
@@ -83,8 +90,11 @@ pub struct GuardInputs {
     pub scene_loading: bool,
     // The stream was rendered this frame (not skipped)
     pub stream_rendered: bool,
-    // Key colour fraction of this frame's new stream frame (None: no new frame or not probed)
+    // Key colour fraction of this frame's new stream frame (None: no new frame, not probed, or
+    // its readback not finished and not needed now)
     pub key_probe: Option<f32>,
+    // Key colour fraction of earlier loops' frames whose readback finished only now (the largest)
+    pub key_probe_earlier: Option<f32>,
     // DEBUG SWITCH screenvr_loading_preview.txt: show this variant over passthrough (tuning)
     pub preview: Option<Variant>,
 }
@@ -146,6 +156,9 @@ pub struct LoadingGuard {
     content_ok: bool,
     previous_scene_mode: bool,
     previous_scene_active: bool,
+    // The previous update's scene loading flag (a key probe result collected a loop late is
+    // applied with its own frame's flag)
+    previous_scene_loading: bool,
     // Real content was shown since the scene (mode or loading flag) began
     scene_content_seen: bool,
     // The stream was submitted last frame
@@ -164,11 +177,74 @@ pub struct LoadingGuard {
 }
 
 impl LoadingGuard {
+    /// Whether this frame's key probe result can change what update() shows in this frame, so
+    /// the render loop must wait for it. It can when the stream was shown opaque in the last
+    /// frame (a key colour frame now cuts to the loading screen at once, also when scene mode or
+    /// the loading flag changes in this frame), or in scene mode without the loading flag while
+    /// content is shown or this frame could complete CONTENT_FRAMES clean frames (with one
+    /// earlier result). It cannot (the stream stays hidden or keyed either way) when:
+    /// - the stream is not rendered;
+    /// - not in scene mode and not shown opaque: the chroma key / passthrough handles key colour,
+    ///   the probe only counts frames;
+    /// - scene loading: clean frames are reset every frame and the stream stays hidden;
+    /// - no content yet and even this frame plus one earlier result cannot complete
+    ///   CONTENT_FRAMES clean frames.
+    ///
+    /// So a key colour frame is still never presented: at a scene start, while the scene app
+    /// shows content, and when it goes back to loading or ends.
+    pub fn needs_current_probe(
+        &self,
+        scene_mode: bool,
+        scene_loading: bool,
+        stream_rendered: bool,
+    ) -> bool {
+        stream_rendered
+            && (self.stream_shown_opaque
+                || (scene_mode
+                    && !scene_loading
+                    && (self.content_ok || self.good_frames + 2 >= CONTENT_FRAMES)))
+    }
+
+    // One probe result: counts clean frames, resets on a key colour frame. Returns key colour.
+    fn apply_probe(&mut self, now: Instant, fraction: f32, scene_loading: bool) -> bool {
+        if fraction >= KEY_FRAME_FRACTION {
+            self.content_ok = false;
+            self.good_frames = 0;
+            return true;
+        }
+        if !self.first_clean_logged
+            && let Some(since) = self.visible_since
+        {
+            // When the scene app's frames really started, against the overlay app's flag
+            info!(
+                "Loading screen: first frame without the key colour {} ms after the loading \
+                 screen appeared (scene loading flag {})",
+                now.saturating_duration_since(since).as_millis(),
+                if scene_loading { "still set" } else { "clear" }
+            );
+            self.first_clean_logged = true;
+        }
+        self.good_frames = self.good_frames.saturating_add(1);
+        if self.good_frames >= CONTENT_FRAMES && !scene_loading {
+            self.content_ok = true;
+        }
+        false
+    }
+
     pub fn update(&mut self, now: Instant, inputs: GuardInputs) -> GuardOutput {
         let dt = self
             .last_update
             .map_or(Duration::ZERO, |last| now.saturating_duration_since(last));
         self.last_update = Some(now);
+
+        // Results of earlier frames that arrived a loop late: applied first, as in their own
+        // loop (before this loop's resets, with their loop's loading flag). A key colour one
+        // also hides the stream now (that frame was not shown, see needs_current_probe(), and
+        // this one may be key colour too)
+        let key_earlier = inputs
+            .key_probe_earlier
+            .is_some_and(|fraction| self.apply_probe(now, fraction, self.previous_scene_loading));
+        self.previous_scene_loading = inputs.scene_loading;
 
         if inputs.scene_mode && !self.previous_scene_mode {
             self.content_ok = false;
@@ -193,33 +269,9 @@ impl LoadingGuard {
             self.content_ok = false;
             self.good_frames = 0;
         }
-        let mut key_now = false;
+        let mut key_now = key_earlier;
         if let Some(fraction) = inputs.key_probe {
-            if fraction >= KEY_FRAME_FRACTION {
-                key_now = true;
-                self.content_ok = false;
-                self.good_frames = 0;
-            } else {
-                if !self.first_clean_logged
-                    && let Some(since) = self.visible_since
-                {
-                    // When the scene app's frames really started, against the overlay app's flag
-                    info!(
-                        "Loading screen: first frame without the key colour {} ms after the loading                          screen appeared (scene loading flag {})",
-                        now.saturating_duration_since(since).as_millis(),
-                        if inputs.scene_loading {
-                            "still set"
-                        } else {
-                            "clear"
-                        }
-                    );
-                    self.first_clean_logged = true;
-                }
-                self.good_frames = self.good_frames.saturating_add(1);
-                if self.good_frames >= CONTENT_FRAMES && !inputs.scene_loading {
-                    self.content_ok = true;
-                }
-            }
+            key_now |= self.apply_probe(now, fraction, inputs.scene_loading);
         }
         if self.content_ok && inputs.scene_mode {
             self.scene_content_seen = true;
@@ -1176,6 +1228,7 @@ mod tests {
             scene_loading: false,
             stream_rendered: true,
             key_probe: None,
+            key_probe_earlier: None,
             preview: None,
         }
     }
@@ -1186,7 +1239,139 @@ mod tests {
             scene_loading: false,
             stream_rendered: true,
             key_probe: key,
+            key_probe_earlier: None,
             preview: None,
+        }
+    }
+
+    // (scene mode, scene loading, key fraction of the frame) per frame: front end, a scene start
+    // with magenta while loading and after the flag cleared, content, the scene app stopping
+    // (magenta before the overlay app's flag), back to loading, content again, scene end
+    fn scene_script() -> Vec<(bool, bool, f32)> {
+        let mut script = vec![];
+        let mut add = |n: usize, mode: bool, loading: bool, key: f32| {
+            script.extend(std::iter::repeat_n((mode, loading, key), n));
+        };
+        add(20, false, false, 0.0);
+        add(50, true, true, 0.97);
+        add(10, true, false, 0.97);
+        add(3, true, false, 0.0);
+        add(1, true, false, 0.9);
+        add(300, true, false, 0.0);
+        add(5, true, false, 0.97);
+        add(30, true, true, 0.97);
+        add(20, true, true, 0.0);
+        add(200, true, false, 0.0);
+        add(2, true, false, 0.97);
+        add(100, true, false, 0.0);
+        add(60, false, true, 0.97);
+        add(100, false, false, 0.0);
+        script
+    }
+
+    #[test]
+    fn the_loop_waits_for_the_probe_only_when_it_can_change_this_frame() {
+        let mut sim = Sim::new();
+        // Front end: never
+        sim.run(Duration::from_millis(100), front_end());
+        assert!(!sim.guard.needs_current_probe(false, false, true));
+        // Scene loading with magenta: never (the stream stays hidden)
+        let loading = GuardInputs {
+            scene_loading: true,
+            ..scene(Some(0.97))
+        };
+        sim.run(Duration::from_millis(500), loading);
+        assert!(!sim.guard.needs_current_probe(true, true, true));
+        // Flag cleared, first clean frames: not until the next result could show the stream
+        let mut needs = vec![];
+        for _ in 0..CONTENT_FRAMES {
+            needs.push(sim.guard.needs_current_probe(true, false, true));
+            sim.step(scene(Some(0.0)));
+        }
+        assert_eq!(needs, [false, false, false, false, true, true]);
+        // Content shown: every frame, also when the loading flag or scene mode changes now
+        assert!(
+            sim.run(Duration::from_secs(1), scene(Some(0.0)))
+                .show_stream
+        );
+        assert!(sim.guard.needs_current_probe(true, false, true));
+        assert!(sim.guard.needs_current_probe(true, true, true));
+        assert!(sim.guard.needs_current_probe(false, true, true));
+        // Not rendered: never
+        assert!(!sim.guard.needs_current_probe(true, false, false));
+    }
+
+    #[test]
+    fn asynchronous_probe_results_show_exactly_what_synchronous_ones_did() {
+        // Synchronous (the old readback): every probed frame's result in its own loop.
+        // Asynchronous: the result is ready in its own loop only sometimes; the loop waits for
+        // it when needs_current_probe() says so, otherwise it arrives one loop later.
+        for ready_pattern in [0_usize, 1, 2, 3] {
+            let mut sync = Sim::new();
+            let mut lagged = Sim::new();
+            let mut sync_probe = false;
+            let mut lagged_probe = false;
+            let mut pending = None::<f32>;
+            let mut waits = 0;
+            for (i, (scene_mode, scene_loading, key)) in scene_script().into_iter().enumerate() {
+                let base = GuardInputs {
+                    scene_mode,
+                    scene_loading,
+                    stream_rendered: true,
+                    key_probe: None,
+                    key_probe_earlier: None,
+                    preview: None,
+                };
+                let sync_output = sync.step(GuardInputs {
+                    key_probe: sync_probe.then_some(key),
+                    ..base
+                });
+                sync_probe = sync_output.probe;
+
+                let earlier = pending.take();
+                let ready_now = match ready_pattern {
+                    0 => false,
+                    1 => true,
+                    2 => i % 2 == 0,
+                    _ => i % 5 != 0,
+                };
+                let current = if lagged_probe {
+                    let needed = lagged
+                        .guard
+                        .needs_current_probe(scene_mode, scene_loading, true);
+                    if needed && !ready_now {
+                        waits += 1;
+                    }
+                    if needed || ready_now {
+                        Some(key)
+                    } else {
+                        pending = Some(key);
+                        None
+                    }
+                } else {
+                    None
+                };
+                let lagged_output = lagged.step(GuardInputs {
+                    key_probe: current,
+                    key_probe_earlier: earlier,
+                    ..base
+                });
+                lagged_probe = lagged_output.probe;
+
+                assert_eq!(
+                    lagged_output, sync_output,
+                    "frame {i}, pattern {ready_pattern}"
+                );
+                assert!(
+                    !(scene_mode && key >= KEY_FRAME_FRACTION && lagged_output.show_stream),
+                    "frame {i}: a key colour frame was shown"
+                );
+            }
+            // With nothing ready in its own loop the loop waits only while content is shown or
+            // about to be: not during loading
+            if ready_pattern == 0 {
+                assert!(waits > 0 && waits < scene_script().len() - 200, "{waits}");
+            }
         }
     }
 

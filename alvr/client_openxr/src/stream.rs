@@ -18,8 +18,8 @@ use alvr_common::{
     parking_lot::RwLock,
 };
 use alvr_graphics::{
-    GraphicsContext, OpaqueRegionGeometry, OpaqueRegionsParams, StreamRenderer, StreamViewParams,
-    key_chroma_direction, magenta_chroma_direction,
+    GraphicsContext, KeyProbeResults, OpaqueRegionGeometry, OpaqueRegionsParams, StreamRenderer,
+    StreamViewParams, key_chroma_direction, magenta_chroma_direction,
 };
 use alvr_packets::{
     CameraFramesConfig, ClientStreamConfig, OpaqueRegion, RealTimeConfig, TrackingData,
@@ -44,6 +44,7 @@ const DECODER_MAX_TIMEOUT_MULTIPLIER: f32 = 0.8;
 // next loop's frame and the client would settle in a different (waiting) state. Half a frame keeps
 // that state out of reach for target margins up to 4 ms (server_core phase_sync.rs).
 const PHASE_SYNC_DECODER_TIMEOUT_MULTIPLIER: f32 = 0.5;
+const KEY_PROBE_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const CM_TO_M: f32 = 0.01;
 
 pub struct ParsedStreamConfig {
@@ -120,19 +121,50 @@ pub struct StreamContext {
     // The last chroma key configured (scene mode sends no passthrough): what key colour frames look
     // like. None until one is configured: magenta is assumed.
     last_key_config: Option<PassthroughMode>,
-    // Key colour probing of each new frame while the loading screen wants it (loading_screen.rs),
-    // and its result for the last render()
+    // Key colour probing of each new frame while the loading screen wants it (loading_screen.rs);
+    // whether render() issued a probe in this loop (collected with take_key_probes())
     key_probe_enabled: bool,
-    key_probe: Option<f32>,
-    // (window start, probes, total, max) for the cost log
-    key_probe_timing: (Instant, u32, Duration, Duration),
+    key_probe_issued: bool,
+    key_probe_stats: KeyProbeStats,
     decoder: Option<(VideoDecoderConfig, VideoDecoderSource)>,
     // The server steers its frame phase (RealTimeConfig EXT_PHASE_SYNC): newest ready frame, half a
     // frame of wait, a report per loop
     phase_sync: bool,
+    // The last render()'s output views (projection_layer())
+    layer_view_params: Option<[ViewParams; 2]>,
     use_custom_reprojection: bool,
     // Running while the server requests headset camera frames
     camera_frames: Option<(CameraFramesConfig, CameraFrameSource)>,
+}
+
+// Key probe cost log (window): probes, results in their own loop without waiting / after waiting
+// (wait total, max), one loop late; stream render() time with a probe (total, max)
+struct KeyProbeStats {
+    window_start: Instant,
+    probes: u32,
+    ready: u32,
+    waited: u32,
+    wait_total: Duration,
+    wait_max: Duration,
+    lagged: u32,
+    render_total: Duration,
+    render_max: Duration,
+}
+
+impl KeyProbeStats {
+    fn new() -> Self {
+        Self {
+            window_start: Instant::now(),
+            probes: 0,
+            ready: 0,
+            waited: 0,
+            wait_total: Duration::ZERO,
+            wait_max: Duration::ZERO,
+            lagged: 0,
+            render_total: Duration::ZERO,
+            render_max: Duration::ZERO,
+        }
+    }
 }
 
 impl StreamContext {
@@ -288,13 +320,14 @@ impl StreamContext {
                 _ => None,
             },
             key_probe_enabled: false,
-            key_probe: None,
-            key_probe_timing: (Instant::now(), 0, Duration::ZERO, Duration::ZERO),
+            key_probe_issued: false,
+            key_probe_stats: KeyProbeStats::new(),
             config,
             target_view_resolution,
             renderer,
             decoder: None,
             phase_sync: false,
+            layer_view_params: None,
         };
 
         this.update_reference_space();
@@ -432,10 +465,53 @@ impl StreamContext {
         }
     }
 
-    /// Probe each new frame for the key colour during render() (synchronous tiny readback) while
-    /// the loading screen needs it; the result is render()'s third value
+    /// Probe each new frame for the key colour (asynchronous tiny readback issued in render(),
+    /// collected with take_key_probes()) while the loading screen needs it
     pub fn set_key_probe(&mut self, wanted: bool) {
         self.key_probe_enabled = wanted;
+    }
+
+    /// The key probe results of this loop's frame and of earlier ones (see
+    /// StreamRenderer::take_key_probes). Call after the other content of the frame was drawn
+    /// (the GPU has had the most time for the readback); wait_for_current: the result can change
+    /// what is shown in this frame (LoadingGuard::needs_current_probe).
+    pub fn take_key_probes(&mut self, wait_for_current: bool) -> KeyProbeResults {
+        let issued = std::mem::take(&mut self.key_probe_issued);
+        let start = Instant::now();
+        let results = self.renderer.take_key_probes(issued, wait_for_current);
+        let elapsed = start.elapsed();
+        let stats = &mut self.key_probe_stats;
+        if issued {
+            if results.newest_pending {
+                stats.lagged += 1;
+            } else if elapsed >= Duration::from_micros(200) && wait_for_current {
+                stats.waited += 1;
+                stats.wait_total += elapsed;
+                stats.wait_max = stats.wait_max.max(elapsed);
+            } else {
+                stats.ready += 1;
+            }
+        }
+        if stats.probes > 0 && stats.window_start.elapsed() >= KEY_PROBE_LOG_INTERVAL {
+            info!(
+                "Key probe: {} frames in {:.1} s (asynchronous 16x16 RGBA readback): result in \
+                 its own loop without waiting {}, after waiting {} (mean {} us, max {} us), one \
+                 loop later {}; stream render() mean {} us, max {} us",
+                stats.probes,
+                stats.window_start.elapsed().as_secs_f32(),
+                stats.ready,
+                stats.waited,
+                stats.wait_total.as_micros() / u128::from(stats.waited.max(1)),
+                stats.wait_max.as_micros(),
+                stats.lagged,
+                stats.render_total.as_micros() / u128::from(stats.probes),
+                stats.render_max.as_micros(),
+            );
+            *stats = KeyProbeStats::new();
+        } else if stats.probes == 0 && stats.window_start.elapsed() >= KEY_PROBE_LOG_INTERVAL {
+            *stats = KeyProbeStats::new();
+        }
+        results
     }
 
     pub fn view_reference_space(&self) -> Arc<xr::Space> {
@@ -506,11 +582,7 @@ impl StreamContext {
             .set(config.log_input_diagnostics);
     }
 
-    pub fn render(
-        &mut self,
-        frame_interval: Duration,
-        vsync_time: Duration,
-    ) -> (ProjectionLayerBuilder<'_>, Duration, Option<f32>) {
+    pub fn render(&mut self, frame_interval: Duration, vsync_time: Duration) -> Duration {
         let xr_vsync_time = xr::Time::from_nanos(vsync_time.as_nanos() as _);
         let poll_start = Instant::now();
         let mut frame_result = None;
@@ -663,8 +735,8 @@ impl StreamContext {
                 );
         }
 
-        let probe_start = Instant::now();
-        let key_fraction = self.renderer.render(
+        let render_start = Instant::now();
+        self.key_probe_issued = self.renderer.render(
             buffer_ptr,
             [
                 StreamViewParams {
@@ -690,32 +762,19 @@ impl StreamContext {
                 debug_tint,
             },
             // A new frame: how much of it is the key colour (e.g. SteamVR's magenta while a scene
-            // app has not presented yet)
+            // app has not presented yet); collected with take_key_probes()
             (self.key_probe_enabled && !buffer_ptr.is_null()).then(|| {
                 self.last_key_config
                     .as_ref()
                     .map_or_else(magenta_chroma_direction, key_chroma_direction)
             }),
         );
-        // render() time with a new frame while probing: includes the synchronous readback's
-        // render-thread cost
-        let probe_elapsed = probe_start.elapsed();
-        self.key_probe = key_fraction;
-        if self.key_probe_enabled && !buffer_ptr.is_null() {
-            // Cost log (stand measurement): the readback is synchronous, render-thread time
-            let (window_start, count, total, max) = &mut self.key_probe_timing;
-            *count += 1;
-            *total += probe_elapsed;
-            *max = (*max).max(probe_elapsed);
-            if window_start.elapsed() >= Duration::from_secs(5) {
-                info!(
-                    "Key probe: {count} frames in {:.1} s, stream render() mean {} us, max {}                      us per frame (16x16 RGBA readback, synchronous)",
-                    window_start.elapsed().as_secs_f32(),
-                    total.as_micros() / u128::from(*count),
-                    max.as_micros()
-                );
-                self.key_probe_timing = (Instant::now(), 0, Duration::ZERO, Duration::ZERO);
-            }
+        if self.key_probe_issued {
+            let elapsed = render_start.elapsed();
+            let stats = &mut self.key_probe_stats;
+            stats.probes += 1;
+            stats.render_total += elapsed;
+            stats.render_max = stats.render_max.max(elapsed);
         }
 
         self.swapchains[0].release_image().unwrap();
@@ -730,6 +789,15 @@ impl StreamContext {
             );
         }
 
+        self.layer_view_params = Some(output_view_params);
+
+        openxr_display_time
+    }
+
+    /// The projection layer of the last render() (separate from render() so that the loop can
+    /// still draw and collect probes after it)
+    pub fn projection_layer(&self) -> Option<ProjectionLayerBuilder<'_>> {
+        let output_view_params = self.layer_view_params?;
         let rect = xr::Rect2Di {
             offset: xr::Offset2Di { x: 0, y: 0 },
             extent: xr::Extent2Di {
@@ -783,7 +851,7 @@ impl StreamContext {
             clientside_post_processing,
         );
 
-        (layer, openxr_display_time, self.key_probe)
+        Some(layer)
     }
 }
 

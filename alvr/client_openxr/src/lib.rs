@@ -800,20 +800,60 @@ pub fn entry_point() {
                 .as_ref()
                 .map(StreamContext::view_reference_space);
             let streaming = stream_context.is_some();
-            let (layer, display_time, key_probe) = if let Some(stream) = &mut stream_context {
+            let mut stream_rendered = false;
+            let mut lobby_layer = None;
+            let display_time = if let Some(stream) = &mut stream_context {
                 stream.set_key_probe(loading_output.is_some_and(|output| output.probe));
                 stream.set_phase_sync(phase_sync_flag);
                 if skip_stream {
                     stream.skip_frame(vsync_time);
-                    (None, vsync_time, None)
+                    vsync_time
                 } else {
-                    let (layer, display_time, key_probe) =
-                        stream.render(frame_interval, vsync_time);
-                    (Some(layer), display_time, key_probe)
+                    stream_rendered = true;
+                    stream.render(frame_interval, vsync_time)
                 }
             } else {
-                (Some(lobby.render(vsync_time)), vsync_time, None)
+                lobby_layer = Some(lobby.render(vsync_time));
+                vsync_time
             };
+
+            // After the stream (which may wait for a decoded frame), with the joints and views
+            // predicted for this frame's display time
+            if let (Some(hands), Some(space), Some(selected)) =
+                (&mut native_hands, &native_quads_space, &hands_selected)
+            {
+                hands.render(space, &interaction_context, selected, vsync_time);
+
+                // What the hands are drawn with, for the overlay app (on change, at most 10 Hz,
+                // and every 2 s)
+                let info = hands.shape_info();
+                let key = format!("{info:.3?}");
+                if last_hand_shape_sent
+                    .as_ref()
+                    .is_none_or(|(sent_key, at): &(String, Instant)| {
+                        (*sent_key != key && at.elapsed() >= Duration::from_millis(100))
+                            || at.elapsed() >= Duration::from_secs(2)
+                    })
+                {
+                    core_context.send_hand_shape(info);
+                    last_hand_shape_sent = Some((key, Instant::now()));
+                }
+            }
+
+            // Key colour probe results, collected after the hands were drawn (the GPU has had
+            // the most time for the readback). The loop waits for this frame's result only when
+            // it can change what is shown in this frame (loading_screen.rs needs_current_probe)
+            let key_probes = stream_context
+                .as_mut()
+                .filter(|_| stream_rendered)
+                .map(|stream| {
+                    stream.take_key_probes(loading_guard.needs_current_probe(
+                        scene_mode_flag,
+                        scene_loading_flag,
+                        true,
+                    ))
+                })
+                .unwrap_or_default();
 
             // Loading screen instead of key colour frames while passthrough is off
             let loading = streaming.then(|| {
@@ -823,7 +863,8 @@ pub fn entry_point() {
                         scene_mode: scene_mode_flag,
                         scene_loading: scene_loading_flag,
                         stream_rendered: !skip_stream,
-                        key_probe,
+                        key_probe: key_probes.newest,
+                        key_probe_earlier: key_probes.earlier,
                         preview: match crate::debug_switches::get().loading_preview.as_str() {
                             "1" | "normal" => Some(loading_screen::Variant::Normal),
                             "longer" => Some(loading_screen::Variant::TakingLonger),
@@ -860,30 +901,15 @@ pub fn entry_point() {
                 }
                 output
             });
-            let layer = layer.filter(|_| loading.is_none_or(|output| output.show_stream));
 
-            // After the stream (which may wait for a decoded frame), with the joints and views
-            // predicted for this frame's display time
-            if let (Some(hands), Some(space), Some(selected)) =
-                (&mut native_hands, &native_quads_space, &hands_selected)
-            {
-                hands.render(space, &interaction_context, selected, vsync_time);
-
-                // What the hands are drawn with, for the overlay app (on change, at most 10 Hz,
-                // and every 2 s)
-                let info = hands.shape_info();
-                let key = format!("{info:.3?}");
-                if last_hand_shape_sent
+            let layer = if stream_rendered {
+                stream_context
                     .as_ref()
-                    .is_none_or(|(sent_key, at): &(String, Instant)| {
-                        (*sent_key != key && at.elapsed() >= Duration::from_millis(100))
-                            || at.elapsed() >= Duration::from_secs(2)
-                    })
-                {
-                    core_context.send_hand_shape(info);
-                    last_hand_shape_sent = Some((key, Instant::now()));
-                }
-            }
+                    .and_then(StreamContext::projection_layer)
+            } else {
+                lobby_layer
+            };
+            let layer = layer.filter(|_| loading.is_none_or(|output| output.show_stream));
 
             let projection_layer = layer.as_ref().map(|layer| layer.build());
             let quad_layers = native_quads_space

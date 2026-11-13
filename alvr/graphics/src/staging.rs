@@ -2,7 +2,7 @@ use super::{GraphicsContext, ck};
 use crate::GL_TEXTURE_EXTERNAL_OES;
 use alvr_common::glam::{IVec2, UVec2};
 use glow::{self as gl, HasContext};
-use std::{ffi::c_void, rc::Rc};
+use std::{collections::VecDeque, ffi::c_void, rc::Rc};
 
 fn create_program(
     gl: &gl::Context,
@@ -57,10 +57,18 @@ pub struct StagingRenderer {
     viewport_size: IVec2,
     // Key colour probe target (renderbuffer, framebuffer), created on first use
     probe_target: Option<(gl::Renderbuffer, gl::Framebuffer)>,
+    // Pixel pack buffers of the asynchronous probes (created on first use), the pending probes
+    // (slot, fence) oldest first, and the next slot
+    probe_buffers: Option<[gl::Buffer; PROBE_SLOTS]>,
+    probe_pending: VecDeque<(usize, gl::Fence)>,
+    probe_next_slot: usize,
 }
 
-/// Side of the sample grid of probe_left_view()
+/// Side of the sample grid of issue_probe()
 pub const PROBE_GRID: usize = 16;
+const PROBE_BYTES: usize = PROBE_GRID * PROBE_GRID * 4;
+/// Probes that can be pending at once (this frame's and one collected a loop later)
+pub const PROBE_SLOTS: usize = 2;
 
 impl StagingRenderer {
     pub fn new(
@@ -118,6 +126,9 @@ impl StagingRenderer {
                 framebuffers: framebuffers.try_into().unwrap(),
                 viewport_size: view_resolution.as_ivec2(),
                 probe_target: None,
+                probe_buffers: None,
+                probe_pending: VecDeque::new(),
+                probe_next_slot: 0,
             }
         }
     }
@@ -152,11 +163,20 @@ impl StagingRenderer {
         };
     }
 
-    /// RGBA8 samples of the left view's staged frame (as decoded, encoded layout), on a
-    /// PROBE_GRID x PROBE_GRID grid (bilinear samples at the grid cells' centres: a sparse grid, not an
-    /// average), rows bottom-up. Synchronous: waits for the staging copy, so call it right after
-    /// render() and only when needed. Leaves the read/draw framebuffer bindings unbound.
-    pub fn probe_left_view(&mut self) -> Vec<[u8; 4]> {
+    /// Starts reading RGBA8 samples of the left view's staged frame (as decoded, encoded
+    /// layout) on a PROBE_GRID x PROBE_GRID grid (bilinear samples at the grid cells' centres: a
+    /// sparse grid, not an average), rows bottom-up, into a pixel pack buffer, with a fence.
+    /// Asynchronous: nothing waits here; take_oldest_probe() collects it. Call right after
+    /// render(). At most PROBE_SLOTS probes are pending: with all slots busy the oldest is
+    /// collected first (blocking) and its samples are returned. Leaves the read/draw framebuffer
+    /// and pixel pack buffer bindings unbound.
+    pub fn issue_probe(&mut self) -> Option<Vec<[u8; 4]>> {
+        let evicted = if self.probe_pending.len() >= PROBE_SLOTS {
+            self.take_oldest_probe(true)
+        } else {
+            None
+        };
+
         let gl = &self.context.gl_context;
         self.context.make_current();
         let grid = PROBE_GRID as i32;
@@ -177,6 +197,21 @@ impl StagingRenderer {
                 ));
                 (renderbuffer, framebuffer)
             });
+            let buffers = *self.probe_buffers.get_or_insert_with(|| {
+                [(); PROBE_SLOTS].map(|_| {
+                    let buffer = ck!(gl.create_buffer().unwrap());
+                    ck!(gl.bind_buffer(gl::PIXEL_PACK_BUFFER, Some(buffer)));
+                    ck!(gl.buffer_data_size(
+                        gl::PIXEL_PACK_BUFFER,
+                        PROBE_BYTES as i32,
+                        gl::STREAM_READ
+                    ));
+                    ck!(gl.bind_buffer(gl::PIXEL_PACK_BUFFER, None));
+                    buffer
+                })
+            });
+            let slot = self.probe_next_slot;
+            self.probe_next_slot = (slot + 1) % PROBE_SLOTS;
 
             ck!(gl.disable(gl::SCISSOR_TEST));
             ck!(gl.bind_framebuffer(gl::READ_FRAMEBUFFER, Some(self.framebuffers[0])));
@@ -195,10 +230,9 @@ impl StagingRenderer {
             ));
 
             ck!(gl.bind_framebuffer(gl::READ_FRAMEBUFFER, Some(probe_framebuffer)));
-            ck!(gl.bind_buffer(gl::PIXEL_PACK_BUFFER, None));
+            ck!(gl.bind_buffer(gl::PIXEL_PACK_BUFFER, Some(buffers[slot])));
             ck!(gl.pixel_store_i32(gl::PACK_ALIGNMENT, 1));
             ck!(gl.pixel_store_i32(gl::PACK_ROW_LENGTH, 0));
-            let mut bytes = vec![0_u8; PROBE_GRID * PROBE_GRID * 4];
             ck!(gl.read_pixels(
                 0,
                 0,
@@ -206,16 +240,77 @@ impl StagingRenderer {
                 grid,
                 gl::RGBA,
                 gl::UNSIGNED_BYTE,
-                gl::PixelPackData::Slice(Some(&mut bytes)),
+                gl::PixelPackData::BufferOffset(0),
             ));
-
+            ck!(gl.bind_buffer(gl::PIXEL_PACK_BUFFER, None));
             ck!(gl.bind_framebuffer(gl::READ_FRAMEBUFFER, None));
             ck!(gl.bind_framebuffer(gl::DRAW_FRAMEBUFFER, None));
 
-            bytes
-                .chunks_exact(4)
-                .map(|pixel| [pixel[0], pixel[1], pixel[2], pixel[3]])
-                .collect()
+            let fence = ck!(gl.fence_sync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0).unwrap());
+            // Start the staging copy and the readback on the GPU now (the CPU goes on with the
+            // stream pass)
+            ck!(gl.flush());
+            self.probe_pending.push_back((slot, fence));
+        }
+
+        evicted
+    }
+
+    /// Probes issued and not collected yet
+    pub fn pending_probes(&self) -> usize {
+        self.probe_pending.len()
+    }
+
+    /// The samples of the oldest pending probe. block = false: None while the GPU has not
+    /// finished it (it stays pending); block = true: waits for it (the old synchronous cost).
+    /// None when nothing is pending.
+    pub fn take_oldest_probe(&mut self, block: bool) -> Option<Vec<[u8; 4]>> {
+        let &(slot, fence) = self.probe_pending.front()?;
+        let buffer = self.probe_buffers?[slot];
+        let gl = &self.context.gl_context;
+        self.context.make_current();
+
+        unsafe {
+            let signaled = gl.get_sync_status(fence) == gl::SIGNALED;
+            if !signaled {
+                if !block {
+                    return None;
+                }
+                // Bounded waits; the map below waits anyway if the GPU takes longer
+                for _ in 0..10 {
+                    let status =
+                        gl.client_wait_sync(fence, gl::SYNC_FLUSH_COMMANDS_BIT, 100_000_000);
+                    if status == gl::ALREADY_SIGNALED
+                        || status == gl::CONDITION_SATISFIED
+                        || status == gl::WAIT_FAILED
+                    {
+                        break;
+                    }
+                }
+            }
+            self.probe_pending.pop_front();
+            gl.delete_sync(fence);
+
+            ck!(gl.bind_buffer(gl::PIXEL_PACK_BUFFER, Some(buffer)));
+            let mapped = gl.map_buffer_range(
+                gl::PIXEL_PACK_BUFFER,
+                0,
+                PROBE_BYTES as i32,
+                gl::MAP_READ_BIT,
+            );
+            let samples = if mapped.is_null() {
+                None
+            } else {
+                let bytes = std::slice::from_raw_parts(mapped, PROBE_BYTES);
+                let samples = bytes
+                    .chunks_exact(4)
+                    .map(|pixel| [pixel[0], pixel[1], pixel[2], pixel[3]])
+                    .collect::<Vec<_>>();
+                gl.unmap_buffer(gl::PIXEL_PACK_BUFFER);
+                Some(samples)
+            };
+            ck!(gl.bind_buffer(gl::PIXEL_PACK_BUFFER, None));
+            samples
         }
     }
 }
@@ -230,6 +325,14 @@ impl Drop for StagingRenderer {
             ck!(gl.delete_texture(self.surface_texture));
             for framebuffer in &self.framebuffers {
                 ck!(gl.delete_framebuffer(*framebuffer));
+            }
+            for (_, fence) in self.probe_pending.drain(..) {
+                gl.delete_sync(fence);
+            }
+            if let Some(buffers) = self.probe_buffers.take() {
+                for buffer in buffers {
+                    ck!(gl.delete_buffer(buffer));
+                }
             }
             if let Some((renderbuffer, framebuffer)) = self.probe_target.take() {
                 ck!(gl.delete_framebuffer(framebuffer));

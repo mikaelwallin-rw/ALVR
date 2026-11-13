@@ -12,7 +12,7 @@ use alvr_common::{
     info,
 };
 use alvr_session::{PassthroughMode, UpscalingConfig};
-use std::{ffi::c_void, iter, mem, rc::Rc};
+use std::{collections::VecDeque, ffi::c_void, iter, mem, rc::Rc};
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingResource, BindingType, Buffer, BufferBindingType,
@@ -120,6 +120,23 @@ pub struct StreamRenderer {
     foveation_buffer: Buffer,
     last_foveation_center_shifts: Option<[Vec2; 2]>,
     staging_resolution: UVec2,
+    // Key colour probes: the key direction of each pending readback (oldest first, parallel to
+    // the staging renderer's pending probes), results of probes collected early (all slots
+    // busy), and this loop's result when it needed no readback
+    probe_key_dirs: VecDeque<Vec3>,
+    probe_stash: Vec<f32>,
+    probe_immediate: Option<f32>,
+}
+
+/// Key colour probe results collected by StreamRenderer::take_key_probes()
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct KeyProbeResults {
+    /// Frames of earlier loops (collected a loop late): the largest key fraction among them
+    pub earlier: Option<f32>,
+    /// This loop's new frame (None: not probed, or still on the GPU and not waited for)
+    pub newest: Option<f32>,
+    /// This loop's probe is still pending (it is returned as `earlier` next time)
+    pub newest_pending: bool,
 }
 
 impl StreamRenderer {
@@ -405,6 +422,9 @@ impl StreamRenderer {
             foveation_buffer,
             last_foveation_center_shifts: None,
             staging_resolution,
+            probe_key_dirs: VecDeque::new(),
+            probe_stash: Vec::new(),
+            probe_immediate: None,
         }
     }
 
@@ -502,9 +522,9 @@ impl StreamRenderer {
         passthrough: Option<&PassthroughMode>,
         foveation_center_shifts: Option<[Vec2; 2]>,
         opaque_regions: &OpaqueRegionsParams,
-        // Key chroma direction: probe the new frame for the key colour (see key_colour_fraction())
+        // Key chroma direction: probe the new frame for the key colour (see take_key_probes())
         key_probe: Option<Vec3>,
-    ) -> Option<f32> {
+    ) -> bool {
         // Before the opaque regions: their meshes use the encoded pixel map of these centers
         if let Some(config) = &self.foveated_encoding
             && self.last_foveation_center_shifts != foveation_center_shifts
@@ -567,11 +587,26 @@ impl StreamRenderer {
         if !hardware_buffer.is_null() {
             self.staging_renderer.render(hardware_buffer);
         }
-        // Right after the staging copy, before the stream pass is queued: the synchronous readback
-        // then only waits for the copy
-        let key_fraction = key_probe
-            .filter(|_| !hardware_buffer.is_null())
-            .map(|key_dir| self.key_colour_fraction(key_dir));
+        // Right after the staging copy, before the stream pass is queued: an asynchronous
+        // readback of the staged frame; its result is collected later in the loop
+        // (take_key_probes), so the render thread does not wait for the GPU here
+        self.probe_immediate = None;
+        let probe_issued = match key_probe.filter(|_| !hardware_buffer.is_null()) {
+            Some(key_dir) if key_dir == Vec3::ZERO => {
+                self.probe_immediate = Some(0.0);
+                true
+            }
+            Some(key_dir) => {
+                if let Some(samples) = self.staging_renderer.issue_probe() {
+                    // All slots were busy: the oldest was collected now
+                    let dir = self.probe_key_dirs.pop_front().unwrap_or(Vec3::ZERO);
+                    self.probe_stash.push(key_fraction(&samples, dir));
+                }
+                self.probe_key_dirs.push_back(key_dir);
+                true
+            }
+            None => false,
+        };
 
         let mut encoder = self
             .context
@@ -682,19 +717,49 @@ impl StreamRenderer {
 
         self.context.queue.submit(iter::once(encoder.finish()));
 
-        key_fraction
+        probe_issued
     }
 
-    /// Fraction (0..1) of a sparse sample grid of the last staged frame (left view) whose colour is
-    /// the key colour or a darkened/faded version of it (same chroma direction, clearly saturated).
-    /// Synchronous GPU readback of a tiny grid: call after render(), only while it matters (e.g.
-    /// passthrough off, where a key colour frame would be shown as is).
-    pub fn key_colour_fraction(&mut self, key_dir: Vec3) -> f32 {
-        if key_dir == Vec3::ZERO {
-            return 0.0;
+    /// Key colour probe results: the fraction (0..1) of a sparse sample grid of a staged frame
+    /// (left view) whose colour is the key colour or a darkened/faded version of it (same chroma
+    /// direction, clearly saturated). Probes of earlier loops are collected (waiting if needed:
+    /// they are a loop old, so done). This loop's probe (newest_issued: render() returned true
+    /// this loop) is collected if the GPU has finished it, or waited for if wait_for_newest;
+    /// otherwise it stays pending and is reported as `earlier` next time.
+    pub fn take_key_probes(
+        &mut self,
+        newest_issued: bool,
+        wait_for_newest: bool,
+    ) -> KeyProbeResults {
+        let mut results = KeyProbeResults::default();
+        let merge = |slot: &mut Option<f32>, value: f32| {
+            *slot = Some(slot.map_or(value, |old: f32| old.max(value)));
+        };
+        for value in self.probe_stash.drain(..) {
+            merge(&mut results.earlier, value);
         }
-        let samples = self.staging_renderer.probe_left_view();
-        key_fraction(&samples, key_dir)
+        let newest_in_flight = newest_issued && self.probe_immediate.is_none();
+        let older = self
+            .staging_renderer
+            .pending_probes()
+            .saturating_sub(usize::from(newest_in_flight));
+        for _ in 0..older {
+            let dir = self.probe_key_dirs.pop_front().unwrap_or(Vec3::ZERO);
+            if let Some(samples) = self.staging_renderer.take_oldest_probe(true) {
+                merge(&mut results.earlier, key_fraction(&samples, dir));
+            }
+        }
+        if newest_issued {
+            if let Some(value) = self.probe_immediate.take() {
+                results.newest = Some(value);
+            } else if let Some(samples) = self.staging_renderer.take_oldest_probe(wait_for_newest) {
+                let dir = self.probe_key_dirs.pop_front().unwrap_or(Vec3::ZERO);
+                results.newest = Some(key_fraction(&samples, dir));
+            } else {
+                results.newest_pending = self.staging_renderer.pending_probes() > 0;
+            }
+        }
+        results
     }
 }
 
