@@ -79,6 +79,11 @@ impl Platform {
     pub const fn is_yvr(&self) -> bool {
         matches!(self, Self::Yvr | Self::PlayForDreamMR)
     }
+
+    // Headsets whose SoC has a hardware AV1 decoder (XR2 Gen 2)
+    pub const fn supports_av1_decoding(&self) -> bool {
+        matches!(self, Self::Quest3 | Self::Quest3S | Self::Pico4Ultra)
+    }
 }
 
 impl Display for Platform {
@@ -132,34 +137,7 @@ pub fn platform(runtime_name: Option<String>, runtime_version: Option<u64>) -> P
             runtime_name: {runtime_name:?}, runtime_version: {runtime_version:?}",
         );
 
-        match (
-            manufacturer.as_str(),
-            model.as_str(),
-            device.as_str(),
-            product.as_str(),
-        ) {
-            ("Oculus", _, "monterey", _) => Platform::Quest1,
-            ("Oculus", _, "hollywood", _) => Platform::Quest2,
-            ("Oculus", _, "eureka", _) => Platform::Quest3,
-            ("Oculus", _, "panther", _) => Platform::Quest3S,
-            ("Oculus", _, "seacliff", _) => Platform::QuestPro,
-            ("Oculus", _, _, _) => Platform::QuestUnknown,
-            ("Pico", "Pico Neo 3" | "Pico Neo3 Link", _, _) => Platform::PicoNeo3,
-            ("Pico", _, _, "PICO 4 Pro") => Platform::Pico4Pro,
-            ("Pico", _, _, "PICO 4 Enterprise") => Platform::Pico4Enterprise,
-            ("Pico", _, _, "PICO 4") => Platform::Pico4,
-            ("Pico", _, _, "PICO 4 Ultra") => Platform::Pico4Ultra,
-            ("Pico", _, _, "PICO G3") => Platform::PicoG3,
-            ("Pico", _, _, _) => Platform::PicoUnknown,
-            ("HTC", "VIVE Focus 3", _, _) => Platform::Focus3,
-            ("HTC", "VIVE Focus Vision", _, _) => Platform::FocusVision,
-            ("HTC", "VIVE XR Series", _, _) => Platform::XRElite,
-            ("HTC", _, _, _) => Platform::ViveUnknown,
-            ("YVR", _, _, _) => Platform::Yvr,
-            ("Play For Dream", _, _, _) => Platform::PlayForDreamMR,
-            ("samsung", _, "xrvst2", _) => Platform::SamsungGalaxyXR,
-            _ => Platform::AndroidUnknown,
-        }
+        platform_from_android_build(&manufacturer, &model, &device, &product)
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -170,6 +148,42 @@ pub fn platform(runtime_name: Option<String>, runtime_version: Option<u64>) -> P
             "macos" => Platform::Macos,
             _ => Platform::Unknown,
         }
+    }
+}
+
+// Maps the android.os.Build strings (MANUFACTURER, MODEL, DEVICE, PRODUCT) to a platform. Separate
+// from `platform()` so that the table can be unit tested on the host.
+pub fn platform_from_android_build(
+    manufacturer: &str,
+    model: &str,
+    device: &str,
+    product: &str,
+) -> Platform {
+    match (manufacturer, model, device, product) {
+        ("Oculus", _, "monterey", _) => Platform::Quest1,
+        ("Oculus", _, "hollywood", _) => Platform::Quest2,
+        ("Oculus", _, "eureka", _) => Platform::Quest3,
+        ("Oculus", _, "panther", _) => Platform::Quest3S,
+        ("Oculus", _, "seacliff", _) => Platform::QuestPro,
+        ("Oculus", _, _, _) => Platform::QuestUnknown,
+        ("Pico", "Pico Neo 3" | "Pico Neo3 Link", _, _) => Platform::PicoNeo3,
+        ("Pico", _, _, "PICO 4 Pro") => Platform::Pico4Pro,
+        ("Pico", _, _, "PICO 4 Enterprise") => Platform::Pico4Enterprise,
+        ("Pico", _, _, "PICO 4") => Platform::Pico4,
+        // PICO patches android.os.Build: PRODUCT is the marketing name. The PICO 4 Ultra Enterprise
+        // (Build.MODEL "A94Y0", device "sparrow") has the same SoC (XR2 Gen 2) and controllers as the
+        // consumer PICO 4 Ultra, so it gets the same platform (AV1 decode, controller profile).
+        ("Pico", _, _, "PICO 4 Ultra" | "PICO 4 Ultra Enterprise") => Platform::Pico4Ultra,
+        ("Pico", _, _, "PICO G3") => Platform::PicoG3,
+        ("Pico", _, _, _) => Platform::PicoUnknown,
+        ("HTC", "VIVE Focus 3", _, _) => Platform::Focus3,
+        ("HTC", "VIVE Focus Vision", _, _) => Platform::FocusVision,
+        ("HTC", "VIVE XR Series", _, _) => Platform::XRElite,
+        ("HTC", _, _, _) => Platform::ViveUnknown,
+        ("YVR", _, _, _) => Platform::Yvr,
+        ("Play For Dream", _, _, _) => Platform::PlayForDreamMR,
+        ("samsung", _, "xrvst2", _) => Platform::SamsungGalaxyXR,
+        _ => Platform::AndroidUnknown,
     }
 }
 
@@ -185,4 +199,42 @@ pub enum ClientFlavor {
     Store,
     Github,
     Custom(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn detect(manufacturer: &str, model: &str, device: &str, product: &str) -> Platform {
+        platform_from_android_build(manufacturer, model, device, product)
+    }
+
+    #[test]
+    fn pico_4_ultra_enterprise_is_pico_4_ultra() {
+        // Strings as reported by the fleet headset (PICO OS 5.15.7): Build.MODEL "A94Y0",
+        // Build.PRODUCT "PICO 4 Ultra Enterprise" (sys.pxr.product.*), device "sparrow".
+        assert!(
+            detect("Pico", "A94Y0", "sparrow", "PICO 4 Ultra Enterprise") == Platform::Pico4Ultra
+        );
+        assert!(detect("Pico", "x", "x", "PICO 4 Ultra") == Platform::Pico4Ultra);
+        assert!(Platform::Pico4Ultra.supports_av1_decoding());
+    }
+
+    #[test]
+    fn pico_4_enterprise_stays_pico_4_enterprise() {
+        // XR2 Gen 1: no AV1 decoder
+        assert!(detect("Pico", "x", "x", "PICO 4 Enterprise") == Platform::Pico4Enterprise);
+        assert!(!Platform::Pico4Enterprise.supports_av1_decoding());
+        assert!(detect("Pico", "x", "x", "PICO 4") == Platform::Pico4);
+        assert!(detect("Pico", "x", "x", "PICO 4 Pro") == Platform::Pico4Pro);
+    }
+
+    #[test]
+    fn other_devices() {
+        assert!(detect("Pico", "Pico Neo 3", "x", "x") == Platform::PicoNeo3);
+        assert!(detect("Pico", "x", "x", "PICO 5") == Platform::PicoUnknown);
+        assert!(detect("Oculus", "Quest 3", "eureka", "eureka") == Platform::Quest3);
+        assert!(detect("Oculus", "x", "x", "x") == Platform::QuestUnknown);
+        assert!(detect("Xiaomi", "x", "x", "x") == Platform::AndroidUnknown);
+    }
 }

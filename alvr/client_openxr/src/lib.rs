@@ -407,10 +407,7 @@ pub fn entry_point() {
             foveated_encoding: platform != Platform::Unknown,
             encoder_high_profile: platform != Platform::Unknown,
             encoder_10_bits: platform != Platform::Unknown,
-            encoder_av1: matches!(
-                platform,
-                Platform::Quest3 | Platform::Quest3S | Platform::Pico4Ultra
-            ),
+            encoder_av1: platform.supports_av1_decoding(),
             prefer_10bit: false,
             preferred_encoding_gamma: 1.0,
             prefer_hdr: false,
