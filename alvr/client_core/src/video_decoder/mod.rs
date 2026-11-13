@@ -48,6 +48,24 @@ impl VideoDecoderSource {
         #[cfg(not(target_os = "android"))]
         None
     }
+
+    /// Fork phase sync: get_frame() returns the newest ready frame and drops older ready ones
+    /// (default off: upstream's buffering by running average)
+    #[allow(unused_variables)]
+    pub fn set_newest_frame_only(&mut self, newest_only: bool) {
+        #[cfg(target_os = "android")]
+        self.inner.set_newest_frame_only(newest_only);
+    }
+
+    /// Frames dropped by the newest-frame rule since the last call
+    pub fn take_dropped_frames(&mut self) -> u32 {
+        #[cfg(target_os = "android")]
+        {
+            self.inner.take_dropped_frames()
+        }
+        #[cfg(not(target_os = "android"))]
+        0
+    }
 }
 
 // report_frame_decoded: (target_timestamp: Duration) -> ()

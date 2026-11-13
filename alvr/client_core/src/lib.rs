@@ -8,6 +8,7 @@
 mod c_api;
 mod connection;
 mod logging_backend;
+pub mod phase_sync;
 mod sockets;
 mod statistics;
 mod storage;
@@ -36,7 +37,7 @@ use std::{
     collections::{HashSet, VecDeque},
     sync::Arc,
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use storage::Config;
 
@@ -96,6 +97,7 @@ pub struct ClientCoreContext {
     connection_context: Arc<ConnectionContext>,
     connection_thread: Arc<Mutex<Option<JoinHandle<()>>>>,
     last_good_opaque_regions: Mutex<Arc<Vec<OpaqueRegion>>>,
+    phase_sync: Mutex<phase_sync::PhaseSyncReporter>,
 }
 
 impl ClientCoreContext {
@@ -144,6 +146,7 @@ impl ClientCoreContext {
             connection_context,
             connection_thread: Arc::new(Mutex::new(Some(connection_thread))),
             last_good_opaque_regions: Mutex::new(Arc::new(Vec::new())),
+            phase_sync: Mutex::new(phase_sync::PhaseSyncReporter::default()),
         }
     }
 
@@ -441,6 +444,73 @@ impl ClientCoreContext {
 
     pub fn platform(&self) -> Platform {
         self.platform
+    }
+
+    /// Fork phase sync: the server announces it (RealTimeConfig EXT_PHASE_SYNC); only then are
+    /// phase sync reports sent
+    pub fn set_phase_sync(&self, enabled: bool) {
+        let mut reporter = self.phase_sync.lock();
+        if reporter.is_enabled() != enabled {
+            info!("Phase sync: {}", if enabled { "on" } else { "off" });
+        }
+        reporter.set_enabled(enabled);
+    }
+
+    /// Fork phase sync: one render loop of the main stream. poll_start = when the loop started
+    /// looking for a decoded frame; picked = (frame timestamp, it was already decoded at
+    /// poll_start); dropped = older ready frames dropped for it.
+    pub fn report_stream_loop(
+        &self,
+        poll_start: Instant,
+        picked: Option<(Duration, bool)>,
+        dropped: u32,
+        frame_interval: Duration,
+    ) {
+        if !self.phase_sync.lock().is_enabled() {
+            return;
+        }
+        let outcome = match picked {
+            Some((timestamp, ready_at_poll)) => {
+                let decoded = self
+                    .connection_context
+                    .statistics_manager
+                    .lock()
+                    .as_ref()
+                    .and_then(|stats| stats.frame_decoded_instant(timestamp));
+                phase_sync::LoopOutcome::Picked {
+                    margin_ms: decoded.map(|decoded| {
+                        if poll_start >= decoded {
+                            poll_start.duration_since(decoded).as_secs_f32() * 1000.0
+                        } else {
+                            -(decoded.duration_since(poll_start).as_secs_f32() * 1000.0)
+                        }
+                    }),
+                    ready_at_poll,
+                    dropped,
+                }
+            }
+            None => phase_sync::LoopOutcome::NoFrame,
+        };
+        self.send_phase_sync_report(outcome, Some(frame_interval));
+    }
+
+    /// Fork phase sync: a render loop that skipped the stream (stream unused)
+    pub fn report_stream_skipped(&self) {
+        self.send_phase_sync_report(phase_sync::LoopOutcome::Skipped, None);
+    }
+
+    fn send_phase_sync_report(
+        &self,
+        outcome: phase_sync::LoopOutcome,
+        frame_interval: Option<Duration>,
+    ) {
+        let report = self
+            .phase_sync
+            .lock()
+            .on_loop(Instant::now(), outcome, frame_interval);
+        if let Some(report) = report {
+            self.send_reserved_buffer(report.encode());
+        }
     }
 }
 

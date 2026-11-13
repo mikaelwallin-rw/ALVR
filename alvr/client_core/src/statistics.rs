@@ -113,6 +113,15 @@ impl StatisticsManager {
         }
     }
 
+    /// When this frame came out of the decoder (None if unknown)
+    pub fn frame_decoded_instant(&self, target_timestamp: Duration) -> Option<Instant> {
+        self.history_buffer
+            .iter()
+            .find(|frame| frame.client_stats.target_timestamp == target_timestamp)
+            .filter(|frame| !frame.client_stats.video_decode.is_zero())
+            .map(|frame| frame.video_packet_received + frame.client_stats.video_decode)
+    }
+
     pub fn summary(&self, target_timestamp: Duration) -> Option<ClientStatistics> {
         self.history_buffer
             .iter()

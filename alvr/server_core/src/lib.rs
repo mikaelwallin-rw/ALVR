@@ -8,6 +8,7 @@ mod input_mapping;
 mod logging_backend;
 mod native_quads;
 mod opaque_regions;
+mod phase_sync;
 mod screen_video;
 mod sockets;
 mod statistics;
@@ -246,6 +247,7 @@ impl ServerCoreContext {
             } else {
                 0.0
             },
+            None,
         );
 
         let connection_context = Arc::new(ConnectionContext {

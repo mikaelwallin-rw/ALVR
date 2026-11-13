@@ -1,12 +1,15 @@
-use alvr_common::{HEAD_ID, SlidingWindowAverage};
+use crate::phase_sync::{HoldReason, PhaseSample, PhaseSyncController};
+use alvr_common::{HEAD_ID, SlidingWindowAverage, info};
 use alvr_events::{BitrateDirectives, EventType, GraphStatistics, StatisticsSummary};
-use alvr_packets::ClientStatistics;
+use alvr_packets::{ClientStatistics, PhaseSyncReport};
 use std::{
     collections::{HashMap, VecDeque},
     time::{Duration, Instant},
 };
 
 const FULL_REPORT_INTERVAL: Duration = Duration::from_millis(500);
+/// Phase sync status line in the session log
+const PHASE_SYNC_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const EPS_INTERVAL: Duration = Duration::from_micros(1);
 
 pub struct HistoryFrame {
@@ -56,14 +59,64 @@ pub struct StatisticsManager {
     last_vsync_time: Instant,
     frame_interval: Duration,
     last_throughput_directives: BitrateDirectives,
+    // Fork: steers the virtual vsync phase from the client's reports (None = upstream behaviour)
+    phase_sync: Option<PhaseSyncState>,
+}
+
+struct PhaseSyncState {
+    controller: PhaseSyncController,
+    origin: Instant,
+    presents_since_report: u32,
+    reports_received: u64,
+    last_hold: Option<HoldReason>,
+    last_log: Instant,
+    // Sums since the last status line
+    log_reports: u32,
+    log_loops: u32,
+    log_frames: u32,
+    log_late: u32,
+    log_missed: u32,
+    log_dropped: u32,
+    log_skipped: u32,
+    log_margin_mean_sum: f32,
+    last_report: PhaseSyncReport,
+}
+
+impl PhaseSyncState {
+    fn new(target_margin_ms: f32) -> Self {
+        Self {
+            controller: PhaseSyncController::new(target_margin_ms),
+            origin: Instant::now(),
+            presents_since_report: 0,
+            reports_received: 0,
+            last_hold: None,
+            last_log: Instant::now(),
+            log_reports: 0,
+            log_loops: 0,
+            log_frames: 0,
+            log_late: 0,
+            log_missed: 0,
+            log_dropped: 0,
+            log_skipped: 0,
+            log_margin_mean_sum: 0.0,
+            last_report: PhaseSyncReport::default(),
+        }
+    }
+
+    fn now_s(&self) -> f64 {
+        self.origin.elapsed().as_secs_f64()
+    }
 }
 
 impl StatisticsManager {
     // history size used to calculate average total pipeline latency
+    /// phase_sync_target_ms: Some(target margin) to steer the virtual vsync from the client's
+    /// phase sync reports (only once reports arrive; without them the grid is the nominal one)
     pub fn new(
         max_history_size: usize,
         nominal_server_frame_interval: Duration,
         steamvr_pipeline_frames: f32,
+        phase_sync_target_ms: Option<f32>,
     ) -> Self {
         Self {
             history_buffer: VecDeque::new(),
@@ -86,6 +139,7 @@ impl StatisticsManager {
             last_vsync_time: Instant::now(),
             frame_interval: nominal_server_frame_interval,
             last_throughput_directives: BitrateDirectives::default(),
+            phase_sync: phase_sync_target_ms.map(PhaseSyncState::new),
         }
     }
 
@@ -120,6 +174,9 @@ impl StatisticsManager {
             self.last_frame_present_instant = now;
 
             frame.frame_present = now;
+        }
+        if let Some(phase_sync) = &mut self.phase_sync {
+            phase_sync.presents_since_report += 1;
         }
     }
 
@@ -296,15 +353,127 @@ impl StatisticsManager {
         self.steamvr_pipeline_latency
     }
 
+    /// Fork: a client phase sync report (ReservedBuffer 'PSYN'). Ignored when phase sync is off.
+    pub fn report_phase_sync(&mut self, report: PhaseSyncReport) {
+        let Some(state) = &mut self.phase_sync else {
+            return;
+        };
+        let now_s = state.now_s();
+        let sample = PhaseSample {
+            window_s: report.window_us as f32 / 1e6,
+            client_frame_interval_s: report.frame_interval_us as f32 / 1e6,
+            loops: report.loops,
+            frames: report.frames,
+            skipped_loops: report.skipped_loops,
+            missed_slots: report.missed_slots,
+            margin_p50_ms: report.margin_p50_ms,
+            server_frames: state.presents_since_report,
+        };
+        state.presents_since_report = 0;
+        state.reports_received += 1;
+        if state.reports_received == 1 {
+            info!(
+                "Phase sync: client reports arriving, target margin {:.1} ms, margin now {:.1} ms (median)",
+                state.controller.effective_target_ms(),
+                report.margin_p50_ms
+            );
+        }
+
+        let update = state.controller.update(now_s, &sample);
+        if update.hold != state.last_hold {
+            match update.hold {
+                Some(reason) => info!("Phase sync: holding the phase ({reason:?})"),
+                None => info!("Phase sync: steering again"),
+            }
+            state.last_hold = update.hold;
+        }
+        match update.lock_changed {
+            Some(true) => info!(
+                "Phase sync: LOCKED, margin {:.1} ms (median; target {:.1}), clock correction {:+.0} ppm",
+                report.margin_p50_ms,
+                state.controller.effective_target_ms(),
+                state.controller.freq_ms_per_s() * 1000.0
+            ),
+            Some(false) => info!(
+                "Phase sync: lock lost, margin {:.1} ms (median; target {:.1})",
+                report.margin_p50_ms,
+                state.controller.effective_target_ms()
+            ),
+            None => (),
+        }
+        if update.extra_changed {
+            info!(
+                "Phase sync: target margin now {:.1} ms (back-off {:.1} ms)",
+                state.controller.effective_target_ms(),
+                state.controller.extra_margin_ms(),
+            );
+        }
+
+        state.log_reports += 1;
+        state.log_loops += report.loops;
+        state.log_frames += report.frames;
+        state.log_late += report.late_frames;
+        state.log_missed += report.missed_slots;
+        state.log_dropped += report.dropped_frames;
+        state.log_skipped += report.skipped_loops;
+        state.log_margin_mean_sum += report.margin_mean_ms;
+        state.last_report = report;
+        if state.last_log.elapsed() >= PHASE_SYNC_LOG_INTERVAL {
+            let r = &state.last_report;
+            info!(
+                "Phase sync: margin p10/p50/p90 {:.1}/{:.1}/{:.1} ms, mean over {} reports {:.1} ms, target {:.1}, {}; rate {:+.2} ms/s, clock {:+.0} ppm; loops {}, frames {}, waited for {}, missed {}, dropped {}, skipped {}",
+                r.margin_p10_ms,
+                r.margin_p50_ms,
+                r.margin_p90_ms,
+                state.log_reports,
+                state.log_margin_mean_sum / state.log_reports.max(1) as f32,
+                state.controller.effective_target_ms(),
+                if state.controller.is_locked() {
+                    "locked"
+                } else {
+                    "not locked"
+                },
+                state.controller.rate_at(now_s),
+                state.controller.freq_ms_per_s() * 1000.0,
+                state.log_loops,
+                state.log_frames,
+                state.log_late,
+                state.log_missed,
+                state.log_dropped,
+                state.log_skipped,
+            );
+            state.last_log = Instant::now();
+            state.log_reports = 0;
+            state.log_loops = 0;
+            state.log_frames = 0;
+            state.log_late = 0;
+            state.log_missed = 0;
+            state.log_dropped = 0;
+            state.log_skipped = 0;
+            state.log_margin_mean_sum = 0.0;
+        }
+    }
+
     // NB: this call is non-blocking, waiting should be done externally
     pub fn duration_until_next_vsync(&mut self) -> Duration {
         let now = Instant::now();
 
+        // Fork phase sync: the period is nominal * (1 + rate), |rate| <= 0.1 %; exactly the
+        // nominal period while phase sync is off or before the first client report
+        let frame_interval = match &self.phase_sync {
+            Some(state) if state.reports_received > 0 => Duration::from_secs_f64(
+                state
+                    .controller
+                    .frame_interval_s(self.frame_interval.as_secs_f64(), state.now_s()),
+            ),
+            _ => self.frame_interval,
+        };
+
         // update the last vsync if it's too old
-        while self.last_vsync_time + self.frame_interval < now {
-            self.last_vsync_time += self.frame_interval;
+        while self.last_vsync_time + frame_interval < now {
+            self.last_vsync_time += frame_interval;
         }
 
-        (self.last_vsync_time + self.frame_interval).saturating_duration_since(now)
+        (self.last_vsync_time + frame_interval).saturating_duration_since(now)
     }
 }

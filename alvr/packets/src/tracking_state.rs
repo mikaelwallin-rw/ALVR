@@ -14,9 +14,12 @@ use alvr_common::{
 pub const TRACKING_STATE_TAG: [u8; 4] = *b"SVTS";
 pub const CAMERA_STAMP_TAG: [u8; 4] = *b"SVCS";
 pub const SCREEN_VIDEO_DECODE_TAG: [u8; 4] = *b"SVDA";
+/// Phase sync report (fork-internal, not read by the overlay app)
+pub const PHASE_SYNC_TAG: [u8; 4] = *b"PSYN";
 const TRACKING_STATE_VERSION: u16 = 1;
 const CAMERA_STAMP_VERSION: u16 = 1;
 const SCREEN_VIDEO_DECODE_VERSION: u16 = 1;
+const PHASE_SYNC_VERSION: u16 = 1;
 
 /// Head tracking flags (TrackingStateReport::flags, CameraTrackingStamp::flags)
 pub const HEAD_POSITION_TRACKED: u32 = 1 << 0;
@@ -126,6 +129,39 @@ pub struct ScreenVideoDecodeReport {
     pub client_instance: u64,
     /// Streams shown by a quad first; at most SCREEN_VIDEO_DECODE_MAX_STREAMS
     pub streams: Vec<ScreenVideoDecodeStatus>,
+}
+
+/// Phase sync: how the decoded main stream frames met the client's render loop during one window
+/// (about 500 ms). Sent only while the server announces phase sync (RealTimeConfig.ext_str token
+/// EXT_PHASE_SYNC). The margin of a frame is "render loop starts looking for a frame" minus
+/// "frame decoded", in the client's clock: positive = the frame waited decoded (decoder queue),
+/// negative = the loop waited for it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PhaseSyncReport {
+    /// Increments per report (per client process)
+    pub sequence: u32,
+    /// Client time covered by this report, microseconds
+    pub window_us: u32,
+    /// The runtime's display period (xrWaitFrame), microseconds
+    pub frame_interval_us: u32,
+    /// Render loops that looked for a stream frame
+    pub loops: u32,
+    /// Loops that picked a new frame with a known decode time (each one a margin sample)
+    pub frames: u32,
+    /// Loops that skipped the stream (stream unused): no samples
+    pub skipped_loops: u32,
+    /// Loops that found a frame already waiting while the previous loop got none: that frame
+    /// missed its slot (arrived after the previous loop stopped waiting)
+    pub missed_slots: u32,
+    /// Picked frames that the loop had to wait for (negative margin)
+    pub late_frames: u32,
+    /// Older decoded frames dropped because a newer one was ready at the same poll
+    pub dropped_frames: u32,
+    /// Margins in milliseconds (0 when frames == 0)
+    pub margin_mean_ms: f32,
+    pub margin_p10_ms: f32,
+    pub margin_p50_ms: f32,
+    pub margin_p90_ms: f32,
 }
 
 struct Writer(Vec<u8>);
@@ -287,9 +323,105 @@ impl ScreenVideoDecodeReport {
     }
 }
 
+impl PhaseSyncReport {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new(PHASE_SYNC_TAG, PHASE_SYNC_VERSION);
+        for v in [
+            self.sequence,
+            self.window_us,
+            self.frame_interval_us,
+            self.loops,
+            self.frames,
+            self.skipped_loops,
+            self.missed_slots,
+            self.late_frames,
+            self.dropped_frames,
+        ] {
+            w.u32(v);
+        }
+        for v in [
+            self.margin_mean_ms,
+            self.margin_p10_ms,
+            self.margin_p50_ms,
+            self.margin_p90_ms,
+        ] {
+            w.f32(v);
+        }
+        w.0
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut r = open(bytes, PHASE_SYNC_TAG, PHASE_SYNC_VERSION)?;
+        let report = Self {
+            sequence: r.u32()?,
+            window_us: r.u32()?,
+            frame_interval_us: r.u32()?,
+            loops: r.u32()?,
+            frames: r.u32()?,
+            skipped_loops: r.u32()?,
+            missed_slots: r.u32()?,
+            late_frames: r.u32()?,
+            dropped_frames: r.u32()?,
+            margin_mean_ms: r.f32()?,
+            margin_p10_ms: r.f32()?,
+            margin_p50_ms: r.f32()?,
+            margin_p90_ms: r.f32()?,
+        };
+        [
+            report.margin_mean_ms,
+            report.margin_p10_ms,
+            report.margin_p50_ms,
+            report.margin_p90_ms,
+        ]
+        .iter()
+        .all(|v| v.is_finite())
+        .then_some(report)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phase_sync_report_round_trips() {
+        let report = PhaseSyncReport {
+            sequence: 9,
+            window_us: 500_123,
+            frame_interval_us: 11_111,
+            loops: 45,
+            frames: 44,
+            skipped_loops: 0,
+            missed_slots: 1,
+            late_frames: 3,
+            dropped_frames: 1,
+            margin_mean_ms: 2.25,
+            margin_p10_ms: -0.5,
+            margin_p50_ms: 2.0,
+            margin_p90_ms: 4.75,
+        };
+        let bytes = report.encode();
+        assert_eq!(PhaseSyncReport::decode(&bytes), Some(report));
+        let mut longer = bytes.clone();
+        longer.extend_from_slice(&[7; 12]);
+        assert_eq!(PhaseSyncReport::decode(&longer), Some(report));
+        assert_eq!(PhaseSyncReport::decode(&bytes[..bytes.len() - 1]), None);
+        // Other payloads are not phase sync reports and vice versa
+        assert_eq!(TrackingStateReport::decode(&bytes), None);
+        assert_eq!(ScreenVideoDecodeReport::decode(&bytes), None);
+        assert_eq!(CameraTrackingStamp::decode(&bytes), None);
+        let stamp = CameraTrackingStamp {
+            capture_ns: 1,
+            client_instance: 2,
+            client_epoch: 3,
+            flags: 0,
+        };
+        assert_eq!(PhaseSyncReport::decode(&stamp.encode()), None);
+        // Non-finite margins are refused
+        let mut nan = report;
+        nan.margin_mean_ms = f32::NAN;
+        assert_eq!(PhaseSyncReport::decode(&nan.encode()), None);
+    }
 
     #[test]
     fn round_trips_and_rejects_foreign_payloads() {

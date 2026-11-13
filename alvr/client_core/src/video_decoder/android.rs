@@ -92,11 +92,22 @@ pub struct VideoDecoderSource {
     image_queue: Arc<Mutex<VecDeque<QueuedImage>>>,
     config: VideoDecoderConfig,
     buffering_running_average: f32,
+    // Fork phase sync: show the newest ready frame (older ready ones dropped and counted)
+    newest_frame_only: bool,
+    dropped_frames: u32,
 }
 
 unsafe impl Send for VideoDecoderSource {}
 
 impl VideoDecoderSource {
+    pub fn set_newest_frame_only(&mut self, newest_only: bool) {
+        self.newest_frame_only = newest_only;
+    }
+
+    pub fn take_dropped_frames(&mut self) -> u32 {
+        std::mem::take(&mut self.dropped_frames)
+    }
+
     // The application MUST finish using the returned buffer before calling this function again
     pub fn dequeue_frame(&mut self) -> Option<(Duration, *mut c_void)> {
         let mut image_queue_lock = self.image_queue.lock();
@@ -108,12 +119,22 @@ impl VideoDecoderSource {
             image_queue_lock.pop_front();
         }
 
-        // use running average to give more weight to recent samples
-        self.buffering_running_average = self.buffering_running_average
-            * self.config.buffering_history_weight
-            + image_queue_lock.len() as f32 * (1. - self.config.buffering_history_weight);
-        if self.buffering_running_average > self.config.max_buffering_frames as f32 {
-            image_queue_lock.pop_front();
+        if self.newest_frame_only {
+            // Phase sync: frames are meant to arrive one per render loop just before it looks;
+            // more than one ready means the client fell behind (a late frame, a hiccup): catch up
+            // at once instead of staying a frame behind
+            while image_queue_lock.len() > 1 {
+                image_queue_lock.pop_front();
+                self.dropped_frames += 1;
+            }
+        } else {
+            // use running average to give more weight to recent samples
+            self.buffering_running_average = self.buffering_running_average
+                * self.config.buffering_history_weight
+                + image_queue_lock.len() as f32 * (1. - self.config.buffering_history_weight);
+            if self.buffering_running_average > self.config.max_buffering_frames as f32 {
+                image_queue_lock.pop_front();
+            }
         }
 
         if let Some(queued_image) = image_queue_lock.front_mut() {
@@ -420,6 +441,8 @@ pub fn video_decoder_split(
         image_queue,
         config,
         buffering_running_average: 0.0,
+        newest_frame_only: false,
+        dropped_frames: 0,
     };
 
     Ok((sink, source))

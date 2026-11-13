@@ -981,6 +981,21 @@ fn connection_pipeline(
 
     let disconnect_notif = Arc::new(Condvar::new());
 
+    // Fork phase sync: steers the virtual vsync that paces SteamVR (PostPresent, Windows only, and
+    // only with server frame pacing); announced to the client with RealTimeConfig EXT_PHASE_SYNC
+    let phase_sync_target_ms = initial_settings
+        .video
+        .phase_sync
+        .as_option()
+        .filter(|_| cfg!(windows) && initial_settings.video.enforce_server_frame_pacing)
+        .map(|config| config.target_margin_ms);
+    info!(
+        "Phase sync: {}",
+        match phase_sync_target_ms {
+            Some(target) => format!("on, target margin {target:.1} ms"),
+            None => "off (setting, or server frame pacing off)".into(),
+        }
+    );
     *ctx.statistics_manager.write() = Some(StatisticsManager::new(
         initial_settings.connection.statistics_history_size,
         Duration::from_secs_f32(1.0 / fps),
@@ -989,6 +1004,7 @@ fn connection_pipeline(
         } else {
             0.0
         },
+        phase_sync_target_ms,
     ));
     *ctx.bitrate_manager.lock() =
         BitrateManager::new(initial_settings.video.bitrate.history_size, fps);
@@ -1319,6 +1335,17 @@ fn connection_pipeline(
                 }
                 if scene_loading {
                     ext_tokens.push(alvr_packets::EXT_SCENE_LOADING);
+                }
+                // Phase sync needs the server's frame pacing (real-time setting): without it the
+                // client keeps its upstream frame queue behaviour
+                if phase_sync_target_ms.is_some()
+                    && SESSION_MANAGER
+                        .read()
+                        .settings()
+                        .video
+                        .enforce_server_frame_pacing
+                {
+                    ext_tokens.push(alvr_packets::EXT_PHASE_SYNC);
                 }
                 config.ext_str = ext_tokens.join(",");
 
@@ -1670,7 +1697,13 @@ fn connection_pipeline(
                     // Tagged payloads of newer clients (head tracking continuity, camera frame
                     // tracking stamps); unknown ones are ignored
                     ClientControlPacket::ReservedBuffer(bytes) => {
-                        tracking_extras::report_reserved_buffer(&bytes);
+                        if let Some(report) = alvr_packets::PhaseSyncReport::decode(&bytes) {
+                            if let Some(stats) = &mut *ctx.statistics_manager.write() {
+                                stats.report_phase_sync(report);
+                            }
+                        } else {
+                            tracking_extras::report_reserved_buffer(&bytes);
+                        }
                     }
                     ClientControlPacket::Reserved(_) => (),
                 }

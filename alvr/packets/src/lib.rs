@@ -577,6 +577,11 @@ pub const EXT_SCENE_MODE: &str = "scene_mode";
 /// kVrNativeQuadsFlagSceneLoading): the client shows its loading screen instead of the stream
 pub const EXT_SCENE_LOADING: &str = "scene_loading";
 
+/// RealTimeConfig.ext_str token: the server steers its frame phase from the client's
+/// PhaseSyncReport (ReservedBuffer 'PSYN'). Only while it is present does the client send those
+/// reports and show the newest ready frame (dropping an older one) instead of the oldest.
+pub const EXT_PHASE_SYNC: &str = "phase_sync";
+
 // Note: server sends a packet to the client at low frequency, binary encoding, without ensuring
 // compatibility between different versions, even if within the same major version.
 #[derive(Serialize, Deserialize, PartialEq, Clone)]

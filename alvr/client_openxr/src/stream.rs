@@ -39,6 +39,11 @@ use std::{
 };
 
 const DECODER_MAX_TIMEOUT_MULTIPLIER: f32 = 0.8;
+// Phase sync (fork): wait at most half a frame for a decoded frame. Frames are steered to arrive
+// just before the loop looks; with the longer upstream wait a loop without a frame could catch the
+// next loop's frame and the client would settle in a different (waiting) state. Half a frame keeps
+// that state out of reach for target margins up to 4 ms (server_core phase_sync.rs).
+const PHASE_SYNC_DECODER_TIMEOUT_MULTIPLIER: f32 = 0.5;
 const CM_TO_M: f32 = 0.01;
 
 pub struct ParsedStreamConfig {
@@ -122,6 +127,9 @@ pub struct StreamContext {
     // (window start, probes, total, max) for the cost log
     key_probe_timing: (Instant, u32, Duration, Duration),
     decoder: Option<(VideoDecoderConfig, VideoDecoderSource)>,
+    // The server steers its frame phase (RealTimeConfig EXT_PHASE_SYNC): newest ready frame, half a
+    // frame of wait, a report per loop
+    phase_sync: bool,
     use_custom_reprojection: bool,
     // Running while the server requests headset camera frames
     camera_frames: Option<(CameraFramesConfig, CameraFrameSource)>,
@@ -286,6 +294,7 @@ impl StreamContext {
             target_view_resolution,
             renderer,
             decoder: None,
+            phase_sync: false,
         };
 
         this.update_reference_space();
@@ -415,6 +424,14 @@ impl StreamContext {
         Arc::clone(&self.hands_selected)
     }
 
+    /// Phase sync announced by the server (lib.rs keeps the flag from RealTimeConfig.ext_str)
+    pub fn set_phase_sync(&mut self, enabled: bool) {
+        if enabled != self.phase_sync {
+            self.phase_sync = enabled;
+            self.core_context.set_phase_sync(enabled);
+        }
+    }
+
     /// Probe each new frame for the key colour during render() (synchronous tiny readback) while
     /// the loading screen needs it; the result is render()'s third value
     pub fn set_key_probe(&mut self, wanted: bool) {
@@ -440,6 +457,9 @@ impl StreamContext {
         // Every decoded frame available now, each reported as presented: nothing waits in this
         // loop, so taking one per loop could let the decoder's output back up (queue overflow, then
         // input saturation and keyframe requests)
+        if self.phase_sync {
+            self.core_context.report_stream_skipped();
+        }
         while let Some((timestamp, _)) = source.get_frame() {
             Self::report_compositor_start(
                 &self.core_context,
@@ -492,15 +512,37 @@ impl StreamContext {
         vsync_time: Duration,
     ) -> (ProjectionLayerBuilder<'_>, Duration, Option<f32>) {
         let xr_vsync_time = xr::Time::from_nanos(vsync_time.as_nanos() as _);
-        let frame_poll_deadline = Instant::now()
-            + Duration::from_secs_f32(
-                frame_interval.as_secs_f32() * DECODER_MAX_TIMEOUT_MULTIPLIER,
-            );
+        let poll_start = Instant::now();
         let mut frame_result = None;
         if let Some((_, source)) = &mut self.decoder {
-            while frame_result.is_none() && Instant::now() < frame_poll_deadline {
+            if self.phase_sync {
+                let frame_poll_deadline = poll_start
+                    + Duration::from_secs_f32(
+                        frame_interval.as_secs_f32() * PHASE_SYNC_DECODER_TIMEOUT_MULTIPLIER,
+                    );
+                source.set_newest_frame_only(true);
                 frame_result = source.get_frame();
-                thread::sleep(Duration::from_micros(500));
+                let ready_at_poll = frame_result.is_some();
+                while frame_result.is_none() && Instant::now() < frame_poll_deadline {
+                    thread::sleep(Duration::from_micros(500));
+                    frame_result = source.get_frame();
+                }
+                self.core_context.report_stream_loop(
+                    poll_start,
+                    frame_result.map(|(timestamp, _)| (timestamp, ready_at_poll)),
+                    source.take_dropped_frames(),
+                    frame_interval,
+                );
+            } else {
+                source.set_newest_frame_only(false);
+                let frame_poll_deadline = poll_start
+                    + Duration::from_secs_f32(
+                        frame_interval.as_secs_f32() * DECODER_MAX_TIMEOUT_MULTIPLIER,
+                    );
+                while frame_result.is_none() && Instant::now() < frame_poll_deadline {
+                    frame_result = source.get_frame();
+                    thread::sleep(Duration::from_micros(500));
+                }
             }
         }
 

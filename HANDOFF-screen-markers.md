@@ -9,6 +9,121 @@ Sections below "Deployed (2026-11-11)" are dated history; where they disagree, t
 The cleanup of 2026-11-13 (next section) removed most debug switches and workarounds described in that
 history.
 
+## Phase sync 2026-11-13 (branch `feature/phase-sync` on `merge/upstream-2026-11` `95be6485`, worktree `C:\wkspaces\ALVR_phase`, NOT deployed)
+
+Goal: no more session-to-session lottery in the decoder queue (`D:\wkspaces\ScreenVR\docs\StreamingLatency-2026-11-13.md`
+3.1, experiment E8). Driver and APK are both needed for the feature; each works alone with the other's old version
+(then frame timing is exactly as before).
+
+### What the code showed (and what changed the plan)
+
+- **Server loop.** SteamVR's compositor calls `Present` then `PostPresent` (`server_openvr/cpp/platform/win32/
+  OvrDirectModeComponent.cpp`); `PostPresent` -> `WaitForVSync` (`server_openvr/src/lib.rs` `wait_for_vsync`) sleeps
+  until the next **virtual vsync** of `StatisticsManager::duration_until_next_vsync` (`server_core/src/statistics.rs`):
+  a fixed grid of period 1/fps started at connect time, never aligned to anything. With
+  `DriverDirectModeSendsVsyncEvents = false` and `SecondsFromVsyncToPhotons = 0` (`server_openvr/src/props.rs`) this
+  sleep is what paces the compositor and the game, so shifting the grid shifts when frames are produced. Only with
+  `video.enforce_server_frame_pacing` (default true); without it `PostPresent` only yields. Upstream's
+  `dynamic-framerate+tracking-phase-sync` (2023, `a44e3c75`) only fed the client's predicted frame interval into the
+  same grid (and `Prop_DisplayFrequency`); no phase control. Not merged; the idea (frequency from the headset) is
+  covered here by the controller's integral term.
+- **Client loop** (`client_openxr/src/lib.rs` render loop, `stream.rs` `StreamContext::render`): `xrWaitFrame`,
+  screen videos, then `render` takes the **oldest** decoded image (`client_core/src/video_decoder/android.rs`
+  `dequeue_frame`) or **waits up to 0.8 frame** for one. `decoder_queue_s` = picked minus decoded (frames picked
+  while the loop waited show ~0 to 0.5 ms; the wait itself lands in `vsync_queue_s`).
+- **Consequence (not in the latency doc):** for a phase where frames arrive shortly after the loop starts looking,
+  two states are self-sustaining: "the loop waits a little for each frame" (low decoder queue) and "each frame waits
+  almost a whole frame decoded" (one frame behind: every loop finds the previous loop's frame ready and never waits).
+  `max_buffering_frames` 2.0 never drops a frame in the second state. Which state a session lands in is history
+  (start-up, any dropped frame). The measured 6 to 10 ms flat decoder queues are the "one frame behind" state; the
+  1.6 ms run was a phase just outside the 0.8-frame wait window. Steering the server's phase alone cannot leave the
+  "behind" state quickly, and could even push a session into it; so the client's pick rules change too while phase
+  sync is on.
+
+### Design
+
+- **Signal (client, `client_core/src/phase_sync.rs` `PhaseSyncReporter`, fed by `ClientCoreContext::report_stream_loop`
+  from `StreamContext::render`):** per render loop, margin = loop starts looking (`poll_start`) minus the picked
+  frame's decode time (`StatisticsManager::frame_decoded_instant` = packet received + decode). Positive: the frame
+  waited; negative: the loop waited. Also counted: loops, frames (= samples), loops without a frame, **missed slots**
+  (loop finds its frame already waiting while the previous loop got none), frames the loop waited for, frames dropped
+  by the newest-frame rule, loops skipped (stream unused). Every 500 ms a `PhaseSyncReport` (`alvr_packets`,
+  `tracking_state.rs`) in `ClientControlPacket::ReservedBuffer`, tag **`PSYN`** version 1 (58 bytes): sequence,
+  window, display period, the counts, margin mean / p10 / p50 / p90. Sent only while the server announces phase sync.
+- **Client pick rules while phase sync is on** (`stream.rs` `render`, `android.rs` `dequeue_frame`): the newest ready
+  frame is shown and older ready ones are dropped (counted) instead of upstream's running-average trimming; the loop
+  waits at most **0.5 frame** (upstream 0.8) and does not sleep 0.5 ms after a frame was found. With the target margin
+  below frame - 0.5 frame - jitter (cap 4 ms) only one state exists.
+- **Controller (server, `server_core/src/phase_sync.rs` `PhaseSyncController`, pure, unit tested):** PI on
+  error = median margin - (target + back-off), clamped to +-1 frame. Kp 0.25/s, Ki 0.02/s^2 (damping 0.88). Output
+  rate (ms of phase per second, positive = later) clamped to **+-1 ms/s** (= frame period +-0.1 %); the integral
+  term (clamped +-0.8 ms/s) converges to the PC/headset clock offset, so on average the server runs at the headset's
+  rate; the proportional term only while the last report is < 1.5 s old. **Hold** (phase term 0, frequency term
+  kept) when the client skipped the stream (stream unused), when < 5 samples or < 50 % of loops had one (no scene /
+  SteamVR not presenting / decoder restart), when the client ran < 80 % of its display rate, or on a malformed report.
+  **Lock**: |error| < 1 ms in 3 reports in a row; lost: > 3 ms in 4 in a row. **Back-off**: judged every 5 s; if
+  missed slots not explained by frames the server did not present exceed max(3, 2 % of loops) while locked, the
+  target rises by 0.5 ms (effective target capped at 4 ms); it decays by 0.25 ms per 30 s without unexplained misses.
+  Frames the loop waited for are NOT a back-off reason: they are shown in their slot, with less latency.
+- **Actuator (`StatisticsManager::duration_until_next_vsync`):** grid period = nominal x (1 + rate/1000) once the
+  first report arrived; the nominal period otherwise. `StatisticsManager` is created per connection
+  (`connection.rs` `connection_pipeline`), so reconnects and SteamVR restarts start a fresh controller on the nominal
+  grid; no report = today's behaviour.
+- **Announcement:** `RealTimeConfig.ext_str` token **`phase_sync`** (`alvr_packets::EXT_PHASE_SYNC`) while the
+  controller exists and `enforce_server_frame_pacing` is on. The client never decides from its own settings copy.
+
+### Setting
+
+`session_settings.video.phase_sync` = `{"enabled": true, "content": {"target_margin_ms": 2.0}}` (Switch, default
+**on**; slider 0.5 to 4 ms, clamped to 0..4 by the controller). Read at connection start (reconnect to apply). A
+`session.json` without the key (dev rig and fleet seed today) gets the default, i.e. ON. Off = upstream behaviour
+exactly: no token, the client keeps oldest-frame + running-average buffering + 0.8-frame wait, the server keeps the
+nominal grid. Windows only (`cfg!(windows)`), and only with `video.enforce_server_frame_pacing`.
+
+### Compatibility
+
+No packet variant, no version bump: protocol id stays `21-dev14.screenvr.1`.
+- New driver + old APK: token ignored by the old client, no reports, grid stays nominal (log `Phase sync: on, ...`
+  but never `client reports arriving`).
+- Old driver + new APK: no token, the new client behaves as upstream and sends nothing.
+- ScreenVR contracts unchanged: tracking extras v6, request block, native quads, screen video, `SVDA`/`SVTS`/`SVCS`.
+  `PSYN` is decoded before `tracking_extras::report_reserved_buffer`; other servers ignore it.
+
+### Verify from the logs
+
+`session_log.txt` (server):
+- once per connection: `Phase sync: on, target margin 2.0 ms` (or `off (...)`);
+- `Phase sync: client reports arriving, target margin 2.0 ms, margin now X ms (median)`;
+- `Phase sync: LOCKED, margin 2.x ms (median; target 2.0), clock correction +NN ppm` within about 5 to 25 s;
+- every 10 s: `Phase sync: margin p10/p50/p90 a/b/c ms, mean over N reports m ms, target t, locked; rate r ms/s,
+  clock NN ppm; loops, frames, waited for, missed, dropped, skipped`;
+- on events only: `holding the phase (StreamSkipped | TooFewFrames | ClientSlow | Invalid)`, `steering again`,
+  `lock lost`, `target margin now ...` (back-off).
+Client logcat: `Phase sync: on` / `off`.
+`D:\wkspaces\ScreenVR\tools\streaming\alvr_stats.py` / `Run-LatencyExp.ps1`: per-frame `decoder queue` should be
+about 2 ms average in every session and flat in the 10-bucket series (no saw-tooth); `vsync queue` unchanged (~20
+ms); total about (old decoder queue - 2) ms lower. Note: `Run-LatencyExp.ps1` has no phase sync parameter yet; to A/B,
+set `session_settings.video.phase_sync.enabled` false/true in `session.json`.
+
+### Tests and build
+
+`cargo test -p alvr_server_core --lib` (22, of which 10 `phase_sync`: simulation of grid + pipeline + client pick
+rules with drift +-200/300 ppm, decode jitter 0.6 / 1.5 ms, +3 ms decode step, 10 % server frame drops, 20 s idle,
+20 s stream unused, 5 % decoder hiccups; converges from the "one frame behind" state (8 ms) and from "loop waits"
+(-4 ms), settles to +-0.3 ms of the target without oscillation (rate spread < 0.3 ms/s), the integral equals the
+clock offset), `-p alvr_client_core --lib` (4, reporter), `-p alvr_packets` (`PSYN` round trip, foreign payloads),
+`-p alvr_session`, `-p alvr_client_openxr` (35); `cargo check -p alvr_client_openxr --target aarch64-linux-android`,
+`cargo check -p alvr_server_openvr -p alvr_dashboard`; clippy: nothing in touched files.
+
+### Not known yet (needs the rig)
+
+- That SteamVR's compositor really follows the shifted `PostPresent` timing 1:1 (expected from the code; if not, the
+  log never shows `LOCKED` and the 10 s line shows `rate +-1.00` with the margin not moving).
+- Whether a NEGATIVE target (the loop waits a few ms for each frame) is safe with PICO's compositor deadline: it
+  would save another 2 to 5 ms, but needs a client rule to leave the "one frame behind" state after a miss (see
+  "What the code showed"); not implemented, the target is clamped to >= 0.
+- PICO 4 Enterprise (other decoder jitter) and 72 / 120 Hz.
+
 ## Upstream merge 2026-11-13 (branch `merge/upstream-2026-11`, worktree `C:\wkspaces\ALVR_upstream`, NOT deployed)
 
 Built on `f93c2e3b` (= `feature/screen-markers` = `master`). Two commits:

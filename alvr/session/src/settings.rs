@@ -789,6 +789,15 @@ pub struct UpscalingConfig {
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
+pub struct PhaseSyncConfig {
+    #[schema(strings(
+        help = r"How long (median) a decoded frame should wait before the headset's render loop picks it up. Smaller is lower latency. A frame that arrives a little late is still shown in time (the render loop waits up to half a frame for it); one later than that misses its slot and the previous frame is shown again. The server raises the margin by itself (to at most 4 ms) while frames miss their slot too often."
+    ))]
+    #[schema(gui(slider(min = 0.5, max = 4.0, step = 0.1)), suffix = " ms")]
+    pub target_margin_ms: f32,
+}
+
+#[derive(SettingsSchema, Serialize, Deserialize, Clone)]
 pub struct VideoConfig {
     #[schema(flag = "real-time")]
     pub passthrough: Switch<PassthroughMode>,
@@ -830,6 +839,12 @@ If you want to reduce the amount of pixelation on the edges, increase the center
     ))]
     #[schema(flag = "real-time")]
     pub enforce_server_frame_pacing: bool,
+
+    #[cfg_attr(not(target_os = "windows"), schema(flag = "hidden"))]
+    #[schema(strings(
+        help = r"Steers when the server produces frames so that each frame finishes decoding just before the headset's render loop picks it up (removes most of the decoder queue). The headset reports how early or late its frames arrive; the server shifts its frame timing slowly (at most 1 ms per second) and never changes its average frame rate. Needs server frame pacing and a client that supports it; otherwise frame timing is unchanged. Applied at the next connection."
+    ))]
+    pub phase_sync: Switch<PhaseSyncConfig>,
 
     #[schema(flag = "steamvr-restart")]
     pub encoder_config: EncoderConfig,
@@ -1862,6 +1877,12 @@ pub fn session_settings_default() -> SettingsDefault {
             max_buffering_frames: 2.0,
             buffering_history_weight: 0.90,
             enforce_server_frame_pacing: true,
+            phase_sync: SwitchDefault {
+                enabled: true,
+                content: PhaseSyncConfigDefault {
+                    target_margin_ms: 2.0,
+                },
+            },
             bitrate: BitrateConfigDefault {
                 gui_collapsed: false,
                 mode: BitrateModeDefault {

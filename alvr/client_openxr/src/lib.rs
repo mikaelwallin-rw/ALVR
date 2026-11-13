@@ -488,6 +488,8 @@ pub fn entry_point() {
         // Overlay app's flag (RealTimeConfig.ext_str): nothing of its own is in the stream
         let mut stream_unused_flag = false;
         let mut stream_skipped = false;
+        // Server's flag (RealTimeConfig.ext_str): it steers its frame phase from our reports
+        let mut phase_sync_flag = false;
         // Overlay app's flags (RealTimeConfig.ext_str): a scene app owns the view / is starting or
         // shutting down; and whether the server configures passthrough (scene mode: no)
         let mut scene_mode_flag = false;
@@ -646,6 +648,8 @@ pub fn entry_point() {
                         loading_output = None;
                         scene_mode_flag = false;
                         scene_loading_flag = false;
+                        phase_sync_flag = false;
+                        core_context.set_phase_sync(false);
                     }
                     ClientCoreEvent::Haptics {
                         device_id,
@@ -688,6 +692,7 @@ pub fn entry_point() {
                         let has_token =
                             |name: &str| config.ext_str.split(',').any(|token| token == name);
                         stream_unused_flag = has_token(alvr_packets::EXT_STREAM_UNUSED);
+                        phase_sync_flag = has_token(alvr_packets::EXT_PHASE_SYNC);
                         scene_mode_flag = has_token(alvr_packets::EXT_SCENE_MODE);
                         scene_loading_flag = has_token(alvr_packets::EXT_SCENE_LOADING);
                         passthrough_configured = config.passthrough.is_some();
@@ -797,6 +802,7 @@ pub fn entry_point() {
             let streaming = stream_context.is_some();
             let (layer, display_time, key_probe) = if let Some(stream) = &mut stream_context {
                 stream.set_key_probe(loading_output.is_some_and(|output| output.probe));
+                stream.set_phase_sync(phase_sync_flag);
                 if skip_stream {
                     stream.skip_frame(vsync_time);
                     (None, vsync_time, None)
