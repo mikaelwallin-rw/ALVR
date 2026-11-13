@@ -232,49 +232,6 @@ pub enum ServerControlPacket {
     NativeQuads(Vec<NativeQuad>),
     // Overlay app's persistent anchor command (create/replace or forget)
     AnchorRequest(AnchorRequest),
-    // NO LONGER SENT (cleanup 2026-11-13, stage 1): kept only so that this server and an older
-    // client still decode each other's packets; removed together with a protocol version bump.
-    // Overlay app's automatic hand correction (lengthened drawn fingers near the touchscreen)
-    HandCorrection(HandCorrection),
-    // Overlay app's hand display transform (drawn hands into the passthrough-consistent frame)
-    HandDisplay(HandDisplay),
-}
-
-/// Hand display transform from an overlay app: the DRAWN hands near the touch display are moved
-/// into the frame in which the overlay app draws that display (e.g. its passthrough-compensated
-/// pose), so that hand and display agree with what passthrough shows. Never applied to reported
-/// joints.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
-pub struct HandDisplay {
-    pub sequence: u32,
-    /// false = identity (e.g. scene mode, where the display is drawn at its true pose)
-    pub active: bool,
-    /// STAGE -> STAGE rigid part mapping the display's true pose to its published pose
-    pub transform: Pose,
-    /// Uniform scale about the display's true centre, applied before `transform`
-    pub scale: f32,
-    /// The display quad as published (STAGE) and its full size, meters
-    pub quad_pose: Pose,
-    pub quad_size: [f32; 2],
-    /// Full weight within this distance of the quad rectangle, fading smoothly to none at
-    /// `falloff_meters`
-    pub full_meters: f32,
-    pub falloff_meters: f32,
-}
-
-/// Automatic correction of the DRAWN hands from an overlay app (e.g. from measured touch contact
-/// points): each hand's fingers are lengthened by `finger_scale` while its index tip is near the
-/// given plane, fading to no correction at `near_meters` from it. Applied on top of the client's own
-/// hand shape settings; never applied to the joints the client reports.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
-pub struct HandCorrection {
-    pub sequence: u32,
-    /// Left, right; 1 = none
-    pub finger_scale: [f32; 2],
-    /// Full correction within half this distance of the plane, none beyond it
-    pub near_meters: f32,
-    /// Plane pose in the client STAGE space (the plane is its local XY plane)
-    pub plane: Pose,
 }
 
 /// What the client applies when drawing the hands (reported so that the overlay app can tell the

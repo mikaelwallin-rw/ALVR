@@ -681,11 +681,6 @@ fn connection_pipeline(
                             .lock()
                             .push_back(ClientCoreEvent::AnchorRequest(request));
                     }
-                    // No longer applied (cleanup 2026-11-13); an older server may still send them
-                    Ok(
-                        ServerControlPacket::HandCorrection(_)
-                        | ServerControlPacket::HandDisplay(_),
-                    ) => {}
                     Ok(ServerControlPacket::StartStream) => {
                         error!("Unexpected StartStream paceket");
                     }

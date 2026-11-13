@@ -44,6 +44,25 @@ since 2026-11-11 PICO's own camera extrinsics are used and none of the workaroun
   `graphics/src/hands.rs` (and their test). The hands are drawn as tracked with `thickness`/`scale`. The
   `HandShape` report and the extras v4 `hands[]` stay: `drawFingers` and `drawFingerCorrection` are now
   always 1, `drawCorrectionSequence` 0. The packet variants stay until step 6.
+- **Step 6 (last commit, can be dropped; driver and APK MUST be installed together):** the
+  `ServerControlPacket::HandCorrection` / `HandDisplay` variants and their structs are removed, and the fork's
+  version is `21.0.0-dev13.screenvr.1` (workspace `Cargo.toml`; was `21.0.0-dev13`). The protocol id includes
+  the pre-release, so it changes from `21-dev13` to `21-dev13.screenvr.1`: a mismatched driver/APK pair is
+  refused at the handshake (server log `Trusted client is incompatible!`) instead of dropping mid-stream.
+  Side effects of the version change at the first start (ALVR code, not ours):
+  - The client resets its config: new random hostname (`NNNN.client.local.`).
+  - The dashboard sees `server_version` != its own version: it clears `client_connections` (the trusted
+    headsets) and sets `open_setup_wizard`. The fleet seed
+    `C:\wkspaces\devroot\DeathStar\Tools\Pico\Data\alvr\session_seed.json` has `server_version`
+    `21.0.0-dev13` and the client `client.wired`: it needs the new version string when this ships (fleet
+    installer, not changed from here). On the dev copy, re-trust the headset in the dashboard after the update.
+  - Extras: `VERSION` is 5 (A10 "write 4 instead of 3" was already fixed on 2026-11-11; unchanged).
+
+| Cleanup commit | Content | Install |
+|---|---|---|
+| `8417f853` | Step 4: client switches, camera probe, projected passthrough, extrinsics table | APK alone (works with driver `76182441`) |
+| `240eb38d` | Step 5: hand correction / display transform | Driver and APK independently (any pair) |
+| step 6 commit (this file's commit) | Packet variants removed + version bump | Driver and APK together |
 
 ### Headset switch files after the cleanup (`/sdcard/Android/data/alvr.client.dev/files`; table in AlvrInterface.md)
 
@@ -72,6 +91,8 @@ state), `screenvr_tracking_diag.log` (+ `.1`).
 | `c35aa22b` | Server: tracking extras v5 (`trackingEpoch`, `headTrackingFlags`, floor-height stage change) + camera-frame tracking stamp |
 | `c3d3847d` | Client: head tracking epoch state machine + tracking diagnostics log (= deployed tree) |
 | (this file) | docs commit on top |
+| `5fc521a4` | Client: SETTLED no longer waits forever for PICO's tracking-established event (deployed APK `ef584717`, 2026-11-12) |
+| `8417f853`, `240eb38d`, + step 6 | Cleanup 2026-11-13 (see "Cleanup 2026-11-13"), NOT deployed |
 
 Intermediate commits of 2026-11-11 were not build-tested one by one; `c3d3847d` is the deployed tree.
 Deliberately NOT committed: `CLAUDE.md`, `HANDOVER.md`, `resources/SM_Hand_*.FBX`,
