@@ -121,13 +121,110 @@ the merge branch, so it pairs with any `merge/upstream-2026-11` driver/APK):
 - `alvr_streamer_windows\ALVR Dashboard.exe` sha256 `d757ae9f284e964977215790c33d2ae31fb3d1267605fe576dbab8f565e74282`
 - `alvr_client_android\alvr_client_android.apk` sha256 `f9dcb26ec31a2a3461639e3f6bf624ac8df1772ae71ae72e35f9dae5cc4e368f`
 
+### Late pickup and asynchronous key probe (2026-11-13 evening, commits `d8db5d2f` + the late pickup commit, NOT deployed)
+
+Source: `D:\wkspaces\ScreenVR\docs\StreamingProfile-2026-11-13.md` A.2 to A.4 and D #1/#2: PICO wakes the render loop
+12.5 ms before its compositor latches the frame (std 0.44), the loop needs about 7 ms of it, so the picked frame
+is about 5 ms older than necessary; target 0 instead of 2 gained 1.7 ms but latched an older frame in 5 % of
+cycles (deadline "poll + half a frame" too loose); the key probe's synchronous readback cost 1.5 ms mean, 5.8 ms
+worst on the render thread in scene mode.
+
+**Key probe (`d8db5d2f`, client only).** `graphics/src/staging.rs` `issue_probe` / `take_oldest_probe`: the 16x16
+grid is blitted into a pixel pack buffer with a GL fence (two slots), nothing waits in `render()`.
+`graphics/src/stream.rs` `StreamRenderer::take_key_probes(newest_issued, wait)`. `client_openxr/src/lib.rs`: the
+result is collected after the hands are drawn, then the guard runs; the projection layer is built afterwards
+(`StreamContext::projection_layer`, `render()` returns only the display time). `loading_screen.rs`
+`LoadingGuard::needs_current_probe`: the loop waits for this frame's result only when it can change this frame
+(stream shown opaque last frame; or scene mode without the loading flag while content is shown or this frame could
+complete `CONTENT_FRAMES`). Otherwise a result that is not ready arrives a loop later (`key_probe_earlier`) and is
+applied as in its own loop (before this loop's resets, with its loop's loading flag). Unit test: a scene script
+(front end, start with magenta while loading and after the flag, content, the app stopping before ScreenVR's
+flag, back to loading, content, end) through the old synchronous guard and the new one with results ready
+never / always / every 2nd / 4 of 5 loops: identical guard output every frame, no key colour frame shown.
+Logcat every 5 s: `Key probe: N frames in 5.0 s (asynchronous 16x16 RGBA readback): result in its own loop without
+waiting A, after waiting B (mean x us, max y us), one loop later C; stream render() mean u us, max v us`
+(old line: `... stream render() mean 2383-2550 us, max 5358-5835 us`).
+
+**Late pickup (the late pickup commit, driver + APK).**
+- Planner `client_core/src/late_pickup.rs` `LatePickupPlanner` (pure, 9 unit tests): deadline after the wake-up
+  (`xrWaitFrame` return) = latch estimate - work estimate - safety margin - back-off, clamped to [0, 0.5 frame];
+  earlier at once, later at most 0.5 ms/s; the first one starts at 0.1 frame (about the old poll start).
+  - Latch estimate `latch_after_wake(platform, period)`: PICO 4 Ultra (incl. Enterprise) frame + 1.0 ms (measured
+    12.54 = frame + 1.43 at 90 Hz); every other model 0.8 frame (not measured; PICO 4 Enterprise must be measured).
+  - Work estimate: p95 of the last 180 frames of "end of the wait -> GPU work of the whole frame done". Measured
+    with an EGL fence after the frame's last GL command (`graphics/src/fence_timer.rs` `GpuFenceTimer`, a helper
+    thread in `eglClientWaitSyncKHR`, PICO's own `gpu_frame_end` pattern); the fence is submitted in `lib.rs`
+    right before `xrEndFrame` (`StreamContext::submit_frame_fence`), so the stream pass, the key probe collection,
+    hands, loading screen and quads are all inside it. Ready after 45 frames; not ready when no sample for 1 s
+    (keeps its last deadline for when it comes back). No EGL fence sync = never ready = the old behaviour.
+  - Fail safe: "GPU late" = GPU done after the latch estimate. More than 1 in the last 90 deadline-mode frames:
+    back-off +1 ms (logged), -0.25 ms per quiet 10 s. Never blocks past the deadline (0.25 ms polls, sleep capped
+    at the deadline); the deadline is never later than wake + 0.5 frame, i.e. no later than the old phase sync
+    wait ended (poll + 0.5 frame), so other content is never delayed more than before.
+- Pick rule (`client_openxr/src/stream.rs` `render`, `video_decoder` `peek_newest_frame`): a frame decoded after
+  "deadline - target - half a frame" is this loop's and is taken at once; an older ready one (it came after the
+  previous loop's deadline) is held while the loop waits for a newer one until the deadline (taking it would keep
+  every later frame a loop behind); at the deadline the newest ready frame is taken.
+- Report: margins against the deadline, wrapped into (target - half a frame, target + half a frame]
+  (`client_core` `report_stream_loop`, `LatePickupLoop`). `PSYN` **version 2** (`packets/src/tracking_state.rs`):
+  v1 fields unchanged, then `reference` (0 poll start, 1 deadline), `gpu_late_frames`, `deadline_mean_ms`,
+  `work_estimate_ms`, `backoff_ms`. The new client always sends v2 (with reference 0 it means exactly v1, and the
+  deployed server reads any version >= 1 and ignores the tail); the new server reads v1 and v2.
+- Server (`server_core`): controller unchanged (it now aims frames at "deadline - target"); `connection.rs`
+  announces `late_pickup:<safety ms>:<target ms>` (`alvr_packets::late_pickup_token` / `parse_late_pickup`) next
+  to `phase_sync`; `statistics.rs` logs the reference change and the late pickup values.
+- Setting: `session_settings.video.phase_sync.content.late_pickup` = `{"enabled": true, "content":
+  {"safety_margin_ms": 1.0}}` (Switch, default **on**, slider 0 to 4 ms; read at connection start). A
+  `session.json` without the key gets the default (on). Off = phase sync exactly as before (no token).
+
+Compatibility (protocol id unchanged `21-dev14.screenvr.1`):
+- New driver + old APK (`f9dcb26e`): the old client ignores the token (exact-match parsing), sends v1, picks as
+  before. Key probe unchanged (synchronous) in the old APK.
+- Old driver (`067dff7e`) + new APK: no token, so no late pickup; phase sync exactly as before (v2 reports with
+  reference 0, read by the old server as v1). The asynchronous key probe is active (client only).
+- Phase sync off or `enforce_server_frame_pacing` off: neither token, upstream behaviour.
+
+Verify from the logs:
+- `session_log.txt`: `Phase sync: on, target margin 2.0 ms, late pickup late_pickup:1.00:2.00`; then
+  `Phase sync: client margins now against its poll start`, a few seconds later
+  `... against its late pickup deadline (wake + 1.1 ms, work estimate x ms, back-off 0.0 ms)`; the 10 s line ends
+  with `late N, missed .., dropped .., skipped ..; late pickup: deadline wake + D ms, work W ms, back-off B ms, GPU
+  late G` (`late` = frames that came after their loop's deadline; the loop waiting for a frame is normal now).
+- Client logcat: `Late pickup: on (safety margin 1.0 ms, target margin 2.0 ms)`, `Late pickup: measuring the
+  frame's GPU time, ...`, `Late pickup: deadline active ...`; every 10 s `Late pickup: n of m loops with a deadline
+  (mean wake + D ms; taken at the deadline a, waited past a stale frame b); latch estimate wake + 12.1 ms, pick to
+  GPU done estimate W ms (max ..), back-off B ms; GPU done g, after the latch estimate l`; on events
+  `Late pickup: k of the last 90 frames finished their GPU work after the estimated latch ...: back-off now ..`.
+- Expected on the rig (90 Hz, PICO 4 Ultra): W about 5 to 7 ms, D about 4 to 5 ms after the wake (rises at
+  0.5 ms/s, so give it 10 to 20 s), total latency 2 to 4 ms lower than the `prof-base` 55.2 (decoder queue about
+  the target, client compositor down by the probe's 1.5 ms, vsync queue down), GPU late well under 1 %.
+- Late latches (the real criterion, the app cannot see PICO's latch): Perfetto as in the profile doc,
+  `frames_hs.py`: "newest submitted frame still on the GPU at latch" share at or below today's 1.1 %; PxrMetric
+  `FrmLate`.
+- A/B: `Run-LatencyExp.ps1 -PhaseSync On` keeps the other `phase_sync.content` keys, so late pickup stays at the
+  default (on); for off, set `session_settings.video.phase_sync.content.late_pickup.enabled` false in
+  `session.json` (the script has no parameter for it yet).
+
+Tests: `cargo test -p alvr_client_core --lib` (14: planner 9, reporter 4), `-p alvr_client_openxr --lib` (37, incl.
+the guard equivalence and scheduling tests), `-p alvr_packets` (13, incl. v1/v2 compatibility and the token),
+`-p alvr_session`, `-p alvr_server_core --lib` (22); `cargo check -p alvr_client_openxr --target
+aarch64-linux-android`; clippy: nothing in touched files.
+
+Release build of the working tree = the late pickup commit (`C:\wkspaces\ALVR_phase\build\`, version `21.0.0-dev14.screenvr.1`):
+- `alvr_streamer_windows\alvr_server\bin\win64\driver_alvr_server.dll` sha256 `57089d452a22625b7211fd249b8d86ccfc2e2e81c4beeaa6ea25327076b8f2d6` (changed: deploy with the APK for late pickup)
+- `alvr_streamer_windows\ALVR Dashboard.exe` sha256 `7788566cadf039426880a07e738b579a77ba67fe6ee4b52975d3a74f4a5db916` (settings schema: the new switch)
+- `alvr_client_android\alvr_client_android.apk` sha256 `62799b3bc8008d144041f3ac1d6c977b79096660ad72d3dc0bb4364c5e0e2140`
+
 ### Not known yet (needs the rig)
 
 - That SteamVR's compositor really follows the shifted `PostPresent` timing 1:1 (expected from the code; if not, the
   log never shows `LOCKED` and the 10 s line shows `rate +-1.00` with the margin not moving).
 - Whether a NEGATIVE target (the loop waits a few ms for each frame) is safe with PICO's compositor deadline: it
   would save another 2 to 5 ms, but needs a client rule to leave the "one frame behind" state after a miss (see
-  "What the code showed"); not implemented, the target is clamped to >= 0.
+  "What the code showed"); not implemented, the target is clamped to >= 0. Superseded by late pickup (above), which
+  gets the same gain with a deadline from the wake-up instead of a margin.
+- Late pickup on the rig: the real late-latch rate (Perfetto), whether PICO's latch stays at wake + 12.5 ms when
+  the loop submits later, and the PICO 4 Enterprise's latch (0.8 frame assumed).
 - PICO 4 Enterprise (other decoder jitter) and 72 / 120 Hz.
 
 ## Upstream merge 2026-11-13 (branch `merge/upstream-2026-11`, worktree `C:\wkspaces\ALVR_upstream`, NOT deployed)

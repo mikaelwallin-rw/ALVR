@@ -108,6 +108,15 @@ impl VideoDecoderSource {
         std::mem::take(&mut self.dropped_frames)
     }
 
+    /// Newest queued frame not yet returned by dequeue_frame (only the front can be in use)
+    pub fn peek_newest_frame(&self) -> Option<Duration> {
+        self.image_queue
+            .lock()
+            .back()
+            .filter(|queued_image| !queued_image.in_use)
+            .map(|queued_image| queued_image.timestamp)
+    }
+
     // The application MUST finish using the returned buffer before calling this function again
     pub fn dequeue_frame(&mut self) -> Option<(Duration, *mut c_void)> {
         let mut image_queue_lock = self.image_queue.lock();

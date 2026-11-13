@@ -3,7 +3,7 @@
 //! (server_core phase_sync.rs). Active only while the server announces phase sync
 //! (RealTimeConfig.ext_str EXT_PHASE_SYNC).
 
-use alvr_packets::PhaseSyncReport;
+use alvr_packets::{PHASE_SYNC_REFERENCE_POLL_START, PhaseSyncReport};
 use std::time::{Duration, Instant};
 
 pub const REPORT_INTERVAL: Duration = Duration::from_millis(500);
@@ -11,8 +11,8 @@ pub const REPORT_INTERVAL: Duration = Duration::from_millis(500);
 /// What one render loop got
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum LoopOutcome {
-    /// A new frame. margin_ms = loop started looking minus frame decoded (None when the decode
-    /// time is unknown); ready_at_poll = it was already decoded when the loop started looking;
+    /// A new frame. margin_ms = the loop's reference (poll start, or the late pickup deadline,
+    /// wrapped) minus frame decoded (None when the decode time is unknown); ready_at_poll = it was already decoded when the loop started looking;
     /// dropped = older ready frames dropped for it
     Picked {
         margin_ms: Option<f32>,
@@ -38,6 +38,14 @@ pub struct PhaseSyncReporter {
     late: u32,
     dropped: u32,
     margins_ms: Vec<f32>,
+    // Late pickup (v2 fields): the last loop's reference, deadlines of this window, the last
+    // estimates, GPU late frames of this window
+    reference: u32,
+    deadline_sum_ms: f32,
+    deadline_count: u32,
+    work_estimate_ms: f32,
+    backoff_ms: f32,
+    gpu_late: u32,
 }
 
 impl Default for PhaseSyncReporter {
@@ -55,6 +63,12 @@ impl Default for PhaseSyncReporter {
             late: 0,
             dropped: 0,
             margins_ms: Vec::with_capacity(128),
+            reference: PHASE_SYNC_REFERENCE_POLL_START,
+            deadline_sum_ms: 0.0,
+            deadline_count: 0,
+            work_estimate_ms: 0.0,
+            backoff_ms: 0.0,
+            gpu_late: 0,
         }
     }
 }
@@ -82,6 +96,34 @@ impl PhaseSyncReporter {
                 ..Default::default()
             };
         }
+    }
+
+    /// Late pickup state of the coming loop (call before on_loop): its margin reference, its
+    /// deadline after the wake-up (deadline reference only), the planner's estimates, and GPU late
+    /// frames measured since the last call
+    pub fn note_late_pickup(
+        &mut self,
+        reference: u32,
+        deadline_ms: Option<f32>,
+        work_estimate_ms: f32,
+        backoff_ms: f32,
+        gpu_late: u32,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        self.reference = reference;
+        if let Some(deadline) = deadline_ms.filter(|d| d.is_finite()) {
+            self.deadline_sum_ms += deadline;
+            self.deadline_count += 1;
+        }
+        if work_estimate_ms.is_finite() {
+            self.work_estimate_ms = work_estimate_ms;
+        }
+        if backoff_ms.is_finite() {
+            self.backoff_ms = backoff_ms;
+        }
+        self.gpu_late += gpu_late;
     }
 
     /// One render loop. Returns a report when one is due (only while enabled).
@@ -154,6 +196,15 @@ impl PhaseSyncReporter {
             margin_p10_ms: percentile(&self.margins_ms, 0.1),
             margin_p50_ms: percentile(&self.margins_ms, 0.5),
             margin_p90_ms: percentile(&self.margins_ms, 0.9),
+            reference: self.reference,
+            gpu_late_frames: self.gpu_late,
+            deadline_mean_ms: if self.deadline_count > 0 {
+                self.deadline_sum_ms / self.deadline_count as f32
+            } else {
+                0.0
+            },
+            work_estimate_ms: self.work_estimate_ms,
+            backoff_ms: self.backoff_ms,
         };
 
         self.window_start = Some(now);
@@ -164,6 +215,9 @@ impl PhaseSyncReporter {
         self.late = 0;
         self.dropped = 0;
         self.margins_ms.clear();
+        self.deadline_sum_ms = 0.0;
+        self.deadline_count = 0;
+        self.gpu_late = 0;
 
         Some(report)
     }
@@ -235,6 +289,42 @@ mod tests {
         assert!(first.margin_mean_ms > 1.5 && first.margin_mean_ms < 2.5);
         assert_eq!(reports[1].sequence, 2);
         assert_eq!(reports[1].missed_slots, 0);
+        // Without late pickup: the v1 meaning
+        assert_eq!(first.reference, PHASE_SYNC_REFERENCE_POLL_START);
+        assert_eq!(first.deadline_mean_ms, 0.0);
+    }
+
+    #[test]
+    fn late_pickup_fields_are_reported_per_window() {
+        let mut r = PhaseSyncReporter::default();
+        r.set_enabled(true);
+        let t0 = Instant::now();
+        let period = Duration::from_micros(11_111);
+        let mut reports = vec![];
+        for i in 0..100u32 {
+            r.note_late_pickup(
+                alvr_packets::PHASE_SYNC_REFERENCE_DEADLINE,
+                Some(if i % 2 == 0 { 4.0 } else { 5.0 }),
+                6.5,
+                0.5,
+                u32::from(i == 3),
+            );
+            if let Some(report) = r.on_loop(t0 + period * i, picked(2.0, false), Some(period)) {
+                reports.push(report);
+            }
+        }
+        assert_eq!(reports.len(), 2);
+        assert_eq!(
+            reports[0].reference,
+            alvr_packets::PHASE_SYNC_REFERENCE_DEADLINE
+        );
+        assert!((reports[0].deadline_mean_ms - 4.5).abs() < 0.05);
+        assert_eq!(reports[0].work_estimate_ms, 6.5);
+        assert_eq!(reports[0].backoff_ms, 0.5);
+        assert_eq!(reports[0].gpu_late_frames, 1);
+        assert_eq!(reports[1].gpu_late_frames, 0);
+        // Waiting for a frame is normal with the deadline: those are not late (positive margin)
+        assert_eq!(reports[0].late_frames, 0);
     }
 
     #[test]

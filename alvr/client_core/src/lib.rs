@@ -7,6 +7,7 @@
 
 mod c_api;
 mod connection;
+pub mod late_pickup;
 mod logging_backend;
 pub mod phase_sync;
 mod sockets;
@@ -88,6 +89,20 @@ pub struct VideoFrameMetadata {
     pub view_params: [ViewParams; 2],
     /// If absent, reuse the previous centers or the negotiated centers before the first update.
     pub foveation_center_shifts: Option<[[f32; 2]; 2]>,
+}
+
+/// Fork late pickup: what one render loop tells the phase sync reporter (late_pickup.rs)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LatePickupLoop {
+    /// Some: the loop used a late pickup deadline this long after its wake-up (the reference
+    /// passed to report_stream_loop is that deadline); None: the planner is not ready (the
+    /// reference is the poll start)
+    pub deadline_after_wake: Option<Duration>,
+    pub target_margin_ms: f32,
+    pub work_estimate_ms: f32,
+    pub backoff_ms: f32,
+    /// GPU late frames measured since the previous loop
+    pub gpu_late_frames: u32,
 }
 
 pub struct ClientCoreContext {
@@ -456,33 +471,44 @@ impl ClientCoreContext {
         reporter.set_enabled(enabled);
     }
 
-    /// Fork phase sync: one render loop of the main stream. poll_start = when the loop started
-    /// looking for a decoded frame; picked = (frame timestamp, it was already decoded at
-    /// poll_start); dropped = older ready frames dropped for it.
+    /// When the decoder delivered this frame (None if unknown)
+    pub fn frame_decoded_instant(&self, timestamp: Duration) -> Option<Instant> {
+        self.connection_context
+            .statistics_manager
+            .lock()
+            .as_ref()
+            .and_then(|stats| stats.frame_decoded_instant(timestamp))
+    }
+
+    /// Fork phase sync: one render loop of the main stream. reference = when the loop started
+    /// looking for a decoded frame, or its late pickup deadline (then late_pickup says so);
+    /// picked = (frame timestamp, it was already decoded at the poll start); dropped = older
+    /// ready frames dropped for it. late_pickup: None = no late pickup announced (v1 meaning).
     pub fn report_stream_loop(
         &self,
-        poll_start: Instant,
+        reference: Instant,
         picked: Option<(Duration, bool)>,
         dropped: u32,
         frame_interval: Duration,
+        late_pickup: Option<LatePickupLoop>,
     ) {
         if !self.phase_sync.lock().is_enabled() {
             return;
         }
+        let deadline_mode = late_pickup.is_some_and(|info| info.deadline_after_wake.is_some());
         let outcome = match picked {
             Some((timestamp, ready_at_poll)) => {
-                let decoded = self
-                    .connection_context
-                    .statistics_manager
-                    .lock()
-                    .as_ref()
-                    .and_then(|stats| stats.frame_decoded_instant(timestamp));
+                let decoded = self.frame_decoded_instant(timestamp);
                 phase_sync::LoopOutcome::Picked {
                     margin_ms: decoded.map(|decoded| {
-                        if poll_start >= decoded {
-                            poll_start.duration_since(decoded).as_secs_f32() * 1000.0
-                        } else {
-                            -(decoded.duration_since(poll_start).as_secs_f32() * 1000.0)
+                        let margin = late_pickup::signed_ms(reference, decoded);
+                        match late_pickup.filter(|_| deadline_mode) {
+                            Some(info) => late_pickup::LatePickupPlanner::wrap_margin_ms(
+                                margin,
+                                frame_interval,
+                                info.target_margin_ms,
+                            ),
+                            None => margin,
                         }
                     }),
                     ready_at_poll,
@@ -491,6 +517,20 @@ impl ClientCoreContext {
             }
             None => phase_sync::LoopOutcome::NoFrame,
         };
+        if let Some(info) = late_pickup {
+            self.phase_sync.lock().note_late_pickup(
+                if deadline_mode {
+                    alvr_packets::PHASE_SYNC_REFERENCE_DEADLINE
+                } else {
+                    alvr_packets::PHASE_SYNC_REFERENCE_POLL_START
+                },
+                info.deadline_after_wake
+                    .map(|deadline| deadline.as_secs_f32() * 1000.0),
+                info.work_estimate_ms,
+                info.backoff_ms,
+                info.gpu_late_frames,
+            );
+        }
         self.send_phase_sync_report(outcome, Some(frame_interval));
     }
 

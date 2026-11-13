@@ -989,10 +989,28 @@ fn connection_pipeline(
         .as_option()
         .filter(|_| cfg!(windows) && initial_settings.video.enforce_server_frame_pacing)
         .map(|config| config.target_margin_ms);
+    // Late pickup (fork, with phase sync only): announced with RealTimeConfig EXT_LATE_PICKUP;
+    // only a client that knows the token changes its pick rule and margin reference
+    let late_pickup_token = initial_settings
+        .video
+        .phase_sync
+        .as_option()
+        .filter(|_| phase_sync_target_ms.is_some())
+        .and_then(|config| {
+            config.late_pickup.as_option().map(|late_pickup| {
+                alvr_packets::late_pickup_token(alvr_packets::LatePickupAnnouncement {
+                    safety_margin_ms: late_pickup.safety_margin_ms.clamp(0.0, 4.0),
+                    target_margin_ms: config.target_margin_ms.clamp(0.0, 4.0),
+                })
+            })
+        });
     info!(
         "Phase sync: {}",
         match phase_sync_target_ms {
-            Some(target) => format!("on, target margin {target:.1} ms"),
+            Some(target) => format!(
+                "on, target margin {target:.1} ms, late pickup {}",
+                late_pickup_token.as_deref().unwrap_or("off")
+            ),
             None => "off (setting, or server frame pacing off)".into(),
         }
     );
@@ -1346,6 +1364,9 @@ fn connection_pipeline(
                         .enforce_server_frame_pacing
                 {
                     ext_tokens.push(alvr_packets::EXT_PHASE_SYNC);
+                    if let Some(token) = &late_pickup_token {
+                        ext_tokens.push(token.as_str());
+                    }
                 }
                 config.ext_str = ext_tokens.join(",");
 

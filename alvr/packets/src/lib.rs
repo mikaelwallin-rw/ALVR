@@ -582,6 +582,48 @@ pub const EXT_SCENE_LOADING: &str = "scene_loading";
 /// reports and show the newest ready frame (dropping an older one) instead of the oldest.
 pub const EXT_PHASE_SYNC: &str = "phase_sync";
 
+/// RealTimeConfig.ext_str token, only together with EXT_PHASE_SYNC: late pickup. The client waits
+/// for the newest decoded frame until a deadline measured from its render loop's wake-up (as late
+/// as its render + submit still finishes before the runtime's compositor takes the frame), and
+/// reports margins against that deadline (PhaseSyncReport v2, reference DEADLINE). Carries what
+/// the client needs: `late_pickup:<safety margin ms>:<target margin ms>` (format with
+/// late_pickup_token, read with parse_late_pickup). Older clients ignore it (no exact match).
+pub const EXT_LATE_PICKUP: &str = "late_pickup";
+
+/// What EXT_LATE_PICKUP tells the client
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LatePickupAnnouncement {
+    /// Kept between the client's estimated end of work and the compositor latch, ms
+    pub safety_margin_ms: f32,
+    /// The server's target margin (where the client centres the wrap of its margins), ms
+    pub target_margin_ms: f32,
+}
+
+pub fn late_pickup_token(announcement: LatePickupAnnouncement) -> String {
+    format!(
+        "{EXT_LATE_PICKUP}:{:.2}:{:.2}",
+        announcement.safety_margin_ms, announcement.target_margin_ms
+    )
+}
+
+/// The EXT_LATE_PICKUP token of a RealTimeConfig.ext_str, if any (a malformed one counts as none)
+pub fn parse_late_pickup(ext_str: &str) -> Option<LatePickupAnnouncement> {
+    ext_str.split(',').find_map(|token| {
+        let mut parts = token.split(':');
+        if parts.next()? != EXT_LATE_PICKUP {
+            return None;
+        }
+        let safety_margin_ms = parts.next()?.parse::<f32>().ok()?;
+        let target_margin_ms = parts.next()?.parse::<f32>().ok()?;
+        (safety_margin_ms.is_finite() && target_margin_ms.is_finite()).then_some(
+            LatePickupAnnouncement {
+                safety_margin_ms,
+                target_margin_ms,
+            },
+        )
+    })
+}
+
 // Note: server sends a packet to the client at low frequency, binary encoding, without ensuring
 // compatibility between different versions, even if within the same major version.
 #[derive(Serialize, Deserialize, PartialEq, Clone)]
@@ -613,7 +655,10 @@ impl RealTimeConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{PathSegment, parse_path, path_to_string};
+    use super::{
+        EXT_LATE_PICKUP, EXT_PHASE_SYNC, LatePickupAnnouncement, PathSegment, late_pickup_token,
+        parse_late_pickup, parse_path, path_to_string,
+    };
 
     fn debug_path(path: &str) -> String {
         format!("{:?}", parse_path(path).unwrap())
@@ -711,5 +756,25 @@ mod tests {
             parse_path("foo[]").unwrap_err().to_string(),
             "invalid path \"foo[]\" at column 4: expected `.` or end of input, found `[`",
         );
+    }
+
+    #[test]
+    fn late_pickup_token_round_trips_and_ignores_others() {
+        let announcement = LatePickupAnnouncement {
+            safety_margin_ms: 1.0,
+            target_margin_ms: 2.5,
+        };
+        let ext = format!(
+            "scene_mode,{EXT_PHASE_SYNC},{}",
+            late_pickup_token(announcement)
+        );
+        assert_eq!(parse_late_pickup(&ext), Some(announcement));
+        // An exact-match reader (older clients) does not see it as phase sync or anything else
+        assert!(!ext.split(',').any(|t| t == EXT_LATE_PICKUP));
+        assert_eq!(parse_late_pickup("phase_sync,scene_mode"), None);
+        assert_eq!(parse_late_pickup("late_pickup"), None);
+        assert_eq!(parse_late_pickup("late_pickup:x:2"), None);
+        assert_eq!(parse_late_pickup("late_pickup:NaN:2"), None);
+        assert_eq!(parse_late_pickup(""), None);
     }
 }

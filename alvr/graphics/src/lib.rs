@@ -1,9 +1,11 @@
+mod fence_timer;
 mod hands;
 mod lobby;
 mod opaque_regions;
 mod staging;
 mod stream;
 
+pub use fence_timer::*;
 pub use hands::*;
 pub use lobby::*;
 pub use stream::*;
@@ -355,6 +357,21 @@ impl GraphicsContext {
     #[cfg(any(windows, target_os = "macos", target_os = "ios"))]
     pub fn new_gl() -> Self {
         unimplemented!()
+    }
+
+    /// An EGL (extension) function, null when unavailable
+    #[allow(unused_variables)]
+    pub fn egl_proc_address(&self, name: &str) -> *const c_void {
+        #[cfg(not(any(windows, target_os = "macos", target_os = "ios")))]
+        unsafe {
+            let raw_adapter = self.adapter.as_hal::<wgpu::hal::api::Gles>().unwrap();
+            let egl_instance = raw_adapter.adapter_context().egl_instance().unwrap();
+            egl_instance
+                .get_proc_address(name)
+                .map_or(ptr::null(), |f| f as *const c_void)
+        }
+        #[cfg(any(windows, target_os = "macos", target_os = "ios"))]
+        ptr::null()
     }
 
     pub fn make_current(&self) {

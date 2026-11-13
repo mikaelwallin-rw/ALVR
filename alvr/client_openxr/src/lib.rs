@@ -490,6 +490,8 @@ pub fn entry_point() {
         let mut stream_skipped = false;
         // Server's flag (RealTimeConfig.ext_str): it steers its frame phase from our reports
         let mut phase_sync_flag = false;
+        // Server's late pickup token (RealTimeConfig.ext_str, only with phase sync)
+        let mut late_pickup_announcement = None::<alvr_packets::LatePickupAnnouncement>;
         // Overlay app's flags (RealTimeConfig.ext_str): a scene app owns the view / is starting or
         // shutting down; and whether the server configures passthrough (scene mode: no)
         let mut scene_mode_flag = false;
@@ -649,6 +651,7 @@ pub fn entry_point() {
                         scene_mode_flag = false;
                         scene_loading_flag = false;
                         phase_sync_flag = false;
+                        late_pickup_announcement = None;
                         core_context.set_phase_sync(false);
                     }
                     ClientCoreEvent::Haptics {
@@ -693,6 +696,8 @@ pub fn entry_point() {
                             |name: &str| config.ext_str.split(',').any(|token| token == name);
                         stream_unused_flag = has_token(alvr_packets::EXT_STREAM_UNUSED);
                         phase_sync_flag = has_token(alvr_packets::EXT_PHASE_SYNC);
+                        late_pickup_announcement = alvr_packets::parse_late_pickup(&config.ext_str)
+                            .filter(|_| phase_sync_flag);
                         scene_mode_flag = has_token(alvr_packets::EXT_SCENE_MODE);
                         scene_loading_flag = has_token(alvr_packets::EXT_SCENE_LOADING);
                         passthrough_configured = config.passthrough.is_some();
@@ -739,6 +744,8 @@ pub fn entry_point() {
                     panic!();
                 }
             };
+            // The runtime woke the loop: late pickup measures its deadline from here
+            let wake = Instant::now();
             tracking_diag.set_frame_time(frame_state.predicted_display_time);
             let frame_interval =
                 Duration::from_nanos(frame_state.predicted_display_period.as_nanos() as _);
@@ -805,12 +812,13 @@ pub fn entry_point() {
             let display_time = if let Some(stream) = &mut stream_context {
                 stream.set_key_probe(loading_output.is_some_and(|output| output.probe));
                 stream.set_phase_sync(phase_sync_flag);
+                stream.set_late_pickup(late_pickup_announcement);
                 if skip_stream {
                     stream.skip_frame(vsync_time);
                     vsync_time
                 } else {
                     stream_rendered = true;
-                    stream.render(frame_interval, vsync_time)
+                    stream.render(frame_interval, vsync_time, wake)
                 }
             } else {
                 lobby_layer = Some(lobby.render(vsync_time));
@@ -902,6 +910,16 @@ pub fn entry_point() {
                 output
             });
 
+            // DEBUG SWITCH screenvr_refmarkers.txt: world-locked reference markers (may upload
+            // an atlas: before the frame fence)
+            ref_markers.update(&xr_session);
+
+            // Late pickup: the frame's GL work is all queued; time its GPU completion
+            if stream_rendered && let Some(stream) = &mut stream_context {
+                graphics_context.make_current();
+                stream.submit_frame_fence();
+            }
+
             let layer = if stream_rendered {
                 stream_context
                     .as_ref()
@@ -939,8 +957,6 @@ pub fn entry_point() {
             layers.extend(loading_layers.iter().map(|layer| &**layer));
             // On top of the stream: debug reference, always visible
             layers.extend(quad_layers.iter().map(|layer| &**layer));
-            // DEBUG SWITCH screenvr_refmarkers.txt: world-locked reference markers
-            ref_markers.update(&xr_session);
             let ref_marker_layers = native_quads_space
                 .as_deref()
                 .map(|space| ref_markers.build(space))

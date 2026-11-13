@@ -57,6 +57,17 @@ impl VideoDecoderSource {
         self.inner.set_newest_frame_only(newest_only);
     }
 
+    /// Fork late pickup: the timestamp of the newest decoded frame that get_frame() has not
+    /// returned yet, without taking it (the frame shown now stays valid)
+    pub fn peek_newest_frame(&self) -> Option<Duration> {
+        #[cfg(target_os = "android")]
+        {
+            self.inner.peek_newest_frame()
+        }
+        #[cfg(not(target_os = "android"))]
+        None
+    }
+
     /// Frames dropped by the newest-frame rule since the last call
     pub fn take_dropped_frames(&mut self) -> u32 {
         #[cfg(target_os = "android")]

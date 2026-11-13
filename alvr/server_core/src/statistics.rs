@@ -79,6 +79,10 @@ struct PhaseSyncState {
     log_dropped: u32,
     log_skipped: u32,
     log_margin_mean_sum: f32,
+    // Late pickup (PSYN v2, reference DEADLINE): GPU late frames since the status line
+    log_gpu_late: u32,
+    // The margin reference of the last report (logged on change)
+    last_reference: Option<u32>,
     last_report: PhaseSyncReport,
 }
 
@@ -99,6 +103,8 @@ impl PhaseSyncState {
             log_dropped: 0,
             log_skipped: 0,
             log_margin_mean_sum: 0.0,
+            log_gpu_late: 0,
+            last_reference: None,
             last_report: PhaseSyncReport::default(),
         }
     }
@@ -379,6 +385,23 @@ impl StatisticsManager {
             );
         }
 
+        if state.last_reference != Some(report.reference) {
+            // The client moved its margin reference (late pickup on / off, or warming up): the
+            // controller sees a step in the margin and follows it at its rate limit
+            info!(
+                "Phase sync: client margins now against {}",
+                if report.reference == alvr_packets::PHASE_SYNC_REFERENCE_DEADLINE {
+                    format!(
+                        "its late pickup deadline (wake + {:.1} ms, work estimate {:.1} ms, back-off {:.1} ms)",
+                        report.deadline_mean_ms, report.work_estimate_ms, report.backoff_ms
+                    )
+                } else {
+                    "its poll start".to_string()
+                }
+            );
+            state.last_reference = Some(report.reference);
+        }
+
         let update = state.controller.update(now_s, &sample);
         if update.hold != state.last_hold {
             match update.hold {
@@ -417,11 +440,23 @@ impl StatisticsManager {
         state.log_dropped += report.dropped_frames;
         state.log_skipped += report.skipped_loops;
         state.log_margin_mean_sum += report.margin_mean_ms;
+        state.log_gpu_late += report.gpu_late_frames;
         state.last_report = report;
         if state.last_log.elapsed() >= PHASE_SYNC_LOG_INTERVAL {
             let r = &state.last_report;
+            // With the late pickup reference, "late" frames arrived after their loop's deadline
+            // (the loop waiting for a frame is normal then); "GPU late" frames finished their
+            // GPU work after the client's estimated compositor latch
+            let late_pickup = if r.reference == alvr_packets::PHASE_SYNC_REFERENCE_DEADLINE {
+                format!(
+                    "; late pickup: deadline wake + {:.1} ms, work {:.1} ms, back-off {:.1} ms, GPU late {}",
+                    r.deadline_mean_ms, r.work_estimate_ms, r.backoff_ms, state.log_gpu_late
+                )
+            } else {
+                String::new()
+            };
             info!(
-                "Phase sync: margin p10/p50/p90 {:.1}/{:.1}/{:.1} ms, mean over {} reports {:.1} ms, target {:.1}, {}; rate {:+.2} ms/s, clock {:+.0} ppm; loops {}, frames {}, waited for {}, missed {}, dropped {}, skipped {}",
+                "Phase sync: margin p10/p50/p90 {:.1}/{:.1}/{:.1} ms, mean over {} reports {:.1} ms, target {:.1}, {}; rate {:+.2} ms/s, clock {:+.0} ppm; loops {}, frames {}, {} {}, missed {}, dropped {}, skipped {}{}",
                 r.margin_p10_ms,
                 r.margin_p50_ms,
                 r.margin_p90_ms,
@@ -437,10 +472,16 @@ impl StatisticsManager {
                 state.controller.freq_ms_per_s() * 1000.0,
                 state.log_loops,
                 state.log_frames,
+                if r.reference == alvr_packets::PHASE_SYNC_REFERENCE_DEADLINE {
+                    "late"
+                } else {
+                    "waited for"
+                },
                 state.log_late,
                 state.log_missed,
                 state.log_dropped,
                 state.log_skipped,
+                late_pickup,
             );
             state.last_log = Instant::now();
             state.log_reports = 0;
@@ -451,6 +492,7 @@ impl StatisticsManager {
             state.log_dropped = 0;
             state.log_skipped = 0;
             state.log_margin_mean_sum = 0.0;
+            state.log_gpu_late = 0;
         }
     }
 

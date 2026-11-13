@@ -4,7 +4,8 @@ use crate::{
     interaction::{self, InteractionContext, InteractionSourcesConfig},
 };
 use alvr_client_core::{
-    ClientCoreContext, VideoFrameMetadata,
+    ClientCoreContext, LatePickupLoop, VideoFrameMetadata,
+    late_pickup::{self, LatePickupPlanner, PickDecision, PlannerEvent},
     video_decoder::{self, VideoDecoderConfig, VideoDecoderSource},
 };
 use alvr_common::{
@@ -18,11 +19,12 @@ use alvr_common::{
     parking_lot::RwLock,
 };
 use alvr_graphics::{
-    GraphicsContext, KeyProbeResults, OpaqueRegionGeometry, OpaqueRegionsParams, StreamRenderer,
-    StreamViewParams, key_chroma_direction, magenta_chroma_direction,
+    GpuFenceTimer, GraphicsContext, KeyProbeResults, OpaqueRegionGeometry, OpaqueRegionsParams,
+    StreamRenderer, StreamViewParams, key_chroma_direction, magenta_chroma_direction,
 };
 use alvr_packets::{
-    CameraFramesConfig, ClientStreamConfig, OpaqueRegion, RealTimeConfig, TrackingData,
+    CameraFramesConfig, ClientStreamConfig, LatePickupAnnouncement, OpaqueRegion, RealTimeConfig,
+    TrackingData,
 };
 use alvr_session::{
     ClientsideFoveationConfig, ClientsideFoveationMode, ClientsidePostProcessingConfig, CodecType,
@@ -31,6 +33,7 @@ use alvr_session::{
 use alvr_system_info::Platform;
 use openxr as xr;
 use std::{
+    collections::VecDeque,
     ptr,
     rc::Rc,
     sync::Arc,
@@ -44,6 +47,9 @@ const DECODER_MAX_TIMEOUT_MULTIPLIER: f32 = 0.8;
 // next loop's frame and the client would settle in a different (waiting) state. Half a frame keeps
 // that state out of reach for target margins up to 4 ms (server_core phase_sync.rs).
 const PHASE_SYNC_DECODER_TIMEOUT_MULTIPLIER: f32 = 0.5;
+// Late pickup: how often the loop looks for a decoded frame while waiting for its deadline
+const LATE_PICKUP_POLL: Duration = Duration::from_micros(250);
+const LATE_PICKUP_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const KEY_PROBE_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const CM_TO_M: f32 = 0.01;
 
@@ -130,6 +136,10 @@ pub struct StreamContext {
     // The server steers its frame phase (RealTimeConfig EXT_PHASE_SYNC): newest ready frame, half a
     // frame of wait, a report per loop
     phase_sync: bool,
+    // Late pickup (RealTimeConfig EXT_LATE_PICKUP, with phase sync): the deadline planner, the
+    // GPU completion timer of the loop's frames, and this loop's pick
+    late_pickup: Option<LatePickup>,
+    gfx_ctx: Rc<GraphicsContext>,
     // The last render()'s output views (projection_layer())
     layer_view_params: Option<[ViewParams; 2]>,
     use_custom_reprojection: bool,
@@ -165,6 +175,36 @@ impl KeyProbeStats {
             render_max: Duration::ZERO,
         }
     }
+}
+
+// A frame whose GPU completion is being timed
+struct FrameInFlight {
+    id: u64,
+    wake: Instant,
+    pick: Instant,
+    latch: Duration,
+    deadline_mode: bool,
+}
+
+struct LatePickup {
+    planner: LatePickupPlanner,
+    // None: EGL fence sync unavailable (the planner never gets ready: poll start reference)
+    timer: Option<GpuFenceTimer>,
+    next_id: u64,
+    in_flight: VecDeque<FrameInFlight>,
+    // This loop: (wake, pick, latch, deadline mode), set by render()
+    this_loop: Option<(Instant, Instant, Duration, bool)>,
+    // Log window
+    log_start: Instant,
+    log_loops: u32,
+    log_deadline_loops: u32,
+    log_deadline_sum: Duration,
+    log_taken_at_deadline: u32,
+    log_stale_waits: u32,
+    log_gpu_done: u32,
+    log_gpu_late: u32,
+    log_pick_to_done_max: Duration,
+    log_ready: Option<bool>,
 }
 
 impl StreamContext {
@@ -240,7 +280,7 @@ impl StreamContext {
         ];
 
         let renderer = StreamRenderer::new(
-            gfx_ctx,
+            Rc::clone(&gfx_ctx),
             config.view_resolution,
             target_view_resolution,
             [
@@ -327,6 +367,8 @@ impl StreamContext {
             renderer,
             decoder: None,
             phase_sync: false,
+            late_pickup: None,
+            gfx_ctx,
             layer_view_params: None,
         };
 
@@ -465,6 +507,138 @@ impl StreamContext {
         }
     }
 
+    /// Late pickup announced by the server (lib.rs parses RealTimeConfig.ext_str; None while
+    /// phase sync is off or the token is absent: the loop picks as before)
+    pub fn set_late_pickup(&mut self, announcement: Option<LatePickupAnnouncement>) {
+        match (announcement, &mut self.late_pickup) {
+            (None, None) => (),
+            (None, Some(_)) => {
+                info!("Late pickup: off");
+                self.late_pickup = None;
+            }
+            (Some(announcement), Some(late_pickup)) => {
+                if late_pickup.planner.announcement() != announcement {
+                    late_pickup.planner.set_announcement(announcement);
+                }
+            }
+            (Some(announcement), None) => {
+                let timer = GpuFenceTimer::new(&self.gfx_ctx);
+                info!(
+                    "Late pickup: on (safety margin {:.1} ms, target margin {:.1} ms){}",
+                    announcement.safety_margin_ms,
+                    announcement.target_margin_ms,
+                    if timer.is_none() {
+                        "; no EGL fence sync: the loop keeps picking at its poll start"
+                    } else {
+                        ""
+                    }
+                );
+                self.late_pickup = Some(LatePickup {
+                    planner: LatePickupPlanner::new(announcement),
+                    timer,
+                    next_id: 0,
+                    in_flight: VecDeque::new(),
+                    this_loop: None,
+                    log_start: Instant::now(),
+                    log_loops: 0,
+                    log_deadline_loops: 0,
+                    log_deadline_sum: Duration::ZERO,
+                    log_taken_at_deadline: 0,
+                    log_stale_waits: 0,
+                    log_gpu_done: 0,
+                    log_gpu_late: 0,
+                    log_pick_to_done_max: Duration::ZERO,
+                    log_ready: None,
+                });
+            }
+        }
+    }
+
+    /// Late pickup: after the frame's last GL command, right before xrEndFrame (the GL context
+    /// current): a fence whose completion time feeds the deadline planner. Only for loops that
+    /// rendered the stream.
+    pub fn submit_frame_fence(&mut self) {
+        let Some(late_pickup) = &mut self.late_pickup else {
+            return;
+        };
+        let Some((wake, pick, latch, deadline_mode)) = late_pickup.this_loop.take() else {
+            return;
+        };
+        let Some(timer) = &late_pickup.timer else {
+            return;
+        };
+        let id = late_pickup.next_id;
+        late_pickup.next_id += 1;
+        if timer.submit(&self.gfx_ctx, id) {
+            // Bounded: results come back within the timer's timeout
+            if late_pickup.in_flight.len() > 64 {
+                late_pickup.in_flight.pop_front();
+            }
+            late_pickup.in_flight.push_back(FrameInFlight {
+                id,
+                wake,
+                pick,
+                latch,
+                deadline_mode,
+            });
+        }
+    }
+
+    // Late pickup: GPU completions of earlier frames into the planner
+    fn collect_gpu_done(&mut self) {
+        let Some(late_pickup) = &mut self.late_pickup else {
+            return;
+        };
+        let Some(timer) = &late_pickup.timer else {
+            return;
+        };
+        for (id, done) in timer.poll() {
+            while late_pickup
+                .in_flight
+                .front()
+                .is_some_and(|frame| frame.id < id)
+            {
+                late_pickup.in_flight.pop_front();
+            }
+            let Some(frame) = late_pickup.in_flight.pop_front_if(|frame| frame.id == id) else {
+                continue;
+            };
+            let Some(done) = done else {
+                continue;
+            };
+            let since_wake = done.saturating_duration_since(frame.wake);
+            let since_pick = done.saturating_duration_since(frame.pick);
+            late_pickup.log_gpu_done += 1;
+            if since_wake > frame.latch {
+                late_pickup.log_gpu_late += 1;
+            }
+            late_pickup.log_pick_to_done_max = late_pickup.log_pick_to_done_max.max(since_pick);
+            match late_pickup.planner.on_frame_done(
+                done,
+                since_wake,
+                since_pick,
+                frame.latch,
+                frame.deadline_mode,
+            ) {
+                Some(PlannerEvent::BackedOff {
+                    backoff_ms,
+                    late_frames,
+                    window,
+                }) => info!(
+                    "Late pickup: {late_frames} of the last {window} frames finished their GPU work \
+                     after the estimated latch (wake + {:.1} ms): back-off now {backoff_ms:.1} ms",
+                    frame.latch.as_secs_f32() * 1000.0
+                ),
+                Some(PlannerEvent::Recovered { backoff_ms }) => {
+                    info!(
+                        "Late pickup: no late frames for a while, back-off now {backoff_ms:.1} ms"
+                    )
+                }
+                None => (),
+            }
+        }
+    }
+
     /// Probe each new frame for the key colour (asynchronous tiny readback issued in render(),
     /// collected with take_key_probes()) while the loading screen needs it
     pub fn set_key_probe(&mut self, wanted: bool) {
@@ -582,28 +756,104 @@ impl StreamContext {
             .set(config.log_input_diagnostics);
     }
 
-    pub fn render(&mut self, frame_interval: Duration, vsync_time: Duration) -> Duration {
+    /// wake: when xrWaitFrame returned this loop (late pickup measures its deadline from it)
+    pub fn render(
+        &mut self,
+        frame_interval: Duration,
+        vsync_time: Duration,
+        wake: Instant,
+    ) -> Duration {
         let xr_vsync_time = xr::Time::from_nanos(vsync_time.as_nanos() as _);
+        self.collect_gpu_done();
         let poll_start = Instant::now();
         let mut frame_result = None;
+        let latch = late_pickup::latch_after_wake(self.core_context.platform(), frame_interval);
+        // Late pickup deadline of this loop (None: not announced, not ready, or phase sync off)
+        let deadline = self
+            .late_pickup
+            .as_mut()
+            .filter(|_| self.phase_sync)
+            .and_then(|late_pickup| {
+                late_pickup
+                    .planner
+                    .deadline_after_wake(wake, frame_interval, latch)
+            });
         if let Some((_, source)) = &mut self.decoder {
             if self.phase_sync {
-                let frame_poll_deadline = poll_start
-                    + Duration::from_secs_f32(
-                        frame_interval.as_secs_f32() * PHASE_SYNC_DECODER_TIMEOUT_MULTIPLIER,
-                    );
                 source.set_newest_frame_only(true);
-                frame_result = source.get_frame();
-                let ready_at_poll = frame_result.is_some();
-                while frame_result.is_none() && Instant::now() < frame_poll_deadline {
-                    thread::sleep(Duration::from_micros(500));
+                let ready_at_poll;
+                let reference;
+                if let (Some(deadline_after_wake), Some(late_pickup)) =
+                    (deadline, &mut self.late_pickup)
+                {
+                    // Late pickup: this loop's frame as soon as it is decoded, else wait for one
+                    // until the deadline; never past it
+                    let deadline = wake + deadline_after_wake;
+                    let target = late_pickup.planner.announcement().target_margin_ms;
+                    ready_at_poll = source.peek_newest_frame().is_some();
+                    let mut waited_for_stale = false;
+                    loop {
+                        let now = Instant::now();
+                        let newest = source
+                            .peek_newest_frame()
+                            .map(|timestamp| self.core_context.frame_decoded_instant(timestamp));
+                        match LatePickupPlanner::pick_decision(
+                            now,
+                            deadline,
+                            newest,
+                            frame_interval,
+                            target,
+                        ) {
+                            PickDecision::Take => {
+                                if now >= deadline {
+                                    late_pickup.log_taken_at_deadline += 1;
+                                }
+                                if newest.is_some() {
+                                    frame_result = source.get_frame();
+                                }
+                                break;
+                            }
+                            PickDecision::Wait => {
+                                waited_for_stale |= newest.is_some();
+                                thread::sleep(LATE_PICKUP_POLL.min(deadline - now));
+                            }
+                        }
+                    }
+                    if waited_for_stale {
+                        late_pickup.log_stale_waits += 1;
+                    }
+                    late_pickup.log_deadline_loops += 1;
+                    late_pickup.log_deadline_sum += deadline_after_wake;
+                    reference = deadline;
+                } else {
+                    let frame_poll_deadline = poll_start
+                        + Duration::from_secs_f32(
+                            frame_interval.as_secs_f32() * PHASE_SYNC_DECODER_TIMEOUT_MULTIPLIER,
+                        );
                     frame_result = source.get_frame();
+                    ready_at_poll = frame_result.is_some();
+                    while frame_result.is_none() && Instant::now() < frame_poll_deadline {
+                        thread::sleep(Duration::from_micros(500));
+                        frame_result = source.get_frame();
+                    }
+                    reference = poll_start;
                 }
+                let late_pickup_loop = self.late_pickup.as_mut().map(|late_pickup| {
+                    late_pickup.log_loops += 1;
+                    LatePickupLoop {
+                        deadline_after_wake: deadline,
+                        target_margin_ms: late_pickup.planner.announcement().target_margin_ms,
+                        work_estimate_ms: late_pickup.planner.work_estimate_ms(frame_interval),
+                        backoff_ms: late_pickup.planner.backoff_ms(),
+                        gpu_late_frames: late_pickup.planner.take_gpu_late_frames(),
+                    }
+                });
                 self.core_context.report_stream_loop(
-                    poll_start,
+                    reference,
                     frame_result.map(|(timestamp, _)| (timestamp, ready_at_poll)),
                     source.take_dropped_frames(),
                     frame_interval,
+                    late_pickup_loop,
                 );
             } else {
                 source.set_newest_frame_only(false);
@@ -615,6 +865,51 @@ impl StreamContext {
                     frame_result = source.get_frame();
                     thread::sleep(Duration::from_micros(500));
                 }
+            }
+        }
+        if let Some(late_pickup) = &mut self.late_pickup {
+            late_pickup.this_loop = Some((wake, Instant::now(), latch, deadline.is_some()));
+            let ready = deadline.is_some();
+            if late_pickup.log_ready != Some(ready) {
+                info!(
+                    "Late pickup: {}",
+                    if ready {
+                        "deadline active (frames measured), margins against the deadline"
+                    } else {
+                        "measuring the frame's GPU time, the loop picks at its poll start"
+                    }
+                );
+                late_pickup.log_ready = Some(ready);
+            }
+            if late_pickup.log_start.elapsed() >= LATE_PICKUP_LOG_INTERVAL {
+                let planner = &late_pickup.planner;
+                info!(
+                    "Late pickup: {} of {} loops with a deadline (mean wake + {:.1} ms; taken at \
+                     the deadline {}, waited past a stale frame {}); latch estimate wake + {:.1} \
+                     ms, pick to GPU done estimate {:.1} ms (max {:.1}), back-off {:.1} ms; GPU \
+                     done {}, after the latch estimate {}",
+                    late_pickup.log_deadline_loops,
+                    late_pickup.log_loops,
+                    late_pickup.log_deadline_sum.as_secs_f32() * 1000.0
+                        / late_pickup.log_deadline_loops.max(1) as f32,
+                    late_pickup.log_taken_at_deadline,
+                    late_pickup.log_stale_waits,
+                    latch.as_secs_f32() * 1000.0,
+                    planner.work_estimate_ms(frame_interval),
+                    late_pickup.log_pick_to_done_max.as_secs_f32() * 1000.0,
+                    planner.backoff_ms(),
+                    late_pickup.log_gpu_done,
+                    late_pickup.log_gpu_late,
+                );
+                late_pickup.log_start = Instant::now();
+                late_pickup.log_loops = 0;
+                late_pickup.log_deadline_loops = 0;
+                late_pickup.log_deadline_sum = Duration::ZERO;
+                late_pickup.log_taken_at_deadline = 0;
+                late_pickup.log_stale_waits = 0;
+                late_pickup.log_gpu_done = 0;
+                late_pickup.log_gpu_late = 0;
+                late_pickup.log_pick_to_done_max = Duration::ZERO;
             }
         }
 

@@ -19,7 +19,15 @@ pub const PHASE_SYNC_TAG: [u8; 4] = *b"PSYN";
 const TRACKING_STATE_VERSION: u16 = 1;
 const CAMERA_STAMP_VERSION: u16 = 1;
 const SCREEN_VIDEO_DECODE_VERSION: u16 = 1;
-const PHASE_SYNC_VERSION: u16 = 1;
+/// v1: margins against the poll start. v2 (late pickup, 2026-11-13) appends `reference` and the
+/// late pickup fields; with reference POLL_START a v2 report means exactly what a v1 report means,
+/// so an older server (which reads any version >= 1 and ignores trailing bytes) stays correct.
+const PHASE_SYNC_VERSION: u16 = 2;
+/// PhaseSyncReport::reference: margins against the poll start (v1 meaning)
+pub const PHASE_SYNC_REFERENCE_POLL_START: u32 = 0;
+/// PhaseSyncReport::reference: margins against the late pickup deadline (only while the server
+/// announces late pickup, EXT_LATE_PICKUP)
+pub const PHASE_SYNC_REFERENCE_DEADLINE: u32 = 1;
 
 /// Head tracking flags (TrackingStateReport::flags, CameraTrackingStamp::flags)
 pub const HEAD_POSITION_TRACKED: u32 = 1 << 0;
@@ -162,6 +170,21 @@ pub struct PhaseSyncReport {
     pub margin_p10_ms: f32,
     pub margin_p50_ms: f32,
     pub margin_p90_ms: f32,
+    // ---- v2 (0 in a v1 report) ----
+    /// PHASE_SYNC_REFERENCE_POLL_START or PHASE_SYNC_REFERENCE_DEADLINE (the last loop's): what the
+    /// margins are measured against. With the deadline, margins are wrapped into
+    /// (target - frame / 2, target + frame / 2]; a negative one is a frame that arrived after the
+    /// previous loop's deadline (late_frames counts them), and late_frames no longer counts frames
+    /// the loop waited for (waiting is the normal case then).
+    pub reference: u32,
+    /// Late pickup: frames whose GPU work finished after the estimated compositor latch
+    pub gpu_late_frames: u32,
+    /// Late pickup: mean deadline after the loop's wake-up (xrWaitFrame return), ms
+    pub deadline_mean_ms: f32,
+    /// Late pickup: estimated pick -> GPU done time (high percentile), ms
+    pub work_estimate_ms: f32,
+    /// Late pickup: current automatic back-off, ms
+    pub backoff_ms: f32,
 }
 
 struct Writer(Vec<u8>);
@@ -228,8 +251,17 @@ impl Reader<'_> {
 
 // The payload after a matching tag and a supported version
 fn open(bytes: &[u8], tag: [u8; 4], version: u16) -> Option<Reader<'_>> {
+    open_versioned(bytes, tag, version).map(|(reader, _)| reader)
+}
+
+// Same, also returning the payload's version
+fn open_versioned(bytes: &[u8], tag: [u8; 4], min_version: u16) -> Option<(Reader<'_>, u16)> {
     let mut reader = Reader(bytes);
-    (reader.take::<4>()? == tag && reader.u16()? >= version).then_some(reader)
+    if reader.take::<4>()? != tag {
+        return None;
+    }
+    let version = reader.u16()?;
+    (version >= min_version).then_some((reader, version))
 }
 
 impl TrackingStateReport {
@@ -347,12 +379,22 @@ impl PhaseSyncReport {
         ] {
             w.f32(v);
         }
+        w.u32(self.reference);
+        w.u32(self.gpu_late_frames);
+        for v in [
+            self.deadline_mean_ms,
+            self.work_estimate_ms,
+            self.backoff_ms,
+        ] {
+            w.f32(v);
+        }
         w.0
     }
 
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let mut r = open(bytes, PHASE_SYNC_TAG, PHASE_SYNC_VERSION)?;
-        let report = Self {
+        // v1 and newer
+        let (mut r, version) = open_versioned(bytes, PHASE_SYNC_TAG, 1)?;
+        let mut report = Self {
             sequence: r.u32()?,
             window_us: r.u32()?,
             frame_interval_us: r.u32()?,
@@ -366,12 +408,23 @@ impl PhaseSyncReport {
             margin_p10_ms: r.f32()?,
             margin_p50_ms: r.f32()?,
             margin_p90_ms: r.f32()?,
+            ..Default::default()
         };
+        if version >= 2 {
+            report.reference = r.u32()?;
+            report.gpu_late_frames = r.u32()?;
+            report.deadline_mean_ms = r.f32()?;
+            report.work_estimate_ms = r.f32()?;
+            report.backoff_ms = r.f32()?;
+        }
         [
             report.margin_mean_ms,
             report.margin_p10_ms,
             report.margin_p50_ms,
             report.margin_p90_ms,
+            report.deadline_mean_ms,
+            report.work_estimate_ms,
+            report.backoff_ms,
         ]
         .iter()
         .all(|v| v.is_finite())
@@ -399,6 +452,11 @@ mod tests {
             margin_p10_ms: -0.5,
             margin_p50_ms: 2.0,
             margin_p90_ms: 4.75,
+            reference: PHASE_SYNC_REFERENCE_DEADLINE,
+            gpu_late_frames: 2,
+            deadline_mean_ms: 4.5,
+            work_estimate_ms: 6.25,
+            backoff_ms: 0.5,
         };
         let bytes = report.encode();
         assert_eq!(PhaseSyncReport::decode(&bytes), Some(report));
@@ -421,6 +479,50 @@ mod tests {
         let mut nan = report;
         nan.margin_mean_ms = f32::NAN;
         assert_eq!(PhaseSyncReport::decode(&nan.encode()), None);
+    }
+
+    #[test]
+    fn phase_sync_report_v1_and_v2_are_compatible() {
+        let report = PhaseSyncReport {
+            sequence: 3,
+            window_us: 500_000,
+            frame_interval_us: 11_111,
+            loops: 45,
+            frames: 45,
+            margin_mean_ms: 2.0,
+            margin_p10_ms: 1.5,
+            margin_p50_ms: 2.0,
+            margin_p90_ms: 2.5,
+            reference: PHASE_SYNC_REFERENCE_DEADLINE,
+            gpu_late_frames: 1,
+            deadline_mean_ms: 4.0,
+            work_estimate_ms: 6.0,
+            backoff_ms: 0.0,
+            ..Default::default()
+        };
+        let v2 = report.encode();
+        assert_eq!(&v2[4..6], &2u16.to_le_bytes());
+        // A v1 report (what the deployed client sends): the v1 prefix with version 1, no tail.
+        // Decoded with the v2 fields at their defaults (reference = poll start)
+        let mut v1 = v2[..6 + 9 * 4 + 4 * 4].to_vec();
+        v1[4..6].copy_from_slice(&1u16.to_le_bytes());
+        let decoded = PhaseSyncReport::decode(&v1).unwrap();
+        assert_eq!(decoded.reference, PHASE_SYNC_REFERENCE_POLL_START);
+        assert_eq!(decoded.gpu_late_frames, 0);
+        assert_eq!(decoded.margin_p50_ms, 2.0);
+        assert_eq!(decoded.loops, 45);
+        // A v2 report cut after the v1 fields is refused (a v2 tail must be complete)
+        assert_eq!(PhaseSyncReport::decode(&v2[..v1.len()]), None);
+        // An older server reads a v2 report as v1: same layout of the first fields
+        let mut as_v1 = report;
+        as_v1.reference = 0;
+        as_v1.gpu_late_frames = 0;
+        as_v1.deadline_mean_ms = 0.0;
+        as_v1.work_estimate_ms = 0.0;
+        as_v1.backoff_ms = 0.0;
+        let mut prefix = v2[..v1.len()].to_vec();
+        prefix[4..6].copy_from_slice(&1u16.to_le_bytes());
+        assert_eq!(PhaseSyncReport::decode(&prefix), Some(as_v1));
     }
 
     #[test]

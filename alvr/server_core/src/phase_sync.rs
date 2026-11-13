@@ -20,6 +20,16 @@
 //! dropped frame). With phase sync the client waits at most half a frame and shows the newest ready
 //! frame, so for a target margin below (frame - half a frame - jitter) only one state exists.
 //!
+//! Late pickup (2026-11-13, setting `phase_sync.late_pickup`, token EXT_LATE_PICKUP): a client
+//! that knows it waits for its frame until a deadline measured from its render loop's wake-up
+//! (as late as its own work still meets the headset compositor's latch, client_core
+//! late_pickup.rs) and reports margins against that deadline instead of the poll start
+//! (PhaseSyncReport v2, reference DEADLINE; wrapped to target +- half a frame by the client, so
+//! the "one frame behind" state reads as late, not as a long wait). The controller is the same:
+//! it now aims frames at "deadline - target", i.e. later than before by about deadline - poll
+//! start. Switching the reference (late pickup warming up, or off) is a step in the margin that
+//! the controller follows at its rate limit.
+//!
 //! Pure logic, no clocks: times are passed in seconds.
 
 /// Largest phase shift per second (ms/s). 1 ms/s = the server's frame period 0.1 % longer/shorter.

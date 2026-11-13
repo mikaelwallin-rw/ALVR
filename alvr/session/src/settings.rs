@@ -795,6 +795,20 @@ pub struct PhaseSyncConfig {
     ))]
     #[schema(gui(slider(min = 0.5, max = 4.0, step = 0.1)), suffix = " ms")]
     pub target_margin_ms: f32,
+
+    #[schema(strings(
+        help = r"The headset picks the stream frame as late as its render + submit still finishes before the headset's compositor takes the frame (a deadline from the render loop's wake-up, learnt from the measured GPU completion of its own frames), instead of right after the wake-up; the server then aims frames just before that deadline. Saves a few ms of latency. Backs off by itself when frames finish too late. Needs a client that knows it; off = phase sync as before."
+    ))]
+    pub late_pickup: Switch<LatePickupConfig>,
+}
+
+#[derive(SettingsSchema, Serialize, Deserialize, Clone)]
+pub struct LatePickupConfig {
+    #[schema(strings(
+        help = r"Kept free between the estimated end of the headset's GPU work for a frame (high percentile) and the compositor taking the frame. Larger is safer against frames that miss the compositor, smaller is lower latency."
+    ))]
+    #[schema(gui(slider(min = 0.0, max = 4.0, step = 0.1)), suffix = " ms")]
+    pub safety_margin_ms: f32,
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
@@ -1881,6 +1895,12 @@ pub fn session_settings_default() -> SettingsDefault {
                 enabled: true,
                 content: PhaseSyncConfigDefault {
                     target_margin_ms: 2.0,
+                    late_pickup: SwitchDefault {
+                        enabled: true,
+                        content: LatePickupConfigDefault {
+                            safety_margin_ms: 1.0,
+                        },
+                    },
                 },
             },
             bitrate: BitrateConfigDefault {
